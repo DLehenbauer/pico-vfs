@@ -276,8 +276,16 @@ static void _preclock_then_select(void *_config) {
 
 static void _postclock_then_deselect(void *_config) {
     blockdevice_sd_config_t *config = _config;
-    spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, sizeof(SPI_FILL_CHAR));
+    // Continue post-response clocks for at least N_CR (SD v2.00, section 7.5, p.149).
+    // N_CR = 1..8 byte-times. Conservatively cover its maximum (SD v2.00, Table 7-7, p.153).
+    _spi_wait(config, 8);
+
     gpio_put(config->cs, 1);
+
+    // Busy DataOut releases one clock after CS rises (SD v2.00, section 7.5.1.2, p.150).
+    // Send a full byte, following Elm-Chan multi-slave guidance: "send a byte after the
+    // CS signal is deasserted." (See: https://elm-chan.org/docs/mmc/mmc_e.html#spibus)
+    spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, sizeof(SPI_FILL_CHAR));
 }
 
 static inline void debug_if(int condition, const char *format, ...) {
