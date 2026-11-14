@@ -166,8 +166,9 @@ static void expect_select(void) {
 }
 
 static void expect_release(void) {
-    expect_spi(0xFF, 0xFF, false, 1);
+    expect_spi(0xFF, 0xFF, false, 8);
     expect_cs(true);
+    expect_spi(0xFF, 0xFF, true, 1);
 }
 
 static void expect_command(int cmd, uint32_t arg) {
