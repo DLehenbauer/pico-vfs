@@ -12,6 +12,4 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(sd_spi_tests PRIVATE -Wall -Wextra -Werror)
 endif()
 
-foreach(case singleblock start-rejected token-busy-wrap token-timeout-wrap wide-busy-timeout)
-  add_test(NAME sd_spi.${case} COMMAND sd_spi_tests ${case})
-endforeach()
+add_test(NAME sd_spi COMMAND sd_spi_tests)

@@ -364,20 +364,26 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
         spi_write_read_blocking(config->spi_inst, (const uint8_t *)&cmd_packet[i], NULL, 1);
     }
 
-    // The received byte immediataly following CMD12 is a stuff byte,
-    // it should be discarded before receive the response of the CMD12.
+    // Discard CMD12's stuff byte before R1, following Elm-Chan read guidance: "The received
+    // byte immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
+    // This exact rule is implementation guidance, not explicit wording in SD v2.00, section 7.5.2.2, Figure 7-18, p.151.
     if (CMD12_STOP_TRANSMISSION == cmd) {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, 1);
     }
 
-    // Loop for response: Response is sent back within command response time (NCR), 0 to 8 bytes for SDC
+    // N_CR = 1..8 byte-times (SD v2.00, Table 7-7, p.153).
+    // Retain the existing 16-byte polling guard as host tolerance, not the SD limit.
     for (int i = 0; i < 0x10; i++) {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &response, 1);
+
+        // R1's most significant bit is always zero (SD v2.00, section 7.3.2.1, p.143).
         if (!(response & R1_RESPONSE_RECV)) {
-            break;
+            return response;
         }
     }
-    return response;
+
+    // Tell _cmd() no valid R1 arrived so it can retry (or report failure if retries are exhausted).
+    return R1_NO_RESPONSE;
 }
 
 static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *resp) {

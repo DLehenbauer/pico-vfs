@@ -5,13 +5,22 @@
 #define CONF_SD_CMD_TIMEOUT 5
 #include "../../src/blockdevice/sd.c"
 
+static const char *current_case;
+
 #define CHECK(condition)                                                                           \
     do {                                                                                           \
         if (!(condition)) {                                                                        \
-            fprintf(stderr, "%s:%d: %s (event %zu)\n", __FILE__, __LINE__, #condition,             \
-                    event_index);                                                                  \
+            fprintf(stderr, "%s: %s:%d: %s (event %zu)\n", current_case, __FILE__, __LINE__,          \
+                    #condition, event_index);                                                      \
             exit(EXIT_FAILURE);                                                                    \
         }                                                                                          \
+    } while (0)
+
+#define RUN_CASE(name, test)                                                                        \
+    do {                                                                                           \
+        current_case = name;                                                                       \
+        test;                                                                                      \
+        printf("%s: passed\n", current_case);                                                       \
     } while (0)
 
 typedef struct {
@@ -239,6 +248,56 @@ static void test_start_rejected(void) {
     finish(device.read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_UNSUPPORTED);
 }
 
+// R1's bit 7 must be clear (SD v2.00, section 7.3.2.1, p.143).
+// Exhausting polls with 0x80 or 0xFF is no response, not command success.
+// The existing 16-byte guard and three retries are host tolerance, not N_CR.
+static void test_no_response(bool stop, uint8_t invalid_byte) {
+    reset_card();
+    if (stop) {
+        expect_start(2, 0, 0);
+        expect_block(0x31);
+        expect_block(0xA6);
+        // Retain this baseline's deselection/reselection until the transaction fix.
+        expect_release();
+        expect_select();
+    } else {
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
+    for (unsigned retry = 0; retry < 3; ++retry) {
+        expect_command(stop ? 12 : 18, 0);
+        if (stop) {
+            // An error-looking stuff byte must be discarded before each response.
+            expect_spi(0xFF, 0x04, false, 1);
+        }
+        expect_spi(0xFF, invalid_byte, false, 16);
+    }
+    expect_release();
+    uint8_t buffer[1024];
+    finish(device.read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_DEVICE);
+}
+
+// Check valid R1 success/error responses after discarding the stuff byte,
+// following Elm-Chan read guidance: "The received byte immediately following
+// CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
+static void test_stop_status(uint8_t response, int expected) {
+    reset_card();
+    expect_start(2, 0, 0);
+    expect_block(0x31);
+    expect_block(0xA6);
+    expect_release();
+    expect_select();
+    expect_command(12, 0);
+    expect_spi(0xFF, 0x04, false, 1);
+    expect_spi(0xFF, response, false, 1);
+    if (response == 0) {
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
+    expect_release();
+    uint8_t buffer[1024];
+    finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
+}
+
 // Exercise a full token wait across the 32-bit millisecond rollover, including
 // the pre-rollover window where an overflowing deadline used to fail immediately.
 static void test_token_wrap(bool timeout) {
@@ -265,22 +324,16 @@ static void test_wide_busy_timeout(void) {
     finish(_wait_ready(&config, (uint64_t)UINT32_MAX + 10), false);
 }
 
-int main(int argc, char **argv) {
-    CHECK(argc == 2);
-    const char *name = argv[1];
-    if (!strcmp(name, "singleblock")) {
-        test_singleblock();
-    } else if (!strcmp(name, "start-rejected")) {
-        test_start_rejected();
-    } else if (!strcmp(name, "token-busy-wrap")) {
-        test_token_wrap(false);
-    } else if (!strcmp(name, "token-timeout-wrap")) {
-        test_token_wrap(true);
-    } else if (!strcmp(name, "wide-busy-timeout")) {
-        test_wide_busy_timeout();
-    } else {
-        CHECK(false);
-    }
-    printf("%s: passed\n", name);
+int main(void) {
+    RUN_CASE("singleblock", test_singleblock());
+    RUN_CASE("start-rejected", test_start_rejected());
+    RUN_CASE("token-busy-wrap", test_token_wrap(false));
+    RUN_CASE("token-timeout-wrap", test_token_wrap(true));
+    RUN_CASE("wide-busy-timeout", test_wide_busy_timeout());
+    RUN_CASE("start-invalid-response", test_no_response(false, 0x80));
+    RUN_CASE("stop-invalid-response", test_no_response(true, 0x80));
+    RUN_CASE("stop-no-response", test_no_response(true, 0xFF));
+    RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK));
+    RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
     return EXIT_SUCCESS;
 }
