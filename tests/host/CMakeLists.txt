@@ -17,3 +17,8 @@ target_link_libraries(host PRIVATE
   filesystem_fat
   filesystem_littlefs
 )
+
+if(PICO_PLATFORM STREQUAL "host")
+  add_test(NAME host COMMAND host)
+  add_subdirectory(../sd_spi sd_spi)
+endif()

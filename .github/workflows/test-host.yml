@@ -51,9 +51,9 @@ jobs:
     - name: Build
       working-directory: ${{github.workspace}}/pico-vfs/build
       shell: bash
-      run: cmake --build . --target host --config $BUILD_TYPE
+      run: cmake --build . --target host sd_spi_tests --config $BUILD_TYPE
 
     - name: Test
       working-directory: ${{github.workspace}}/pico-vfs/build
       shell: bash
-      run: ./tests/host/host
+      run: ctest -C $BUILD_TYPE --output-on-failure
