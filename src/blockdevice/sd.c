@@ -292,12 +292,13 @@ static inline void debug_if(int condition, const char *format, ...) {
 static bool _wait_token(void *_config, uint8_t token) {
     blockdevice_sd_config_t *config = _config;
 
-    uint32_t t = to_ms_since_boot(get_absolute_time());
+    // Use 64-bit elapsed time to avoid 32-bit millisecond rollover.
+    absolute_time_t t = get_absolute_time();
     do {
         if (token == _spi_write(config, SPI_FILL_CHAR)) {
             return true;
         }
-    } while (to_ms_since_boot(get_absolute_time()) < t + 300);    // Wait for 300 msec for start token
+    } while (absolute_time_diff_us(t, get_absolute_time()) < 300000); // Wait for 300 msec
     debug_if(SD_DBG, "_wait_token: timeout\n");
     return false;
 }
@@ -305,13 +306,18 @@ static bool _wait_token(void *_config, uint8_t token) {
 static bool _wait_ready(void *_config, uint64_t timeout) {
     blockdevice_sd_config_t *config = _config;
     uint8_t response;
-    uint32_t t = to_ms_since_boot(get_absolute_time());
+
+    // Use 64-bit elapsed time to avoid 32-bit millisecond rollover.
+    absolute_time_t t = get_absolute_time();
     do {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &response, sizeof(SPI_FILL_CHAR));
+        // Any nonzero byte indicates ready (SD v2.00, section 7.3.2.2, p.143).
+        // Retain the full-high check, following Elm-Chan SPI response guidance: "until DO goes
+        // high (a 0xFF is received)." (See: https://elm-chan.org/docs/mmc/mmc_e.html#spimode)
         if (response == 0xFF) {
             return true;
         }
-    } while (to_ms_since_boot(get_absolute_time()) < t + timeout);
+    } while ((uint64_t)absolute_time_diff_us(t, get_absolute_time()) / 1000 < timeout);
     return false;
 
 }

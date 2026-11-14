@@ -27,6 +27,7 @@ static size_t event_count;
 static size_t event_index;
 static bool cs_high;
 static uint64_t now_us;
+static uint64_t time_step_us;
 static blockdevice_sd_config_t config;
 static blockdevice_t device;
 spi_inst_t mock_spi_instances[2] = {{0}, {1}};
@@ -92,7 +93,7 @@ bool gpio_get(unsigned gpio) {
 }
 
 absolute_time_t get_absolute_time(void) {
-    now_us += 1000;
+    now_us += time_step_us;
     return now_us;
 }
 
@@ -118,6 +119,7 @@ static void reset_card(void) {
     event_count = event_index = 0;
     cs_high = true;
     now_us = 0;
+    time_step_us = 1000;
     config = (blockdevice_sd_config_t){
         .spi_inst = spi0,
         .cs = 17,
@@ -236,6 +238,32 @@ static void test_start_rejected(void) {
     finish(device.read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_UNSUPPORTED);
 }
 
+// Exercise a full token wait across the 32-bit millisecond rollover, including
+// the pre-rollover window where an overflowing deadline used to fail immediately.
+static void test_token_wrap(bool timeout) {
+    reset_card();
+    now_us = ((uint64_t)UINT32_MAX - 8) * 1000;
+    expect_start(1, 0, 0);
+    if (timeout) {
+        expect_spi(0xFF, 0xFF, false, 300);
+    } else {
+        expect_spi(0xFF, 0xFF, false, 8);
+        expect_block(0x31);
+    }
+    expect_release();
+    uint8_t buffer[512];
+    finish(device.read(&device, buffer, 0, sizeof(buffer)),
+           timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_OK);
+}
+
+// A timeout wider than the millisecond counter must still expire.
+static void test_wide_busy_timeout(void) {
+    reset_card();
+    time_step_us = (uint64_t)UINT32_MAX * 1000;
+    expect_spi(0xFF, 0, true, 2);
+    finish(_wait_ready(&config, (uint64_t)UINT32_MAX + 10), false);
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 2);
     const char *name = argv[1];
@@ -243,6 +271,12 @@ int main(int argc, char **argv) {
         test_singleblock();
     } else if (!strcmp(name, "start-rejected")) {
         test_start_rejected();
+    } else if (!strcmp(name, "token-busy-wrap")) {
+        test_token_wrap(false);
+    } else if (!strcmp(name, "token-timeout-wrap")) {
+        test_token_wrap(true);
+    } else if (!strcmp(name, "wide-busy-timeout")) {
+        test_wide_busy_timeout();
     } else {
         CHECK(false);
     }
