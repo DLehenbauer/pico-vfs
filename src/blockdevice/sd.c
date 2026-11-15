@@ -397,9 +397,12 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
         *resp = R1_NO_RESPONSE;
     }
 
-    _preclock_then_select(config);
-    // No need to wait for card to be ready when sending the stop command
+    // CMD12 terminates CMD18 (SD v2.00, section 7.2.3, p.131).
+    // CS stays low through the stop and response (SD v2.00, section 7.5.2.2, Figure 7-18, p.151).
     if (CMD12_STOP_TRANSMISSION != cmd) {
+        // Select for a new command. CMD12 must use the already-selected read stream.
+        _preclock_then_select(config);
+
         if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
             debug_if(SD_DBG, "Card not ready yet \n");
 
@@ -883,11 +886,14 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         buffer += config->block_size;
         --block_count;
     }
-    _postclock_then_deselect(config);
 
-    // Send CMD12(0x00000000) to stop the transmission for multi-block transfer
+    // CMD18 transfers blocks until interrupted by CMD12 (SD v2.00, Table 7-3, p.138).
+    // Attempt the stop even after a read failure (host cleanup policy).
+    // Keep CS low so CMD12 can interrupt the selected stream. _cmd() releases the bus.
     if (size > config->block_size) {
         status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+    } else {
+        _postclock_then_deselect(config);
     }
 
     mutex_exit(&config->_mutex);

@@ -205,11 +205,32 @@ static void expect_start(size_t blocks, uint32_t address, uint8_t response) {
 static void expect_block(uint8_t value) {
     uint8_t data[512];
     memset(data, value, sizeof(data));
-    uint16_t crc = reference_crc16(data, sizeof(data));
+    // Deliberately corrupt CRC when checking that disabled CRC is still consumed.
+    uint16_t crc = reference_crc16(data, sizeof(data)) ^ (config.enable_crc ? 0 : 1);
     expect_spi(0xFF, 0xFE, false, 1);
     expect_spi(0xFF, value, false, sizeof(data));
     expect_spi(0xFF, crc >> 8, false, 1);
     expect_spi(0xFF, crc, false, 1);
+}
+
+// CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
+// Discard the stuff byte, following Elm-Chan read guidance: "The received byte
+// immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
+static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_delay) {
+    expect_command(12, 0);
+    expect_spi(0xFF, 0x04, false, 1);
+    if (response_delay) {
+        expect_spi(0xFF, 0xFF, false, response_delay);
+    }
+    expect_spi(0xFF, response, false, 1);
+    // CRC/illegal-command errors return before the existing R1b wait.
+    if (!(response & (0x04 | 0x08))) {
+        if (busy_bytes) {
+            expect_spi(0xFF, 0, false, busy_bytes);
+        }
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
+    expect_release();
 }
 
 static void finish(int actual, int expected) {
@@ -257,9 +278,6 @@ static void test_no_response(bool stop, uint8_t invalid_byte) {
         expect_start(2, 0, 0);
         expect_block(0x31);
         expect_block(0xA6);
-        // Retain this baseline's deselection/reselection until the transaction fix.
-        expect_release();
-        expect_select();
     } else {
         expect_select();
         expect_spi(0xFF, 0xFF, false, 1);
@@ -280,20 +298,12 @@ static void test_no_response(bool stop, uint8_t invalid_byte) {
 // Check valid R1 success/error responses after discarding the stuff byte,
 // following Elm-Chan read guidance: "The received byte immediately following
 // CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
-static void test_stop_status(uint8_t response, int expected) {
+static void test_stop_status(uint8_t response, int expected, size_t response_delay) {
     reset_card();
     expect_start(2, 0, 0);
     expect_block(0x31);
     expect_block(0xA6);
-    expect_release();
-    expect_select();
-    expect_command(12, 0);
-    expect_spi(0xFF, 0x04, false, 1);
-    expect_spi(0xFF, response, false, 1);
-    if (response == 0) {
-        expect_spi(0xFF, 0xFF, false, 1);
-    }
-    expect_release();
+    expect_stop(response, 0, response_delay);
     uint8_t buffer[1024];
     finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
 }
@@ -353,6 +363,45 @@ static void test_command_busy(bool app_command) {
     }
 }
 
+// No extra clocks, ready polling, or CS edges are allowed from the final CRC
+// through CMD12 (SD v2.00, section 7.5.2.2, Figure 7-18, p.151).
+// SDSC byte addressing and SDHC block addressing differ (SD v2.00, Table 7-3,
+// footnote 10, p.140). Busy is optional (Table 7-3, footnote 5, p.140).
+static void test_multiblock(bool high_capacity, bool crc_enabled) {
+    reset_card();
+    config.card_type = high_capacity ? SDCARD_V2HC : SDCARD_V1;
+    config.enable_crc = crc_enabled;
+    expect_start(2, high_capacity ? 2 : 1024, 0);
+    expect_block(0x31);
+    expect_block(0xA6);
+    expect_stop(0, 3, 2);
+    uint8_t buffer[1024] = {0};
+    uint8_t expected[1024];
+    memset(expected, 0x31, 512);
+    memset(expected + 512, 0xA6, 512);
+    finish(device.read(&device, buffer, 1024, sizeof(buffer)), BD_ERROR_OK);
+    CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
+}
+
+static void test_repeated_read(void) {
+    reset_card();
+    expect_start(2, 0, 0);
+    expect_block(0x31);
+    expect_block(0xA6);
+    expect_stop(0, 3, 2);
+    expect_start(1, 1024, 0);
+    expect_block(0x42);
+    expect_release();
+    uint8_t buffer[1024];
+    CHECK(device.read(&device, buffer, 0, sizeof(buffer)) == BD_ERROR_OK);
+    CHECK(cs_high);
+    CHECK(!config._mutex.locked);
+    finish(device.read(&device, buffer, 1024, 512), BD_ERROR_OK);
+    uint8_t expected[512];
+    memset(expected, 0x42, sizeof(expected));
+    CHECK(memcmp(buffer, expected, sizeof(expected)) == 0);
+}
+
 int main(void) {
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("start-rejected", test_start_rejected());
@@ -362,9 +411,19 @@ int main(void) {
     RUN_CASE("start-invalid-response", test_no_response(false, 0x80));
     RUN_CASE("stop-invalid-response", test_no_response(true, 0x80));
     RUN_CASE("stop-no-response", test_no_response(true, 0xFF));
-    RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK));
-    RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
+    RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK, 0));
+    RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED, 2));
     RUN_CASE("command-busy-timeout", test_command_busy(false));
     RUN_CASE("app-command-busy-timeout", test_command_busy(true));
+    RUN_CASE("multiblock-sdsc", test_multiblock(false, true));
+    RUN_CASE("multiblock-sdhc", test_multiblock(true, true));
+    RUN_CASE("crc-disabled", test_multiblock(false, false));
+    RUN_CASE("repeated-read", test_repeated_read());
+    RUN_CASE("stop-crc", test_stop_status(0x08, SD_BLOCK_DEVICE_ERROR_CRC, 2));
+    RUN_CASE("stop-parameter", test_stop_status(0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER, 2));
+    RUN_CASE("stop-erase", test_stop_status(0x10, SD_BLOCK_DEVICE_ERROR_ERASE, 2));
+    RUN_CASE("stop-no-busy", test_stop_status(0, BD_ERROR_OK, 2));
+    // Seven delayed bytes plus the stuff byte exercise eight filler bytes.
+    RUN_CASE("stop-max-response-delay", test_stop_status(0, BD_ERROR_OK, 7));
     return EXIT_SUCCESS;
 }
