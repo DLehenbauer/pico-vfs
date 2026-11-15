@@ -202,15 +202,19 @@ static void expect_start(size_t blocks, uint32_t address, uint8_t response) {
     expect_spi(0xFF, response, false, 1);
 }
 
-static void expect_block(uint8_t value) {
+static void expect_block_crc(uint8_t value, bool corrupt_crc) {
     uint8_t data[512];
     memset(data, value, sizeof(data));
-    // Deliberately corrupt CRC when checking that disabled CRC is still consumed.
-    uint16_t crc = reference_crc16(data, sizeof(data)) ^ (config.enable_crc ? 0 : 1);
+    uint16_t crc = reference_crc16(data, sizeof(data)) ^ (corrupt_crc ? 1 : 0);
     expect_spi(0xFF, 0xFE, false, 1);
     expect_spi(0xFF, value, false, sizeof(data));
     expect_spi(0xFF, crc >> 8, false, 1);
     expect_spi(0xFF, crc, false, 1);
+}
+
+static void expect_block(uint8_t value) {
+    // Deliberately corrupt CRC when checking that disabled CRC is still consumed.
+    expect_block_crc(value, !config.enable_crc);
 }
 
 // CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
@@ -383,6 +387,21 @@ static void test_multiblock(bool high_capacity, bool crc_enabled) {
     CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
 }
 
+static void test_multiblock_data_failure(bool crc_failure, uint8_t stop_response, int expected) {
+    reset_card();
+    expect_start(3, 0, 0);
+    expect_block(0x31);
+    if (crc_failure) {
+        expect_block_crc(0xA6, true);
+    } else {
+        expect_spi(0xFF, 0xFF, false, 300);
+    }
+    expect_stop(stop_response, 0, 0);
+    uint8_t buffer[1536];
+    // Preserve the deferred behavior: the stop result replaces the read error.
+    finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
+}
+
 static void test_repeated_read(void) {
     reset_card();
     expect_start(2, 0, 0);
@@ -417,6 +436,12 @@ int main(void) {
     RUN_CASE("app-command-busy-timeout", test_command_busy(true));
     RUN_CASE("multiblock-sdsc", test_multiblock(false, true));
     RUN_CASE("multiblock-sdhc", test_multiblock(true, true));
+    RUN_CASE("multiblock-token-timeout", test_multiblock_data_failure(false, 0, BD_ERROR_OK));
+    RUN_CASE("multiblock-token-timeout-stop-error",
+             test_multiblock_data_failure(false, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
+    RUN_CASE("multiblock-data-crc", test_multiblock_data_failure(true, 0, BD_ERROR_OK));
+    RUN_CASE("multiblock-data-crc-stop-error",
+             test_multiblock_data_failure(true, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
     RUN_CASE("crc-disabled", test_multiblock(false, false));
     RUN_CASE("repeated-read", test_repeated_read());
     RUN_CASE("stop-crc", test_stop_status(0x08, SD_BLOCK_DEVICE_ERROR_CRC, 2));
