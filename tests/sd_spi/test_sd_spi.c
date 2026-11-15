@@ -220,7 +220,7 @@ static void expect_block(uint8_t value) {
 // CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
 // Discard the stuff byte, following Elm-Chan read guidance: "The received byte
 // immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
-static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_delay) {
+static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_delay, bool ready) {
     expect_command(12, 0);
     expect_spi(0xFF, 0x04, false, 1);
     if (response_delay) {
@@ -232,7 +232,9 @@ static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_del
         if (busy_bytes) {
             expect_spi(0xFF, 0, false, busy_bytes);
         }
-        expect_spi(0xFF, 0xFF, false, 1);
+        if (ready) {
+            expect_spi(0xFF, 0xFF, false, 1);
+        }
     }
     expect_release();
 }
@@ -307,7 +309,7 @@ static void test_stop_status(uint8_t response, int expected, size_t response_del
     expect_start(2, 0, 0);
     expect_block(0x31);
     expect_block(0xA6);
-    expect_stop(response, 0, response_delay);
+    expect_stop(response, 0, response_delay, true);
     uint8_t buffer[1024];
     finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
 }
@@ -378,7 +380,7 @@ static void test_multiblock(bool high_capacity, bool crc_enabled) {
     expect_start(2, high_capacity ? 2 : 1024, 0);
     expect_block(0x31);
     expect_block(0xA6);
-    expect_stop(0, 3, 2);
+    expect_stop(0, 3, 2, true);
     uint8_t buffer[1024] = {0};
     uint8_t expected[1024];
     memset(expected, 0x31, 512);
@@ -387,7 +389,9 @@ static void test_multiblock(bool high_capacity, bool crc_enabled) {
     CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
 }
 
-static void test_multiblock_data_failure(bool crc_failure, uint8_t stop_response, int expected) {
+// Read blocks carry CRC16 and CMD12 terminates CMD18 (SD v2.00, section 7.2.3,
+// pp.130-131). Preferring the data error over cleanup failure is API policy.
+static void test_multiblock_data_failure(bool crc_failure, uint8_t stop_response, bool stop_busy) {
     reset_card();
     expect_start(3, 0, 0);
     expect_block(0x31);
@@ -396,10 +400,20 @@ static void test_multiblock_data_failure(bool crc_failure, uint8_t stop_response
     } else {
         expect_spi(0xFF, 0xFF, false, 300);
     }
-    expect_stop(stop_response, 0, 0);
+    expect_stop(stop_response, stop_busy ? CONF_SD_CMD_TIMEOUT : 0, 0, !stop_busy);
     uint8_t buffer[1536];
-    // Preserve the deferred behavior: the stop result replaces the read error.
-    finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
+    // Busy-timeout reporting itself remains deferred; this checks data-error preservation.
+    finish(device.read(&device, buffer, 0, sizeof(buffer)),
+           crc_failure ? SD_BLOCK_DEVICE_ERROR_CRC : SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
+}
+
+static void test_singleblock_crc(void) {
+    reset_card();
+    expect_start(1, 0, 0);
+    expect_block_crc(0x31, true);
+    expect_release();
+    uint8_t buffer[512];
+    finish(device.read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_CRC);
 }
 
 static void test_repeated_read(void) {
@@ -407,7 +421,7 @@ static void test_repeated_read(void) {
     expect_start(2, 0, 0);
     expect_block(0x31);
     expect_block(0xA6);
-    expect_stop(0, 3, 2);
+    expect_stop(0, 3, 2, true);
     expect_start(1, 1024, 0);
     expect_block(0x42);
     expect_release();
@@ -436,12 +450,14 @@ int main(void) {
     RUN_CASE("app-command-busy-timeout", test_command_busy(true));
     RUN_CASE("multiblock-sdsc", test_multiblock(false, true));
     RUN_CASE("multiblock-sdhc", test_multiblock(true, true));
-    RUN_CASE("multiblock-token-timeout", test_multiblock_data_failure(false, 0, BD_ERROR_OK));
+    RUN_CASE("multiblock-token-timeout", test_multiblock_data_failure(false, 0, false));
     RUN_CASE("multiblock-token-timeout-stop-error",
-             test_multiblock_data_failure(false, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
-    RUN_CASE("multiblock-data-crc", test_multiblock_data_failure(true, 0, BD_ERROR_OK));
+             test_multiblock_data_failure(false, 0x04, false));
+    RUN_CASE("multiblock-data-crc", test_multiblock_data_failure(true, 0, false));
     RUN_CASE("multiblock-data-crc-stop-error",
-             test_multiblock_data_failure(true, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
+             test_multiblock_data_failure(true, 0x04, false));
+    RUN_CASE("singleblock-crc", test_singleblock_crc());
+    RUN_CASE("read-crc-stop-busy", test_multiblock_data_failure(true, 0, true));
     RUN_CASE("crc-disabled", test_multiblock(false, false));
     RUN_CASE("repeated-read", test_repeated_read());
     RUN_CASE("stop-crc", test_stop_status(0x08, SD_BLOCK_DEVICE_ERROR_CRC, 2));
