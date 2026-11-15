@@ -402,7 +402,7 @@ static void test_multiblock_data_failure(bool crc_failure, uint8_t stop_response
     }
     expect_stop(stop_response, stop_busy ? CONF_SD_CMD_TIMEOUT : 0, 0, !stop_busy);
     uint8_t buffer[1536];
-    // Busy-timeout reporting itself remains deferred; this checks data-error preservation.
+    // The original data error takes precedence over any stop/busy failure.
     finish(device.read(&device, buffer, 0, sizeof(buffer)),
            crc_failure ? SD_BLOCK_DEVICE_ERROR_CRC : SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
 }
@@ -459,6 +459,67 @@ static void test_idle_command(int cmd, bool is_acmd, uint8_t r1, int expected) {
     CHECK(response == (expected == BD_ERROR_OK && (cmd == 8 || cmd == 58) ? 0 : r1));
 }
 
+// R1b permits optional busy bytes; zero means busy (SD v2.00, section 7.3.2.2,
+// p.143). A timeout leaves completion unconfirmed, but must not replace a more
+// specific R1 error. The full-high check and timeout budget remain host policy.
+static void test_stop_busy(bool wrap, uint8_t response, int expected) {
+    reset_card();
+    expect_start(2, 0, 0);
+    expect_block(0x31);
+    expect_block(0xA6);
+    expect_stop(response, CONF_SD_CMD_TIMEOUT, 2, false);
+    if (wrap) {
+        // Packet/data transfers do not advance the mock clock; the three time
+        // reads before the busy wait leave it just before millisecond rollover.
+        now_us = ((uint64_t)UINT32_MAX - 6) * 1000;
+    }
+    uint8_t buffer[1024];
+    finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
+}
+
+static void test_erase_busy_timeout(void) {
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(38, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0, false, CONF_SD_CMD_TIMEOUT);
+    expect_release();
+    uint32_t response = R1_NO_RESPONSE;
+    finish(_cmd(&config, 38, 0, false, &response), SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
+    CHECK(response == 0);
+}
+
+// Without cached SD Status erase parameters, estimate write-block count times
+// 250 ms (SD v3.01, section 4.6.2.3, p.57). This is not the AU-based formula
+// (section 4.14.4, p.89).
+static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
+    reset_card();
+    config.card_type = high_capacity ? SDCARD_V2HC : SDCARD_V1;
+    if (wrap) {
+        now_us = ((uint64_t)UINT32_MAX - 3) * 1000;
+    }
+    for (int cmd = 32; cmd <= 33; ++cmd) {
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        uint32_t sector = cmd == 32 ? 2 : 41;
+        expect_command(cmd, high_capacity ? sector : sector * 512);
+        expect_spi(0xFF, 0, false, 1);
+        expect_release();
+    }
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(38, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0, false, timeout ? 10000 : 6000);
+    if (!timeout) {
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
+    expect_release();
+    finish(trim(&device, 2 * 512, 40 * 512),
+           timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_OK);
+}
+
 int main(void) {
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("start-rejected", test_start_rejected());
@@ -504,5 +565,14 @@ int main(void) {
     RUN_CASE("idle-bare-cmd41", test_idle_command(41, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
     RUN_CASE("idle-parameter-error", test_idle_command(16, false, 0x41, SD_BLOCK_DEVICE_ERROR_PARAMETER));
     RUN_CASE("idle-erase-error", test_idle_command(16, false, 0x11, SD_BLOCK_DEVICE_ERROR_ERASE));
+    RUN_CASE("stop-busy-timeout", test_stop_busy(false, 0, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE));
+    RUN_CASE("stop-busy-wrap", test_stop_busy(true, 0, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE));
+    RUN_CASE("stop-busy-parameter", test_stop_busy(false, 0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER));
+    RUN_CASE("stop-busy-erase", test_stop_busy(false, 0x10, SD_BLOCK_DEVICE_ERROR_ERASE));
+    RUN_CASE("erase-busy-timeout", test_erase_busy_timeout());
+    RUN_CASE("trim-sdsc-long-busy", test_trim_busy(false, false, false));
+    RUN_CASE("trim-sdhc-long-busy", test_trim_busy(true, false, false));
+    RUN_CASE("trim-busy-timeout", test_trim_busy(true, true, false));
+    RUN_CASE("trim-busy-wrap", test_trim_busy(true, false, true));
     return EXIT_SUCCESS;
 }

@@ -386,7 +386,8 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
     return R1_NO_RESPONSE;
 }
 
-static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *resp) {
+static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_acmd,
+                                  uint32_t *resp, uint64_t busy_timeout) {
     blockdevice_sd_config_t *config = _config;
     int32_t status = BD_ERROR_OK;
     uint32_t response;
@@ -503,7 +504,15 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
 
         case CMD12_STOP_TRANSMISSION:       // Response R1b
         case CMD38_ERASE:
-            _wait_ready(config, SD_COMMAND_TIMEOUT);
+            // Wait for completion. R1b retains R1 status and adds optional busy bytes.
+            // Zero means busy. Nonzero means ready (SD v2.00, section 7.3.2.2, p.143).
+            if (false == _wait_ready(config, busy_timeout)) {
+                // A timeout means completion is unconfirmed: report NO_RESPONSE
+                // unless R1 already supplied a more specific error.
+                if (BD_ERROR_OK == status) {
+                    status = SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
+                }
+            }
             break;
 
         case ACMD13_SD_STATUS:             // Response R2
@@ -530,6 +539,10 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
     // Deselect card
     _postclock_then_deselect(config);
     return status;
+}
+
+static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *resp) {
+    return _cmd_with_busy_timeout(_config, cmd, arg, is_acmd, resp, SD_COMMAND_TIMEOUT);
 }
 
 static int _cmd8(void *_config) {
@@ -906,7 +919,8 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
 
     // CMD18 transfers blocks until interrupted by CMD12 (SD v2.00, Table 7-3, p.138).
     // Attempt the stop even after a read failure (host cleanup policy).
-    // Keep CS low so CMD12 can interrupt the selected stream. _cmd() releases the bus.
+    // Keep CS low so CMD12 can interrupt the selected stream. _cmd() checks its R1b/busy
+    // completion and releases CS/MISO on return.
     if (size > config->block_size) {
         int stop_status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
 
@@ -916,6 +930,7 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
             status = stop_status;
         }
     } else {
+        // CMD17 has no multi-block stream to stop. Release CS/MISO here instead.
         _postclock_then_deselect(config);
     }
 
@@ -1061,6 +1076,15 @@ static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
     }
     int status = BD_ERROR_OK;
 
+    // Erase time scales with the area, not a fixed command timeout. Without cached
+    // SD Status erase parameters, estimate 250 ms per write block (SD v3.01,
+    // section 4.6.2.3, p.57). Counting 512-byte logical blocks is conservative
+    // for larger native write blocks. Retain the command timeout as a minimum.
+    uint64_t erase_timeout = (size / config->block_size) * 250;
+    if (erase_timeout < SD_COMMAND_TIMEOUT) {
+        erase_timeout = SD_COMMAND_TIMEOUT;
+    }
+
     size -= config->block_size;
     // SDSC Card (CCS=0) uses byte unit address
     // SDHC and SDXC Cards (CCS=1) use block unit address (512 Bytes unit)
@@ -1080,7 +1104,7 @@ static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
         mutex_exit(&config->_mutex);
         return status;
     }
-    status = _cmd(config, CMD38_ERASE, 0x0, 0, NULL);
+    status = _cmd_with_busy_timeout(config, CMD38_ERASE, 0x0, 0, NULL, erase_timeout);
 
     mutex_exit(&config->_mutex);
     return status;
