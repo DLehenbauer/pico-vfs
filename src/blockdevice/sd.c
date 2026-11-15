@@ -391,11 +391,22 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
     int32_t status = BD_ERROR_OK;
     uint32_t response;
 
+    // If resp is provided, initialize it with R1_NO_RESPONSE to prevent callers
+    // from using a stale/uninitialized response if no valid R1 arrives.
+    if (NULL != resp) {
+        *resp = R1_NO_RESPONSE;
+    }
+
     _preclock_then_select(config);
     // No need to wait for card to be ready when sending the stop command
     if (CMD12_STOP_TRANSMISSION != cmd) {
         if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
             debug_if(SD_DBG, "Card not ready yet \n");
+
+            // Commands are rejected during busy (SD v2.00, section 7.2.8, p.133).
+            // Abort and release the bus. _postclock_then_deselect() documents release timing.
+            _postclock_then_deselect(config);
+            return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
         }
     }
 
@@ -407,6 +418,11 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
             // Wait for card to be ready after CMD55
             if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
                 debug_if(SD_DBG, "Card not ready yet \n");
+                // Commands are rejected during busy (SD v2.00, section 7.2.8, p.133).
+                // Abort before the application command and release the bus, since
+                // normal cleanup below is skipped.
+                _postclock_then_deselect(config);
+                return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
             }
         }
 
@@ -433,15 +449,15 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
     if (response & R1_COM_CRC_ERROR) {
         _postclock_then_deselect(config);
         debug_if(SD_DBG, "CRC error CMD:%d response 0x%" PRIx32 "\n", cmd, response);
-        return SD_BLOCK_DEVICE_ERROR_CRC;                // CRC error
+        return SD_BLOCK_DEVICE_ERROR_CRC;               // CRC error
     }
     if (response & R1_ILLEGAL_COMMAND) {
         _postclock_then_deselect(config);
         debug_if(SD_DBG, "Illegal command CMD:%d response 0x%" PRIx32 "\n", cmd, response);
-        if (CMD8_SEND_IF_COND == cmd) {                  // Illegal command is for Ver1 or not SD Card
+        if (CMD8_SEND_IF_COND == cmd) {                 // Illegal command is for Ver1 or not SD Card
             config->card_type = CARD_UNKNOWN;
         }
-        return SD_BLOCK_DEVICE_ERROR_UNSUPPORTED;      // Command not supported
+        return SD_BLOCK_DEVICE_ERROR_UNSUPPORTED;       // Command not supported
     }
 
     debug_if(SD_DBG, "CMD:%d \t arg:0x%" PRIx32 " \t Response:0x%" PRIx32 "\n", cmd, arg, response);
