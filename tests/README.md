@@ -32,3 +32,7 @@ cmake -S tests/sd_spi -B build/sd-spi -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/sd-spi
 ctest --test-dir build/sd-spi --output-on-failure
 ```
+
+The host CI workflow builds both host executables in the same CMake build and
+runs both suites with CTest. The standalone commands above remain available
+without the Pico SDK.
