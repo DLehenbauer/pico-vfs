@@ -466,10 +466,25 @@ static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *re
     debug_if(SD_DBG, "CMD:%d \t arg:0x%" PRIx32 " \t Response:0x%" PRIx32 "\n", cmd, arg, response);
     // Set status for other errors
     if ((response & R1_ERASE_RESET) || (response & R1_ERASE_SEQUENCE_ERROR)) {
-        status = SD_BLOCK_DEVICE_ERROR_ERASE;            // Erase error
+        status = SD_BLOCK_DEVICE_ERROR_ERASE;           // Erase error
     } else if ((response & R1_ADDRESS_ERROR) || (response & R1_PARAMETER_ERROR)) {
-        // Misaligned address / invalid address block length
+        // R1 reports a misaligned address or invalid command argument
+        // (SD v3.01, section 7.3.2.1, p.129).
         status = SD_BLOCK_DEVICE_ERROR_PARAMETER;
+    }
+
+    // Idle means initialization is in progress, not operational-command success
+    // (SD v3.01, section 7.3.2.1, p.129).
+    // Allow reset/initialization commands (SD v3.01, sections 7.2.1, pp.114-115,
+    // and 7.2.7, p.119) and CMD55, which prefixes ACMD41 (Table 7-4, p.127).
+    // CMD1 remains allowed for legacy init. Specific R1 errors take precedence.
+    bool accepts_idle = cmd == CMD0_GO_IDLE_STATE || cmd == CMD1_SEND_OP_COND ||
+                        cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR ||
+                        cmd == CMD59_CRC_ON_OFF || cmd == CMD55_APP_CMD ||
+                        (is_acmd && cmd == ACMD41_SD_SEND_OP_COND);
+    if (BD_ERROR_OK == status && (response & R1_IDLE_STATE) && !accepts_idle) {
+        _postclock_then_deselect(config);
+        return SD_BLOCK_DEVICE_ERROR_NO_INIT;
     }
 
     // Get rest of the response part for other commands

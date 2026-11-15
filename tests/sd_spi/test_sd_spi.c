@@ -227,8 +227,8 @@ static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_del
         expect_spi(0xFF, 0xFF, false, response_delay);
     }
     expect_spi(0xFF, response, false, 1);
-    // CRC/illegal-command errors return before the existing R1b wait.
-    if (!(response & (0x04 | 0x08))) {
+    // Idle, CRC, and illegal-command responses return before the R1b wait.
+    if (!(response & (0x01 | 0x04 | 0x08))) {
         if (busy_bytes) {
             expect_spi(0xFF, 0, false, busy_bytes);
         }
@@ -435,6 +435,30 @@ static void test_repeated_read(void) {
     CHECK(memcmp(buffer, expected, sizeof(expected)) == 0);
 }
 
+// Idle indicates initialization (SD v3.01, section 7.3.2.1, p.129).
+// Preserve initialization responses, reject operational idle, and distinguish
+// actual ACMD41 from bare CMD41. Specific erase/parameter errors remain specific.
+static void test_idle_command(int cmd, bool is_acmd, uint8_t r1, int expected) {
+    reset_card();
+    config.is_initialized = expected != BD_ERROR_OK;
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    if (is_acmd) {
+        expect_command(55, 0);
+        expect_spi(0xFF, 0x01, false, 1);
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
+    expect_command(cmd, 0);
+    expect_spi(0xFF, r1, false, 1);
+    if (expected == BD_ERROR_OK && (cmd == 8 || cmd == 58)) {
+        expect_spi(0xFF, 0, false, 4);
+    }
+    expect_release();
+    uint32_t response = R1_NO_RESPONSE;
+    finish(_cmd(&config, cmd, 0, is_acmd, &response), expected);
+    CHECK(response == (expected == BD_ERROR_OK && (cmd == 8 || cmd == 58) ? 0 : r1));
+}
+
 int main(void) {
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("start-rejected", test_start_rejected());
@@ -466,5 +490,19 @@ int main(void) {
     RUN_CASE("stop-no-busy", test_stop_status(0, BD_ERROR_OK, 2));
     // Seven delayed bytes plus the stuff byte exercise eight filler bytes.
     RUN_CASE("stop-max-response-delay", test_stop_status(0, BD_ERROR_OK, 7));
+    RUN_CASE("stop-idle", test_stop_status(0x01, SD_BLOCK_DEVICE_ERROR_NO_INIT, 2));
+    RUN_CASE("idle-cmd16", test_idle_command(16, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd32", test_idle_command(32, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd33", test_idle_command(33, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd38", test_idle_command(38, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd0", test_idle_command(0, false, 1, BD_ERROR_OK));
+    RUN_CASE("idle-cmd1", test_idle_command(1, false, 1, BD_ERROR_OK));
+    RUN_CASE("idle-cmd8", test_idle_command(8, false, 1, BD_ERROR_OK));
+    RUN_CASE("idle-cmd58", test_idle_command(58, false, 1, BD_ERROR_OK));
+    RUN_CASE("idle-cmd59", test_idle_command(59, false, 1, BD_ERROR_OK));
+    RUN_CASE("idle-acmd41", test_idle_command(41, true, 1, BD_ERROR_OK));
+    RUN_CASE("idle-bare-cmd41", test_idle_command(41, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-parameter-error", test_idle_command(16, false, 0x41, SD_BLOCK_DEVICE_ERROR_PARAMETER));
+    RUN_CASE("idle-erase-error", test_idle_command(16, false, 0x11, SD_BLOCK_DEVICE_ERROR_ERASE));
     return EXIT_SUCCESS;
 }
