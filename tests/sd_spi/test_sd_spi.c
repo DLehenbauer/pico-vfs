@@ -324,6 +324,35 @@ static void test_wide_busy_timeout(void) {
     finish(_wait_ready(&config, (uint64_t)UINT32_MAX + 10), false);
 }
 
+// Commands are rejected during busy (SD v2.00, section 7.2.8, p.133).
+// Check that readiness timeout sends no ordinary/application command and
+// leaves the response sentinel, with exactly one release and no extra bytes.
+static void test_command_busy(bool app_command) {
+    reset_card();
+    expect_select();
+    if (app_command) {
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_command(55, 0);
+        expect_spi(0xFF, 0, false, 1);
+    }
+    expect_spi(0xFF, 0, false, CONF_SD_CMD_TIMEOUT);
+    expect_release();
+    uint32_t response = 0x12345678;
+    int status = _cmd(&config, app_command ? 41 : 16, 0, app_command, &response);
+    CHECK(response == R1_NO_RESPONSE);
+    finish(status, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
+
+    if (!app_command) {
+        // Also exercise the public read's propagation and mutex cleanup.
+        reset_card();
+        expect_select();
+        expect_spi(0xFF, 0, false, CONF_SD_CMD_TIMEOUT);
+        expect_release();
+        uint8_t buffer[1024];
+        finish(device.read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
+    }
+}
+
 int main(void) {
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("start-rejected", test_start_rejected());
@@ -335,5 +364,7 @@ int main(void) {
     RUN_CASE("stop-no-response", test_no_response(true, 0xFF));
     RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK));
     RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
+    RUN_CASE("command-busy-timeout", test_command_busy(false));
+    RUN_CASE("app-command-busy-timeout", test_command_busy(true));
     return EXIT_SUCCESS;
 }
