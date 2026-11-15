@@ -879,8 +879,10 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
 
     // receive the data : one block at a time
     while (block_count) {
-        if (0 != _read(config, buffer, config->block_size)) {
-            status = SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
+        status = _read(config, buffer, config->block_size);
+        if (BD_ERROR_OK != status) {
+            // Read blocks carry CRC16 (SD v2.00, section 7.2.3, pp.130-131).
+            // Preserve _read()'s specific error while still attempting stop cleanup.
             break;
         }
         buffer += config->block_size;
@@ -891,7 +893,13 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
     // Attempt the stop even after a read failure (host cleanup policy).
     // Keep CS low so CMD12 can interrupt the selected stream. _cmd() releases the bus.
     if (size > config->block_size) {
-        status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+        int stop_status = _cmd(config, CMD12_STOP_TRANSMISSION, 0x0, 0, NULL);
+
+        // A successful stop cannot repair failed data. Preserve the read error;
+        // otherwise report any stop failure rather than claiming the read succeeded.
+        if (BD_ERROR_OK == status) {
+            status = stop_status;
+        }
     } else {
         _postclock_then_deselect(config);
     }
