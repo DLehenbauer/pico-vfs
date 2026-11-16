@@ -234,14 +234,12 @@ static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_del
         expect_spi(0xFF, 0xFF, false, response_delay);
     }
     expect_spi(0xFF, response, false, 1);
-    // Idle, CRC, and illegal-command responses return before the R1b wait.
-    if (!(response & (0x01 | 0x04 | 0x08))) {
-        if (busy_bytes) {
-            expect_spi(0xFF, 0, false, busy_bytes);
-        }
-        if (ready) {
-            expect_spi(0xFF, 0xFF, false, 1);
-        }
+    // CMD12's status bits are ignored, so every response reaches the R1b wait.
+    if (busy_bytes) {
+        expect_spi(0xFF, 0, false, busy_bytes);
+    }
+    if (ready) {
+        expect_spi(0xFF, 0xFF, false, 1);
     }
     expect_release();
 }
@@ -313,10 +311,8 @@ static void test_no_response(bool stop, uint8_t invalid_byte) {
 // Check valid R1 success/error responses after discarding the stuff byte,
 // following Elm-Chan read guidance: "The received byte immediately following
 // CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
-// A final-user-block CMD18 warning concerns OUT_OF_RANGE, distinct from R1's
-// PARAMETER_ERROR (SD v3.01, section 4.3.3, p.29; section 7.3.2.1, p.129;
-// Table 7-6, pp.133-134). It does not justify masking CMD12's 0x40 status
-// without evidence of a card-specific quirk. These tests do not rule one out.
+// CMD12's status bits are ignored: a Samsung 2 GB card (MID 0x1B, 2011) keeps
+// streaming after CMD12 and its tail data is read as an error R1.
 static void test_stop_status(uint8_t response, int expected, size_t response_delay) {
     reset_card();
     expect_start(2, 0, 0);
@@ -325,6 +321,27 @@ static void test_stop_status(uint8_t response, int expected, size_t response_del
     expect_stop(response, 0, response_delay, true);
     uint8_t buffer[1024];
     finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
+}
+
+// Tail-of-stream bytes after the stuff byte, then idle: the read succeeds.
+static void test_stop_stream_tail(void) {
+    reset_card();
+    expect_start(2, 0, 0);
+    expect_block(0x31);
+    expect_block(0xA6);
+    expect_command(12, 0);
+    expect_spi(0xFF, 0x04, false, 1);
+    expect_spi(0xFF, 0x5A, false, 1);
+    expect_spi(0xFF, 0x3C, false, 1);
+    expect_spi(0xFF, 0x00, false, 2);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_release();
+    uint8_t buffer[1024];
+    uint8_t expected[1024];
+    memset(expected, 0x31, 512);
+    memset(expected + 512, 0xA6, 512);
+    finish(device.read(&device, buffer, 0, sizeof(buffer)), BD_ERROR_OK);
+    CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
 }
 
 // Exercise a full token wait across the 32-bit millisecond rollover, including
@@ -482,8 +499,8 @@ static void test_idle_command(int cmd, bool is_acmd, uint8_t r1, int expected) {
 
 // R1b permits optional busy bytes; zero means busy and nonzero means ready
 // (SD v2.00, section 7.3.2.2, p.143).
-// A timeout leaves completion unconfirmed, but must not replace a more
-// specific R1 error. The full-high check and timeout budget remain host policy.
+// A timeout leaves completion unconfirmed, so it fails even when CMD12's
+// ignored R1 had error bits. The full-high check and timeout budget remain host policy.
 // Waiting selected is synchronous-driver policy: deselection is permitted during
 // programming and R1b busy (SD v2.00, section 7.2.4, p.132, and section 7.5.1.2,
 // p.150).
@@ -560,7 +577,8 @@ int main(void) {
     RUN_CASE("stop-invalid-response", test_no_response(true, 0x80));
     RUN_CASE("stop-no-response", test_no_response(true, 0xFF));
     RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK, 0));
-    RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED, 2));
+    RUN_CASE("stop-illegal", test_stop_status(0x04, BD_ERROR_OK, 2));
+    RUN_CASE("stop-stream-tail", test_stop_stream_tail());
     RUN_CASE("command-busy-timeout", test_command_busy(false));
     RUN_CASE("app-command-busy-timeout", test_command_busy(true));
     RUN_CASE("multiblock-sdsc", test_multiblock(false, true));
@@ -575,13 +593,13 @@ int main(void) {
     RUN_CASE("read-crc-stop-busy", test_multiblock_data_failure(true, 0, true));
     RUN_CASE("crc-disabled", test_multiblock(false, false));
     RUN_CASE("repeated-read", test_repeated_read());
-    RUN_CASE("stop-crc", test_stop_status(0x08, SD_BLOCK_DEVICE_ERROR_CRC, 2));
-    RUN_CASE("stop-parameter", test_stop_status(0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER, 2));
-    RUN_CASE("stop-erase", test_stop_status(0x10, SD_BLOCK_DEVICE_ERROR_ERASE, 2));
+    RUN_CASE("stop-crc", test_stop_status(0x08, BD_ERROR_OK, 2));
+    RUN_CASE("stop-parameter", test_stop_status(0x40, BD_ERROR_OK, 2));
+    RUN_CASE("stop-erase", test_stop_status(0x10, BD_ERROR_OK, 2));
     RUN_CASE("stop-no-busy", test_stop_status(0, BD_ERROR_OK, 2));
     // Seven delayed bytes plus the stuff byte exercise eight filler bytes.
     RUN_CASE("stop-max-response-delay", test_stop_status(0, BD_ERROR_OK, 7));
-    RUN_CASE("stop-idle", test_stop_status(0x01, SD_BLOCK_DEVICE_ERROR_NO_INIT, 2));
+    RUN_CASE("stop-idle", test_stop_status(0x01, BD_ERROR_OK, 2));
     RUN_CASE("idle-cmd16", test_idle_command(16, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
     RUN_CASE("idle-cmd32", test_idle_command(32, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
     RUN_CASE("idle-cmd33", test_idle_command(33, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
@@ -597,8 +615,8 @@ int main(void) {
     RUN_CASE("idle-erase-error", test_idle_command(16, false, 0x11, SD_BLOCK_DEVICE_ERROR_ERASE));
     RUN_CASE("stop-busy-timeout", test_stop_busy(false, 0, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE));
     RUN_CASE("stop-busy-wrap", test_stop_busy(true, 0, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE));
-    RUN_CASE("stop-busy-parameter", test_stop_busy(false, 0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER));
-    RUN_CASE("stop-busy-erase", test_stop_busy(false, 0x10, SD_BLOCK_DEVICE_ERROR_ERASE));
+    RUN_CASE("stop-busy-parameter", test_stop_busy(false, 0x40, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE));
+    RUN_CASE("stop-busy-erase", test_stop_busy(false, 0x10, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE));
     RUN_CASE("erase-busy-timeout", test_erase_busy_timeout());
     RUN_CASE("trim-sdsc-long-busy", test_trim_busy(false, false, false));
     RUN_CASE("trim-sdhc-long-busy", test_trim_busy(true, false, false));

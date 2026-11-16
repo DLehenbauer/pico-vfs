@@ -444,6 +444,12 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         *resp = response;
     }
 
+    // Some cards keep streaming after CMD12, so its "R1" can be a data byte.
+    // Ignore its status bits and rely on the R1b busy wait below.
+    if ((CMD12_STOP_TRANSMISSION == cmd) && (R1_NO_RESPONSE != response)) {
+        response = 0;
+    }
+
     // Process the response R1  : Exit on CRC/Illegal command error/No response
     if (R1_NO_RESPONSE == response) {
         _postclock_then_deselect(config);
