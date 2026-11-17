@@ -37,6 +37,7 @@ static size_t event_index;
 static bool cs_high;
 static uint64_t now_us;
 static uint64_t time_step_us;
+static bool startup_pending;
 static blockdevice_sd_config_t config;
 static blockdevice_t device;
 spi_inst_t mock_spi_instances[2] = {{0}, {1}};
@@ -52,6 +53,11 @@ static void expect_cs(bool cs) {
 }
 
 static uint8_t exchange(uint8_t tx) {
+    if (startup_pending) {
+        CHECK(cs_high);
+        CHECK(now_us >= 1000);
+        startup_pending = false;
+    }
     CHECK(event_index < event_count);
     event_t *event = &events[event_index];
     CHECK(!event->gpio);
@@ -85,6 +91,12 @@ int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, s
 
 int spi_write_blocking(spi_inst_t *spi, const uint8_t *src, size_t len) {
     return spi_write_read_blocking(spi, src, NULL, len);
+}
+
+void gpio_set_dir(unsigned gpio, bool out) {
+    CHECK(gpio == config.cs);
+    CHECK(out == GPIO_OUT);
+    CHECK(cs_high);
 }
 
 void gpio_put(unsigned gpio, bool value) {
@@ -129,6 +141,7 @@ static void reset_card(void) {
     cs_high = true;
     now_us = 0;
     time_step_us = 1000;
+    startup_pending = false;
     config = (blockdevice_sd_config_t){
         .spi_inst = spi0,
         .cs = 17,
@@ -523,6 +536,21 @@ static void test_erase_busy_timeout(void) {
 // exceeding the old 5 s production budget. Check both address formats, budget
 // expiration, and rollover. Only trim's CMD38 gets the scaled busy budget;
 // CMD12 and pre-command waits retain the command timeout.
+// Power-up needs at least 74 clocks with CS/DI high (SD v3.01, section 6.4.1, p.111).
+// The 1 ms settling wait follows Elm-Chan SPI initialization guidance
+// (See: https://elm-chan.org/docs/mmc/mmc_e.html#spiinit).
+static void test_power_up(void) {
+    reset_card();
+    cs_high = false;
+    time_step_us = 0;
+    startup_pending = true;
+    expect_cs(true);
+    expect_spi(0xFF, 0xFF, true, 10);
+    _spi_init(&config);
+    CHECK(!startup_pending);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+}
+
 static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
     reset_card();
     config.card_type = high_capacity ? SDCARD_V2HC : SDCARD_V1;
@@ -556,6 +584,7 @@ int main(void) {
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
     RUN_CASE("token-timeout-wrap", test_token_wrap(true));
     RUN_CASE("wide-busy-timeout", test_wide_busy_timeout());
+    RUN_CASE("power-up", test_power_up());
     RUN_CASE("start-invalid-response", test_no_response(false, 0x80));
     RUN_CASE("stop-invalid-response", test_no_response(true, 0x80));
     RUN_CASE("stop-no-response", test_no_response(true, 0xFF));
