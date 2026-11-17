@@ -72,13 +72,13 @@ static uint8_t exchange(uint8_t tx) {
 }
 
 unsigned spi_init(spi_inst_t *spi, unsigned baudrate) {
-    CHECK(spi == spi0);
+    CHECK(spi == config.spi_inst);
     initialized_baudrate = baudrate;
     return baudrate;
 }
 
 int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, size_t len) {
-    CHECK(spi == spi0);
+    CHECK(spi == config.spi_inst);
     for (size_t i = 0; i < len; ++i) {
         uint8_t rx = exchange(src[i]);
         if (dst) {
@@ -89,7 +89,7 @@ int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, s
 }
 
 int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, size_t len) {
-    CHECK(spi == spi0);
+    CHECK(spi == config.spi_inst);
     for (size_t i = 0; i < len; ++i) {
         dst[i] = exchange(repeated_tx_data);
     }
@@ -193,6 +193,14 @@ static uint16_t reference_crc16(const uint8_t *data, size_t len) {
         }
     }
     return crc;
+}
+
+static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
+    for (unsigned bit = lsb; bit <= msb; ++bit) {
+        uint8_t mask = 1u << (bit % 8);
+        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
+                           ((value & (1u << (bit - lsb))) ? mask : 0);
+    }
 }
 
 static void expect_select(void) {
@@ -665,7 +673,54 @@ static void test_init_clock(void) {
     finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
+// SPI1 RX includes GPIO24 and GPIO28 (RP2040 datasheet, section 1.4.3,
+// Table 2, pp.12-13); SD does not specify the host's GPIO routing. The
+// ordinary CSD fixture is only enough to initialize a small SDSC card.
+static void test_create_spi1_miso(unsigned miso) {
+    reset_card();
+    config.spi_inst = spi1;
+    expect_spi(0xFF, 0xFF, true, 10);
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD8_SEND_IF_COND, 0x1AA);
+    expect_spi(0xFF, R1_ILLEGAL_COMMAND | R1_IDLE_STATE, false, 1);
+    expect_release();
+    expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, 0, 0, 0);
+
+    uint8_t csd[16] = {0};
+    set_csd_bits(csd, 83, 80, 9);
+    set_csd_bits(csd, 73, 62, 1023);
+    set_csd_bits(csd, 49, 47, 0);
+    uint16_t crc = reference_crc16(csd, sizeof(csd));
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD9_SEND_CSD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFE, false, 1);
+    for (size_t i = 0; i < sizeof(csd); ++i) {
+        expect_spi(0xFF, csd[i], false, 1);
+    }
+    expect_spi(0xFF, crc >> 8, false, 1);
+    expect_spi(0xFF, crc, false, 1);
+    expect_release();
+    expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
+
+    blockdevice_t *created =
+        blockdevice_sd_create(spi1, 27, miso, 26, 17, 12000000, true);
+    CHECK(created != NULL);
+    blockdevice_sd_config_t *created_config = created->config;
+    CHECK(created->is_initialized && created_config->is_initialized);
+    CHECK(created_config->spi_inst == spi1 && created_config->miso == miso);
+    CHECK(event_index == event_count && !created_config->_mutex.locked);
+    blockdevice_sd_free(created);
+}
+
 int main(void) {
+    RUN_CASE("create-spi1-miso24", test_create_spi1_miso(24));
+    RUN_CASE("create-spi1-miso28", test_create_spi1_miso(28));
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
