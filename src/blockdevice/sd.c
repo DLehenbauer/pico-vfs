@@ -956,11 +956,10 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
     return status;
 }
 
-static uint8_t _write(void *_config, const uint8_t *buffer, uint8_t token, uint32_t length) {
+static int _write(void *_config, const uint8_t *buffer, uint8_t token, uint32_t length) {
     blockdevice_sd_config_t *config = _config;
 
     uint32_t crc = (~0);
-    uint8_t response = 0xFF;
 
     // indicate start of block
     _spi_write(config, token);
@@ -978,14 +977,22 @@ static uint8_t _write(void *_config, const uint8_t *buffer, uint8_t token, uint3
 
 
     // check the response token
-    response = _spi_write(config, SPI_FILL_CHAR);
+    uint8_t response = _spi_write(config, SPI_FILL_CHAR);
+    if ((response & SPI_DATA_RESPONSE_MASK) != SPI_DATA_ACCEPTED) {
+        debug_if(SD_DBG, "%s Block Write failed: data response 0x%02x\n",
+                 token == SPI_START_BLOCK ? "Single" : "Multiple", (unsigned)response);
+    }
 
     // Wait for last block to be written
     if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
-        debug_if(SD_DBG, "Card not ready yet \n");
+        debug_if(SD_DBG, "%s Block Write timed out waiting for ready\n",
+                 token == SPI_START_BLOCK ? "Single" : "Multiple");
+        return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
     }
 
-    return (response & SPI_DATA_RESPONSE_MASK);
+    return (response & SPI_DATA_RESPONSE_MASK) == SPI_DATA_ACCEPTED
+        ? BD_ERROR_OK
+        : SD_BLOCK_DEVICE_ERROR_WRITE;
 }
 
 
@@ -1005,7 +1012,6 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
 
     const uint8_t *buffer = (const uint8_t *)_buffer;
     int status = BD_ERROR_OK;
-    uint8_t response;
 
     // Get block count
     size_t block_count = size / config->block_size;
@@ -1025,13 +1031,7 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
         }
 
         // Write data 
-        response = _write(config, buffer, SPI_START_BLOCK, config->block_size);
-
-        // Only CRC and general write error are communicated via response token
-        if (response != SPI_DATA_ACCEPTED) {
-            debug_if(SD_DBG, "Single Block Write failed: 0x%x \n", response);
-            status = SD_BLOCK_DEVICE_ERROR_WRITE;
-        }
+        status = _write(config, buffer, SPI_START_BLOCK, config->block_size);
     } else {
         // Pre-erase setting prior to multiple block write operation
         _cmd(config, ACMD23_SET_WR_BLK_ERASE_COUNT, block_count, 1, NULL);
@@ -1044,19 +1044,26 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
 
         // Write the data: one block at a time
         do {
-            response = _write(config, buffer, SPI_START_BLK_MUL_WRITE, config->block_size);
-            if (response != SPI_DATA_ACCEPTED) {
-                debug_if(SD_DBG, "Multiple Block Write failed: 0x%x \n", response);
+            status = _write(config, buffer, SPI_START_BLK_MUL_WRITE, config->block_size);
+            if (status != BD_ERROR_OK) {
                 break;
             }
             buffer += config->block_size;
         } while (--block_count);     // Receive all blocks of data
 
-        /* In a Multiple Block write operation, the stop transmission will be done by
-         * sending 'Stop Tran' token instead of 'Start Block' token at the beginning
-         * of the next block
-         */
-        _spi_write(config, SPI_STOP_TRAN);
+        // A ready card can safely be aborted after rejecting a block. Preserve
+        // the write error if CMD12 also fails. Never command a card that is
+        // still busy after a programming timeout.
+        if (status == SD_BLOCK_DEVICE_ERROR_WRITE) {
+            _cmd(config, CMD12_STOP_TRANSMISSION, 0, false, NULL);
+            mutex_exit(&config->_mutex);
+            return status;
+        }
+
+        if (status == BD_ERROR_OK) {
+            // Stop Tran terminates a successful multiple-block write.
+            _spi_write(config, SPI_STOP_TRAN);
+        }
     }
 
     _postclock_then_deselect(config);
