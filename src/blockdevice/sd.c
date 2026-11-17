@@ -600,8 +600,13 @@ static int init_card(void *_config) {
         return status;
     }
 
+    // When requested, enable CRC before ACMD41 (SD v3.01, section 7.2.2, p.116).
     if (config->enable_crc) {
         status = _cmd(config, CMD59_CRC_ON_OFF, config->enable_crc, 0, NULL);
+        // Abort on rejection rather than using an unconfirmed CRC mode (host policy).
+        if (BD_ERROR_OK != status) {
+            return status;
+        }
     }
 
     // Read OCR - CMD58 Response contains OCR register
@@ -656,10 +661,9 @@ static int init_card(void *_config) {
     }
 
     if (!config->enable_crc) {
-        // Disable CRC
+        // CMD59 bit 0 selects CRC mode (SD v3.01, Table 7-3, p.126).
+        // Only send zero when CRC is disabled. Otherwise retain the enabled mode.
         status = _cmd(config, CMD59_CRC_ON_OFF, config->enable_crc, 0x0, &response);
-    } else {
-        status = _cmd(config, CMD59_CRC_ON_OFF, 0, 0x0, &response);
     }
     return status;
 }
