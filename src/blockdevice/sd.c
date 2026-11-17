@@ -382,6 +382,18 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
         if (!(response & R1_RESPONSE_RECV)) {
             return response;
         }
+
+        // A card stopped mid-byte by CMD12 can send its R1 unaligned, e.g. E0 1F
+        // is 0x00 three bits late. Realign it, as Linux mmc_spi does (ab5a643c).
+        if ((CMD12_STOP_TRANSMISSION == cmd) && (response != 0xFF)) {
+            uint8_t next;
+            spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &next, 1);
+            uint16_t bits = (uint16_t)((response << 8) | next);
+            while (bits & 0x8000) {
+                bits <<= 1;
+            }
+            return (uint8_t)(bits >> 8);
+        }
     }
 
     // Tell _cmd() no valid R1 arrived so it can retry (or report failure if retries are exhausted).

@@ -395,6 +395,26 @@ static void test_stop_status(uint8_t response, int expected, size_t response_del
     finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
 }
 
+// Bytes captured from a Samsung 2 GB card (MID 0x1B, 2011) after CMD12: stuff
+// byte 3F (two data bits), then E0 1F, an R1 of 0x00 three bits late.
+// E0 9F is the same alignment carrying ILLEGAL_COMMAND, which must still fail.
+static void test_stop_unaligned(uint8_t second, int expected) {
+    reset_card();
+    expect_start(2, 0, 0);
+    expect_block(0x31);
+    expect_block(0xA6);
+    expect_command(12, 0);
+    expect_spi(0xFF, 0x3F, false, 1);
+    expect_spi(0xFF, 0xE0, false, 1);
+    expect_spi(0xFF, second, false, 1);
+    if (BD_ERROR_OK == expected) {
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
+    expect_release();
+    uint8_t buffer[1024];
+    finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
+}
+
 // Exercise a full token wait across the 32-bit millisecond rollover, including
 // the pre-rollover window where an overflowing deadline used to fail immediately.
 static void test_token_wrap(bool timeout) {
@@ -656,7 +676,8 @@ int main(void) {
     RUN_CASE("wide-busy-timeout", test_wide_busy_timeout());
     RUN_CASE("power-up", test_power_up());
     RUN_CASE("start-invalid-response", test_no_response(false, 0x80));
-    RUN_CASE("stop-invalid-response", test_no_response(true, 0x80));
+    RUN_CASE("stop-unaligned", test_stop_unaligned(0x1F, BD_ERROR_OK));
+    RUN_CASE("stop-unaligned-illegal", test_stop_unaligned(0x9F, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED));
     RUN_CASE("stop-no-response", test_no_response(true, 0xFF));
     RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK, 0));
     RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED, 2));
