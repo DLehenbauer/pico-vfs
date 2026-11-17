@@ -6,10 +6,15 @@ endif()
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(sd_spi_tests test_sd_spi.c)
-target_include_directories(sd_spi_tests PRIVATE mocks ../../include)
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(sd_spi_tests PRIVATE -Wall -Wextra -Werror)
-endif()
-
+# The production timeout exercises trim's minimum-budget branch; the short
+# timeout alone cannot. That floor is driver policy, not an SD timing minimum.
+foreach(target sd_spi_tests sd_spi_tests_production_timeout)
+  add_executable(${target} test_sd_spi.c)
+  target_include_directories(${target} PRIVATE mocks ../../include)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+  endif()
+endforeach()
+target_compile_definitions(sd_spi_tests PRIVATE CONF_SD_CMD_TIMEOUT=5)
 add_test(NAME sd_spi COMMAND sd_spi_tests)
+add_test(NAME sd_spi_production_timeout COMMAND sd_spi_tests_production_timeout)
