@@ -831,6 +831,7 @@ static int init(blockdevice_t *device) {
         return err;
     }
 
+    device->erase_size = config->erase_size;
     device->is_initialized = true;
     mutex_exit(&config->_mutex);
     return BD_ERROR_OK;

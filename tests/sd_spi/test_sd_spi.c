@@ -249,6 +249,42 @@ static void expect_block(uint8_t value) {
     expect_block_crc(value, !config.enable_crc);
 }
 
+static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
+    for (unsigned bit = lsb; bit <= msb; ++bit) {
+        uint8_t mask = 1u << (bit % 8);
+        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
+                           ((value & (1u << (bit - lsb))) ? mask : 0);
+    }
+}
+
+static void make_ordinary_csd(uint8_t *csd, bool high_capacity) {
+    memset(csd, 0, 16);
+    set_csd_bits(csd, 127, 126, high_capacity ? 1 : 0);
+    if (high_capacity) {
+        set_csd_bits(csd, 69, 48, 0);
+    } else {
+        set_csd_bits(csd, 83, 80, 9);
+        set_csd_bits(csd, 73, 62, 1023);
+        set_csd_bits(csd, 49, 47, 0);
+        set_csd_bits(csd, 45, 39, 3);
+    }
+}
+
+static void expect_csd(const uint8_t *csd) {
+    uint16_t crc = reference_crc16(csd, 16);
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD9_SEND_CSD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, SPI_START_BLOCK, false, 1);
+    for (size_t i = 0; i < 16; ++i) {
+        expect_spi(0xFF, csd[i], false, 1);
+    }
+    expect_spi(0xFF, crc >> 8, false, 1);
+    expect_spi(0xFF, crc, false, 1);
+    expect_release();
+}
+
 // CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
 // Discard the stuff byte, following Elm-Chan read guidance: "The received byte
 // immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
@@ -295,6 +331,26 @@ static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_
         }
     }
     expect_release();
+}
+
+static void expect_card_init(bool high_capacity) {
+    expect_spi(0xFF, 0xFF, true, 10);
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+    if (high_capacity) {
+        expect_init_command(CMD8_SEND_IF_COND, 0x1AA, 1, 0x1AA);
+    } else {
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_command(CMD8_SEND_IF_COND, 0x1AA);
+        expect_spi(0xFF, R1_ILLEGAL_COMMAND, false, 1);
+        expect_release();
+    }
+    expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, high_capacity ? OCR_HCS_CCS : 0, 0, 0);
+    if (high_capacity) {
+        expect_init_command(CMD58_READ_OCR, 0, 0, OCR_3_3V | OCR_HCS_CCS);
+    }
 }
 
 // CMD59 controls CRC mode and should enable it before ACMD41 when requested
@@ -665,6 +721,26 @@ static void test_init_clock(void) {
     finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
+static void test_erase_geometry(void) {
+    for (unsigned high_capacity = 0; high_capacity < 2; ++high_capacity) {
+        reset_card();
+        uint8_t csd[16];
+        make_ordinary_csd(csd, high_capacity);
+        expect_card_init(high_capacity);
+        expect_csd(csd);
+        expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
+
+        finish(init(&device), BD_ERROR_OK);
+        size_t expected = high_capacity ? 512u : 2048u;
+        CHECK(device.erase_size == expected);
+        CHECK(device.erase_size == config.erase_size);
+        CHECK(_is_valid_trim(&device, expected, expected));
+        if (expected > 512) {
+            CHECK(!_is_valid_trim(&device, 512, 512));
+        }
+    }
+}
+
 int main(void) {
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
@@ -725,5 +801,6 @@ int main(void) {
     RUN_CASE("trim-busy-timeout", test_trim_busy(true, true, false));
     RUN_CASE("trim-busy-wrap", test_trim_busy(true, false, true));
     RUN_CASE("init-clock", test_init_clock());
+    RUN_CASE("erase-geometry", test_erase_geometry());
     return EXIT_SUCCESS;
 }
