@@ -665,7 +665,38 @@ static void test_init_clock(void) {
     finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
+// R3/R7 continuations are assembled as unsigned 32-bit values. In particular,
+// CMD58 OCR bit 31 must not be promoted and shifted as a signed int.
+static void test_response_arithmetic(void) {
+    static const struct {
+        int cmd;
+        uint8_t r1;
+        uint8_t bytes[4];
+        uint32_t expected;
+    } cases[] = {
+        {CMD8_SEND_IF_COND, R1_IDLE_STATE, {0x81, 0xA5, 0x5A, 0xC3}, 0x81A55AC3},
+        {CMD58_READ_OCR, 0, {0xC0, 0xFF, 0x80, 0x00}, 0xC0FF8000},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_card();
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_command(cases[i].cmd, 0);
+        expect_spi(0xFF, cases[i].r1, false, 1);
+        for (size_t byte = 0; byte < sizeof(cases[i].bytes); ++byte) {
+            expect_spi(0xFF, cases[i].bytes[byte], false, 1);
+        }
+        expect_release();
+
+        uint32_t response = R1_NO_RESPONSE;
+        finish(_cmd(&config, cases[i].cmd, 0, false, &response), BD_ERROR_OK);
+        CHECK(response == cases[i].expected);
+    }
+}
+
 int main(void) {
+    RUN_CASE("response-arithmetic", test_response_arithmetic());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
