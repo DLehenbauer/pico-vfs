@@ -529,8 +529,10 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
             }
             break;
 
+        // CMD13 and ACMD13 both use opcode 13 and return SPI R2. Preserve R1
+        // while appending the second status byte.
         case ACMD13_SD_STATUS:             // Response R2
-            response = _spi_write(config, SPI_FILL_CHAR);
+            response = (response << 8) | _spi_write(config, SPI_FILL_CHAR);
             debug_if(SD_DBG, "R2: 0x%" PRIx32 "\n", response);
             break;
 
