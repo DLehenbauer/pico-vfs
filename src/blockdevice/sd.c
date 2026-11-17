@@ -647,25 +647,30 @@ static int init_card(void *_config) {
     absolute_time_t timeout = make_timeout_time_ms(SD_COMMAND_TIMEOUT);
     do {
         status = _cmd(config, ACMD41_SD_SEND_OP_COND, arg, 1, &response);
-    } while ((response & R1_IDLE_STATE) && (0 < absolute_time_diff_us(get_absolute_time(), timeout)));
+    } while (status == BD_ERROR_OK && (response & R1_IDLE_STATE) &&
+             (0 < absolute_time_diff_us(get_absolute_time(), timeout)));
 
-    // Initialization complete: ACMD41 successful
+    // Preserve command errors; report a still-idle card as an initialization timeout.
     if ((BD_ERROR_OK != status) || (0x00 != response)) {
         config->card_type = CARD_UNKNOWN;
         debug_if(SD_DBG, "Timeout waiting for card\n");
-        return status;
+        return status == BD_ERROR_OK ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : status;
     }
 
     if (SDCARD_V2 == config->card_type) {
-        // Get the card capacity CCS: CMD58
-        if (BD_ERROR_OK == (status = _cmd(config, CMD58_READ_OCR, 0x0, 0x0, &response))) {
-            // High Capacity card
-            if (response & OCR_HCS_CCS) {
-                config->card_type = SDCARD_V2HC;
-                debug_if(SD_DBG, "Card Initialized: High Capacity Card \n");
-            } else {
-                debug_if(SD_DBG, "Card Initialized: Standard Capacity Card: Version 2.x \n");
-            }
+        // Read CCS after ACMD41 to choose SDSC versus SDHC/SDXC addressing.
+        // Preserve failure to establish the addressing mode.
+        status = _cmd(config, CMD58_READ_OCR, 0x0, 0x0, &response);
+        if (status != BD_ERROR_OK) {
+            config->card_type = CARD_UNKNOWN;
+            return status;
+        }
+        // High Capacity card
+        if (response & OCR_HCS_CCS) {
+            config->card_type = SDCARD_V2HC;
+            debug_if(SD_DBG, "Card Initialized: High Capacity Card \n");
+        } else {
+            debug_if(SD_DBG, "Card Initialized: Standard Capacity Card: Version 2.x \n");
         }
     } else {
         config->card_type = SDCARD_V1;

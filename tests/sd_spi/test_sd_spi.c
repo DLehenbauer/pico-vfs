@@ -289,7 +289,8 @@ static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_
     }
     expect_command(cmd, arg);
     expect_spi(0xFF, response, false, 1);
-    if (cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR) {
+    if ((cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR) &&
+        !(response & (R1_COM_CRC_ERROR | R1_ILLEGAL_COMMAND))) {
         for (int shift = 24; shift >= 0; shift -= 8) {
             expect_spi(0xFF, extra >> shift, false, 1);
         }
@@ -319,6 +320,74 @@ static void test_init_crc(bool enabled, bool rejected) {
         }
     }
     finish(init_card(&config), rejected ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
+}
+
+
+// Legacy/V2 detection, HCS, ACMD41 polling, and post-init CCS determine these
+// sequences and card types (SD v9.10, section 7.2.1, Figure 7-2, pp.287-289).
+static void expect_card_init(uint8_t card_type, bool polling) {
+    bool v2 = card_type != SDCARD_V1;
+    expect_spi(0xFF, 0xFF, true, 10);
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+    expect_init_command(CMD8_SEND_IF_COND, 0x1AA, v2 ? 1 : 0x05, 0x1AA);
+    if (config.enable_crc) {
+        expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    }
+    expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+    if (polling) {
+        expect_init_command(ACMD41_SD_SEND_OP_COND, v2 ? OCR_HCS_CCS : 0, 1, 0);
+    }
+    expect_init_command(ACMD41_SD_SEND_OP_COND, v2 ? OCR_HCS_CCS : 0, 0, 0);
+    if (v2) {
+        expect_init_command(CMD58_READ_OCR, 0, 0,
+                            OCR_3_3V | (card_type == SDCARD_V2HC ? OCR_HCS_CCS : 0));
+    }
+    if (!config.enable_crc) {
+        expect_init_command(CMD59_CRC_ON_OFF, 0, 0, 0);
+    }
+}
+
+static void test_init_types(void) {
+    for (uint8_t type = SDCARD_V1; type <= SDCARD_V2HC; ++type) {
+        for (unsigned crc = 0; crc < 2; ++crc) {
+            reset_card();
+            config.card_type = SDCARD_NONE;
+            config.enable_crc = crc;
+            expect_card_init(type, true);
+            finish(init_card(&config), BD_ERROR_OK);
+            CHECK(config.card_type == type);
+        }
+    }
+}
+
+// Initialization deadlines and preserving the first failure are host policy.
+static void test_init_failures(void) {
+    static const struct {
+        uint8_t acmd41;
+        uint8_t final_ocr;
+        int status;
+    } cases[] = {
+        {1, 0, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE},
+        {0x09, 0, SD_BLOCK_DEVICE_ERROR_CRC},
+        {0, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_card();
+        config.enable_crc = false;
+        if (cases[i].acmd41 == 1) {
+            time_step_us = (uint64_t)SD_COMMAND_TIMEOUT * 1000;
+        }
+        expect_spi(0xFF, 0xFF, true, 10);
+        expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+        expect_init_command(CMD8_SEND_IF_COND, 0x1AA, 1, 0x1AA);
+        expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+        expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, cases[i].acmd41, 0);
+        if (!cases[i].acmd41) {
+            expect_init_command(CMD58_READ_OCR, 0, cases[i].final_ocr, 0);
+        }
+        finish(init_card(&config), cases[i].status);
+        CHECK(config.card_type == CARD_UNKNOWN);
+    }
 }
 
 // Checks CMD17 at SDSC byte address 1024, command CRC7, start token, all 512 data
@@ -669,6 +738,8 @@ int main(void) {
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
+    RUN_CASE("init-types", test_init_types());
+    RUN_CASE("init-failures", test_init_failures());
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("start-rejected", test_start_rejected());
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
