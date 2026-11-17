@@ -415,6 +415,70 @@ static void test_stop_unaligned(uint8_t second, int expected) {
     finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
 }
 
+// A valid CMD55 prefix is required before every application command. Fail
+// closed when the prefix is unanswered or reports an R1 error.
+static void test_app_prefix_failure(void) {
+    static const struct {
+        uint8_t response;
+        int status;
+    } cases[] = {
+        {R1_COM_CRC_ERROR, SD_BLOCK_DEVICE_ERROR_CRC},
+        {R1_ILLEGAL_COMMAND, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {R1_ERASE_RESET, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {R1_PARAMETER_ERROR, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {R1_NO_RESPONSE, SD_BLOCK_DEVICE_ERROR_NO_DEVICE},
+    };
+    static const int commands[] = {
+        ACMD13_SD_STATUS,
+        ACMD23_SET_WR_BLK_ERASE_COUNT,
+        ACMD41_SD_SEND_OP_COND,
+    };
+    const char *outer_case = current_case;
+    for (size_t cmd = 0; cmd < sizeof(commands) / sizeof(commands[0]); ++cmd) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            char name[96];
+            snprintf(name, sizeof(name), "%s/cmd-%zu/case-%zu", outer_case, cmd, i);
+            current_case = name;
+            reset_card();
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            for (unsigned attempt = 0;
+                 attempt < (cases[i].response == R1_NO_RESPONSE ? 3u : 1u); ++attempt) {
+                expect_command(CMD55_APP_CMD, 0);
+                if (cases[i].response == R1_NO_RESPONSE) {
+                    expect_spi(0xFF, 0xFF, false, 16);
+                } else {
+                    expect_spi(0xFF, cases[i].response, false, 1);
+                }
+            }
+            expect_release();
+            uint32_t response = 0x12345678;
+            finish(_cmd(&config, commands[cmd], 0, true, &response), cases[i].status);
+            CHECK(response == cases[i].response);
+        }
+    }
+    current_case = outer_case;
+}
+
+// Reissue CMD55 after an unanswered prefix, then send the application opcode.
+static void test_app_prefix_retry(void) {
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0xFF, false, 16);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(ACMD41_SD_SEND_OP_COND, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_release();
+
+    uint32_t response = R1_NO_RESPONSE;
+    finish(_cmd(&config, ACMD41_SD_SEND_OP_COND, 0, true, &response), BD_ERROR_OK);
+    CHECK(response == 0);
+}
+
 // Exercise a full token wait across the 32-bit millisecond rollover, including
 // the pre-rollover window where an overflowing deadline used to fail immediately.
 static void test_token_wrap(bool timeout) {
@@ -666,6 +730,8 @@ static void test_init_clock(void) {
 }
 
 int main(void) {
+    RUN_CASE("app-prefix-failure", test_app_prefix_failure());
+    RUN_CASE("app-prefix-retry", test_app_prefix_retry());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
