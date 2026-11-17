@@ -480,6 +480,68 @@ static void test_cmd13_release(void) {
     CHECK(response == 0xA5);
 }
 
+// CMD13 and ACMD13 share opcode 13 and return R2: R1 followed by a second
+// status byte. Preserve nonzero R1 status while returning the complete value.
+static void test_r2_status(void) {
+    static const struct {
+        int cmd;
+        bool app;
+        uint8_t r1;
+        uint8_t second;
+        bool reads_second;
+        uint32_t response;
+        int status;
+    } cases[] = {
+        {CMD13_SEND_STATUS, false, 0x00, 0x5A, true, 0x005A, BD_ERROR_OK},
+        {CMD13_SEND_STATUS, false, 0x02, 0xA5, true, 0x02A5,
+         SD_BLOCK_DEVICE_ERROR_ERASE},
+        {CMD13_SEND_STATUS, false, R1_COM_CRC_ERROR, 0, false, R1_COM_CRC_ERROR,
+         SD_BLOCK_DEVICE_ERROR_CRC},
+        {ACMD13_SD_STATUS, true, 0x00, 0xA5, true, 0x00A5, BD_ERROR_OK},
+        {ACMD13_SD_STATUS, true, R1_ILLEGAL_COMMAND, 0, false, R1_ILLEGAL_COMMAND,
+         SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+    };
+    const char *outer_case = current_case;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "%s/case-%zu", outer_case, i);
+        current_case = name;
+        reset_card();
+        bool read_status_block = cases[i].app && cases[i].status == BD_ERROR_OK;
+        uint8_t expected[64];
+        uint8_t actual[64] = {0};
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        if (cases[i].app) {
+            expect_command(CMD55_APP_CMD, 0);
+            expect_spi(0xFF, 0, false, 1);
+            expect_spi(0xFF, 0xFF, false, 1);
+        }
+        expect_command(cases[i].cmd, 0);
+        expect_spi(0xFF, cases[i].r1, false, 1);
+        if (cases[i].reads_second) {
+            expect_spi(0xFF, cases[i].second, false, 1);
+        }
+        if (read_status_block) {
+            fill_pattern(expected, sizeof(expected));
+            expect_status_block(expected, sizeof(expected), false);
+        }
+        expect_release();
+        uint32_t response = R1_NO_RESPONSE;
+        int status = _cmd(&config, cases[i].cmd, 0, cases[i].app, &response);
+        CHECK(status == cases[i].status);
+        CHECK(response == cases[i].response);
+        if (read_status_block) {
+            CHECK(!cs_high);
+            status = _read_bytes(&config, actual, sizeof(actual));
+            CHECK(status == BD_ERROR_OK);
+            CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+        }
+        finish(status, cases[i].status);
+    }
+    current_case = outer_case;
+}
+
 // Exercise a full token wait across the 32-bit millisecond rollover, including
 // the pre-rollover window where an overflowing deadline used to fail immediately.
 static void test_token_wrap(bool timeout) {
@@ -734,6 +796,7 @@ int main(void) {
     RUN_CASE("acmd13-status-data", test_acmd13_data(false));
     RUN_CASE("acmd13-status-crc", test_acmd13_data(true));
     RUN_CASE("cmd13-release", test_cmd13_release());
+    RUN_CASE("r2-status", test_r2_status());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
