@@ -405,6 +405,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
     blockdevice_sd_config_t *config = _config;
     int32_t status = BD_ERROR_OK;
     uint32_t response;
+    bool prefix_failed = false;
 
     // If resp is provided, initialize it with R1_NO_RESPONSE to prevent callers
     // from using a stale/uninitialized response if no valid R1 arrives.
@@ -430,9 +431,16 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
 
     // Re-try command
     for (int i = 0; i < 3; i++) {
-        // Send CMD55 for APP command first
+        // Every application command requires a successful CMD55 prefix.
         if (is_acmd) {
             response = _cmd_spi(config, CMD55_APP_CMD, 0x0);
+            if (R1_NO_RESPONSE == response) {
+                continue;
+            }
+            if (response & ~R1_IDLE_STATE) {
+                prefix_failed = true;
+                break;
+            }
             // Wait for card to be ready after CMD55
             if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
                 debug_if(SD_DBG, "Card not ready yet \n");
@@ -487,6 +495,12 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         // (SD v3.01, section 7.3.2.1, p.129).
         status = SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
+    if (prefix_failed) {
+        // This is CMD55's R1. Do not send the application opcode or consume
+        // bytes from its response or data phase.
+        _postclock_then_deselect(config);
+        return status;
+    }
 
     // Idle means initialization is in progress, not operational-command success
     // (SD v3.01, section 7.3.2.1, p.129).
@@ -529,8 +543,10 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
             }
             break;
 
+        // CMD13 and ACMD13 both use opcode 13 and return SPI R2. Preserve R1
+        // while appending the second status byte.
         case ACMD13_SD_STATUS:             // Response R2
-            response = _spi_write(config, SPI_FILL_CHAR);
+            response = (response << 8) | _spi_write(config, SPI_FILL_CHAR);
             debug_if(SD_DBG, "R2: 0x%" PRIx32 "\n", response);
             break;
 
@@ -543,8 +559,10 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         *resp = response;
     }
 
-    // Do not deselect card if read is in progress.
-    if (((CMD9_SEND_CSD == cmd) || (ACMD22_SEND_NUM_WR_BLOCKS == cmd) ||
+    // Do not deselect card if a read is in progress. ACMD13 returns R2 followed
+    // by the 64-byte SD Status data block; bare CMD13 has only R2.
+    if (((CMD9_SEND_CSD == cmd) || (is_acmd && ACMD13_SD_STATUS == cmd) ||
+            (ACMD22_SEND_NUM_WR_BLOCKS == cmd) ||
             (CMD24_WRITE_BLOCK == cmd) || (CMD25_WRITE_MULTIPLE_BLOCK == cmd) ||
             (CMD17_READ_SINGLE_BLOCK == cmd) || (CMD18_READ_MULTIPLE_BLOCK == cmd))
             && (BD_ERROR_OK == status)) {

@@ -43,7 +43,23 @@ static uint64_t time_step_us;
 static bool startup_pending;
 static blockdevice_sd_config_t config;
 static blockdevice_t device;
+static unsigned mutex_entries;
+static unsigned mutex_exits;
+static bool observing_lifecycle;
+static bool initializing;
+static bool entry_config_initialized;
+static bool entry_device_initialized;
+static bool initialized_on_unlock;
+static bool observing_ready_io;
 spi_inst_t mock_spi_instances[2] = {{0}, {1}};
+
+static void check_spi_state(void) {
+    if ((observing_lifecycle && initializing) || observing_ready_io) {
+        CHECK(config._mutex.locked);
+        CHECK(config.is_initialized == observing_ready_io);
+        CHECK(device.is_initialized == observing_ready_io);
+    }
+}
 
 static void expect_spi(uint8_t tx, uint8_t rx, bool cs, size_t count) {
     CHECK(event_count < sizeof(events) / sizeof(events[0]));
@@ -56,6 +72,7 @@ static void expect_cs(bool cs) {
 }
 
 static uint8_t exchange(uint8_t tx) {
+    check_spi_state();
     if (startup_pending) {
         CHECK(cs_high);
         CHECK(now_us >= 1000);
@@ -74,18 +91,21 @@ static uint8_t exchange(uint8_t tx) {
 }
 
 unsigned spi_init(spi_inst_t *spi, unsigned baudrate) {
+    check_spi_state();
     CHECK(spi == config.spi_inst);
     initialized_baudrate = baudrate;
     return baudrate;
 }
 
 unsigned spi_set_baudrate(spi_inst_t *spi, unsigned baudrate) {
+    check_spi_state();
     CHECK(spi == config.spi_inst);
     transfer_baudrate = baudrate;
     return baudrate;
 }
 
 void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha, unsigned order) {
+    check_spi_state();
     CHECK(spi == config.spi_inst);
     CHECK(bits == 8 && cpol == SPI_CPOL_0 && cpha == SPI_CPHA_0 && order == SPI_MSB_FIRST);
     ++format_calls;
@@ -152,12 +172,24 @@ void mutex_init(mutex_t *mutex) {
 }
 
 void mutex_enter_blocking(mutex_t *mutex) {
+    CHECK(mutex == &config._mutex);
     CHECK(!mutex->locked);
+    if (observing_lifecycle) {
+        CHECK(config.is_initialized == entry_config_initialized);
+        CHECK(device.is_initialized == entry_device_initialized);
+    }
+    ++mutex_entries;
     mutex->locked = true;
 }
 
 void mutex_exit(mutex_t *mutex) {
+    CHECK(mutex == &config._mutex);
     CHECK(mutex->locked);
+    if (observing_lifecycle) {
+        CHECK(config.is_initialized == initialized_on_unlock);
+        CHECK(device.is_initialized == initialized_on_unlock);
+    }
+    ++mutex_exits;
     mutex->locked = false;
 }
 
@@ -167,6 +199,8 @@ static void reset_card(void) {
     now_us = 0;
     time_step_us = 1000;
     startup_pending = false;
+    observing_lifecycle = observing_ready_io = false;
+    mutex_entries = mutex_exits = 0;
     initialized_baudrate = transfer_baudrate = format_calls = 0;
     config = (blockdevice_sd_config_t){
         .spi_inst = spi0,
@@ -269,6 +303,22 @@ static void expect_block(uint8_t value) {
     expect_block_crc(value, !config.enable_crc);
 }
 
+static void fill_pattern(uint8_t *buffer, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        buffer[i] = i * 37 + (i / 256) * 17 + 11;
+    }
+}
+
+static void expect_status_block(const uint8_t *data, size_t length, bool corrupt_crc) {
+    uint16_t crc = reference_crc16(data, length) ^ (corrupt_crc ? 1 : 0);
+    expect_spi(0xFF, SPI_START_BLOCK, false, 1);
+    for (size_t i = 0; i < length; ++i) {
+        expect_spi(0xFF, data[i], false, 1);
+    }
+    expect_spi(0xFF, crc >> 8, false, 1);
+    expect_spi(0xFF, crc, false, 1);
+}
+
 // CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
 // Discard the stuff byte, following Elm-Chan read guidance: "The received byte
 // immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
@@ -297,6 +347,22 @@ static void finish(int actual, int expected) {
     CHECK(event_index == event_count);
     CHECK(cs_high);
     CHECK(!config._mutex.locked);
+}
+
+static void finish_lifecycle(int (*operation)(blockdevice_t *), int expected) {
+    unsigned entries = mutex_entries;
+    unsigned exits = mutex_exits;
+    observing_lifecycle = true;
+    initializing = operation == init;
+    entry_config_initialized = config.is_initialized;
+    entry_device_initialized = device.is_initialized;
+    initialized_on_unlock = initializing && expected == BD_ERROR_OK;
+    finish(operation(&device), expected);
+    CHECK(mutex_entries == entries + 1);
+    CHECK(mutex_exits == exits + 1);
+    CHECK(config.is_initialized == initialized_on_unlock);
+    CHECK(device.is_initialized == initialized_on_unlock);
+    observing_lifecycle = false;
 }
 
 static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_t extra) {
@@ -434,6 +500,181 @@ static void test_stop_unaligned(uint8_t second, int expected) {
     expect_release();
     uint8_t buffer[1024];
     finish(device.read(&device, buffer, 0, sizeof(buffer)), expected);
+}
+
+// A valid CMD55 prefix is required before every application command. Fail
+// closed when the prefix is unanswered or reports an R1 error.
+static void test_app_prefix_failure(void) {
+    static const struct {
+        uint8_t response;
+        int status;
+    } cases[] = {
+        {R1_COM_CRC_ERROR, SD_BLOCK_DEVICE_ERROR_CRC},
+        {R1_ILLEGAL_COMMAND, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {R1_ERASE_RESET, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {R1_PARAMETER_ERROR, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {R1_NO_RESPONSE, SD_BLOCK_DEVICE_ERROR_NO_DEVICE},
+    };
+    static const int commands[] = {
+        ACMD13_SD_STATUS,
+        ACMD23_SET_WR_BLK_ERASE_COUNT,
+        ACMD41_SD_SEND_OP_COND,
+    };
+    const char *outer_case = current_case;
+    for (size_t cmd = 0; cmd < sizeof(commands) / sizeof(commands[0]); ++cmd) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            char name[96];
+            snprintf(name, sizeof(name), "%s/cmd-%zu/case-%zu", outer_case, cmd, i);
+            current_case = name;
+            reset_card();
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            for (unsigned attempt = 0;
+                 attempt < (cases[i].response == R1_NO_RESPONSE ? 3u : 1u); ++attempt) {
+                expect_command(CMD55_APP_CMD, 0);
+                if (cases[i].response == R1_NO_RESPONSE) {
+                    expect_spi(0xFF, 0xFF, false, 16);
+                } else {
+                    expect_spi(0xFF, cases[i].response, false, 1);
+                }
+            }
+            expect_release();
+            uint32_t response = 0x12345678;
+            finish(_cmd(&config, commands[cmd], 0, true, &response), cases[i].status);
+            CHECK(response == cases[i].response);
+        }
+    }
+    current_case = outer_case;
+}
+
+static void expect_acmd13_preamble(void) {
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(ACMD13_SD_STATUS, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xA5, false, 1);
+}
+
+static void test_acmd13_data(bool corrupt_crc) {
+    reset_card();
+    uint8_t expected[64];
+    uint8_t actual[64] = {0};
+    fill_pattern(expected, sizeof(expected));
+    expect_acmd13_preamble();
+    expect_status_block(expected, sizeof(expected), corrupt_crc);
+    expect_release();
+
+    uint32_t response = R1_NO_RESPONSE;
+    int status = _cmd(&config, ACMD13_SD_STATUS, 0, true, &response);
+    CHECK(status == BD_ERROR_OK);
+    CHECK(response == 0xA5);
+    CHECK(!cs_high);
+    status = _read_bytes(&config, actual, sizeof(actual));
+    if (corrupt_crc) {
+        CHECK(status == SD_BLOCK_DEVICE_ERROR_CRC);
+    } else {
+        CHECK(status == BD_ERROR_OK);
+        CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    }
+    finish(status, corrupt_crc ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
+}
+
+static void test_cmd13_release(void) {
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD13_SEND_STATUS, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xA5, false, 1);
+    expect_release();
+
+    uint32_t response = R1_NO_RESPONSE;
+    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response), BD_ERROR_OK);
+    CHECK(response == 0xA5);
+}
+
+// CMD13 and ACMD13 share opcode 13 and return R2: R1 followed by a second
+// status byte. Preserve nonzero R1 status while returning the complete value.
+static void test_r2_status(void) {
+    static const struct {
+        int cmd;
+        bool app;
+        uint8_t r1;
+        uint8_t second;
+        bool reads_second;
+        uint32_t response;
+        int status;
+    } cases[] = {
+        {CMD13_SEND_STATUS, false, 0x00, 0x5A, true, 0x005A, BD_ERROR_OK},
+        {CMD13_SEND_STATUS, false, 0x02, 0xA5, true, 0x02A5,
+         SD_BLOCK_DEVICE_ERROR_ERASE},
+        {CMD13_SEND_STATUS, false, R1_COM_CRC_ERROR, 0, false, R1_COM_CRC_ERROR,
+         SD_BLOCK_DEVICE_ERROR_CRC},
+        {ACMD13_SD_STATUS, true, 0x00, 0xA5, true, 0x00A5, BD_ERROR_OK},
+        {ACMD13_SD_STATUS, true, R1_ILLEGAL_COMMAND, 0, false, R1_ILLEGAL_COMMAND,
+         SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+    };
+    const char *outer_case = current_case;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "%s/case-%zu", outer_case, i);
+        current_case = name;
+        reset_card();
+        bool read_status_block = cases[i].app && cases[i].status == BD_ERROR_OK;
+        uint8_t expected[64];
+        uint8_t actual[64] = {0};
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        if (cases[i].app) {
+            expect_command(CMD55_APP_CMD, 0);
+            expect_spi(0xFF, 0, false, 1);
+            expect_spi(0xFF, 0xFF, false, 1);
+        }
+        expect_command(cases[i].cmd, 0);
+        expect_spi(0xFF, cases[i].r1, false, 1);
+        if (cases[i].reads_second) {
+            expect_spi(0xFF, cases[i].second, false, 1);
+        }
+        if (read_status_block) {
+            fill_pattern(expected, sizeof(expected));
+            expect_status_block(expected, sizeof(expected), false);
+        }
+        expect_release();
+        uint32_t response = R1_NO_RESPONSE;
+        int status = _cmd(&config, cases[i].cmd, 0, cases[i].app, &response);
+        CHECK(status == cases[i].status);
+        CHECK(response == cases[i].response);
+        if (read_status_block) {
+            CHECK(!cs_high);
+            status = _read_bytes(&config, actual, sizeof(actual));
+            CHECK(status == BD_ERROR_OK);
+            CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+        }
+        finish(status, cases[i].status);
+    }
+    current_case = outer_case;
+}
+
+// Reissue CMD55 after an unanswered prefix, then send the application opcode.
+static void test_app_prefix_retry(void) {
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0xFF, false, 16);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(ACMD41_SD_SEND_OP_COND, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_release();
+
+    uint32_t response = R1_NO_RESPONSE;
+    finish(_cmd(&config, ACMD41_SD_SEND_OP_COND, 0, true, &response), BD_ERROR_OK);
+    CHECK(response == 0);
 }
 
 // Exercise a full token wait across the 32-bit millisecond rollover, including
@@ -706,7 +947,7 @@ static void expect_csd(const uint8_t *csd, bool corrupt_crc) {
     expect_release();
 }
 
-static void expect_card_init(bool fail) {
+static void expect_card_init(bool fail, bool high_capacity) {
     expect_spi(0xFF, 0xFF, true, 10);
     if (fail) {
         for (unsigned i = 0; i < SD_CMD0_GO_IDLE_STATE_RETRIES; ++i) {
@@ -715,29 +956,104 @@ static void expect_card_init(bool fail) {
         return;
     }
     expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
-    expect_init_command(CMD8_SEND_IF_COND, 0x1AA, R1_IDLE_STATE | R1_ILLEGAL_COMMAND, 0x1AA);
-    expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    expect_init_command(CMD8_SEND_IF_COND, 0x1AA,
+                        high_capacity ? R1_IDLE_STATE : R1_IDLE_STATE | R1_ILLEGAL_COMMAND, 0x1AA);
+    if (config.enable_crc) {
+        expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    }
     expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
-    expect_init_command(ACMD41_SD_SEND_OP_COND, 0, 0, 0);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, high_capacity ? OCR_HCS_CCS : 0, 0, 0);
+    if (high_capacity) {
+        expect_init_command(CMD58_READ_OCR, 0, 0, OCR_3_3V | OCR_HCS_CCS);
+    }
+    if (!config.enable_crc) {
+        expect_init_command(CMD59_CRC_ON_OFF, 0, 0, 0);
+    }
 }
 
-static void expect_top_init_setup(unsigned failure) {
-    expect_card_init(failure == 4);
+static void expect_top_init_setup(unsigned failure, bool high_capacity) {
+    expect_card_init(failure == 4, high_capacity);
     if (failure == 4) {
         return;
     }
     uint8_t csd[16];
     make_csd(csd);
+    if (high_capacity) {
+        set_csd_bits(csd, 127, 126, 1);
+        set_csd_bits(csd, 69, 48, 3);
+    }
     expect_csd(csd, failure == 1);
     if (failure != 1) {
         expect_init_command(CMD16_SET_BLOCKLEN, 512, failure == 2 ? R1_ILLEGAL_COMMAND : 0, 0);
     }
 }
 
+static void exercise_initialized_io(void) {
+    bool high_capacity = config.card_type == SDCARD_V2HC;
+    uint8_t buffer[512] = {0};
+    observing_ready_io = true;
+    expect_start(1, high_capacity ? 4 : 2048, 0);
+    expect_block(0x31);
+    expect_release();
+    finish(device.read(&device, buffer, 2048, sizeof(buffer)), BD_ERROR_OK);
+    for (size_t i = 0; i < sizeof(buffer); ++i) {
+        CHECK(buffer[i] == 0x31);
+    }
+
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD24_WRITE_BLOCK, high_capacity ? 4 : 2048);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(SPI_START_BLOCK, 0xFF, false, 1);
+    expect_spi(0x31, 0xFF, false, sizeof(buffer));
+    uint16_t crc = config.enable_crc ? reference_crc16(buffer, sizeof(buffer)) : 0xFFFF;
+    expect_spi(crc >> 8, 0xFF, false, 1);
+    expect_spi(crc, 0xFF, false, 1);
+    expect_spi(0xFF, SPI_DATA_ACCEPTED, false, 1);
+    expect_spi(0xFF, 0, false, 2);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_release();
+    finish(device.program(&device, buffer, 2048, sizeof(buffer)), BD_ERROR_OK);
+
+    for (int cmd = CMD32_ERASE_WR_BLK_START_ADDR; cmd <= CMD33_ERASE_WR_BLK_END_ADDR; ++cmd) {
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        uint32_t address = cmd == CMD32_ERASE_WR_BLK_START_ADDR ? 2048 :
+                           2048 + config.erase_size - 512;
+        expect_command(cmd, high_capacity ? address / 512 : address);
+        expect_spi(0xFF, 0, false, 1);
+        expect_release();
+    }
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD38_ERASE, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_release();
+    finish(device.trim(&device, 2048, config.erase_size), BD_ERROR_OK);
+    observing_ready_io = false;
+    CHECK(config.is_initialized && device.is_initialized);
+}
+
+static void test_initialized_invalid_io(void) {
+    reset_card();
+    uint8_t buffer[512] = {0};
+    const bd_size_t addresses[] = {1, 0, device.size(&device)};
+    const bd_size_t sizes[] = {512, 1, 512};
+    for (size_t i = 0; i < sizeof(addresses) / sizeof(addresses[0]); ++i) {
+        finish(device.read(&device, buffer, addresses[i], sizes[i]),
+               SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        finish(device.program(&device, buffer, addresses[i], sizes[i]),
+               SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        finish(device.trim(&device, addresses[i], sizes[i]), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        CHECK(config.is_initialized && device.is_initialized);
+    }
+}
+
 static void test_uninitialized_io(bool after_deinit) {
     reset_card();
     if (after_deinit) {
-        finish(deinit(&device), BD_ERROR_OK);
+        finish_lifecycle(deinit, BD_ERROR_OK);
     } else {
         config.is_initialized = device.is_initialized = false;
     }
@@ -751,14 +1067,14 @@ static void test_uninitialized_io(bool after_deinit) {
 
 static void test_top_init(unsigned failure) {
     reset_card();
-    expect_top_init_setup(failure);
+    expect_top_init_setup(failure, false);
     if (failure == 3) {
         config.hz = 30000000;
     }
     int status = failure == 4 ? SD_BLOCK_DEVICE_ERROR_NO_DEVICE :
                  failure == 1 || failure == 2 ? BD_ERROR_DEVICE_ERROR :
                  failure == 3 ? -EINVAL : BD_ERROR_OK;
-    finish(init(&device), status);
+    finish_lifecycle(init, status);
     CHECK(device.is_initialized == (failure == 0));
     CHECK(config.is_initialized == (failure == 0));
     if (!failure) {
@@ -769,18 +1085,36 @@ static void test_top_init(unsigned failure) {
         finish(read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
         finish(program(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
         finish(trim(&device, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
+        expect_top_init_setup(0, false);
+        finish_lifecycle(init, BD_ERROR_OK);
     }
+    exercise_initialized_io();
+}
+
+static void test_cold_init(bool high_capacity, bool crc_enabled) {
+    reset_card();
+    config.is_initialized = device.is_initialized = false;
+    config.card_type = SDCARD_NONE;
+    config.total_sectors = config.erase_size = 0;
+    config.enable_crc = crc_enabled;
+    expect_top_init_setup(0, high_capacity);
+    finish_lifecycle(init, BD_ERROR_OK);
+    CHECK(config.card_type == (high_capacity ? SDCARD_V2HC : SDCARD_V1));
+    CHECK(device.size(&device) == 4096 * 512);
+    exercise_initialized_io();
 }
 
 static void test_deinit_reinit(void) {
     reset_card();
-    finish(deinit(&device), BD_ERROR_OK);
+    finish_lifecycle(deinit, BD_ERROR_OK);
+    finish_lifecycle(deinit, BD_ERROR_OK);
     CHECK(!config.is_initialized && !device.is_initialized);
 
-    expect_top_init_setup(0);
-    finish(init(&device), BD_ERROR_OK);
+    expect_top_init_setup(0, false);
+    finish_lifecycle(init, BD_ERROR_OK);
     CHECK(config.is_initialized && device.is_initialized);
     CHECK(transfer_baudrate == 12000000);
+    exercise_initialized_io();
 }
 
 
@@ -798,6 +1132,11 @@ static void test_init_clock(void) {
 }
 
 int main(void) {
+    RUN_CASE("initialized-invalid-io", test_initialized_invalid_io());
+    RUN_CASE("cold-sdsc-crc", test_cold_init(false, true));
+    RUN_CASE("cold-sdsc-no-crc", test_cold_init(false, false));
+    RUN_CASE("cold-sdhc-crc", test_cold_init(true, true));
+    RUN_CASE("cold-sdhc-no-crc", test_cold_init(true, false));
     RUN_CASE("uninitialized-io", test_uninitialized_io(false));
     RUN_CASE("deinitialized-io", test_uninitialized_io(true));
     RUN_CASE("top-init", test_top_init(0));
@@ -806,6 +1145,12 @@ int main(void) {
     RUN_CASE("top-init-frequency-error", test_top_init(3));
     RUN_CASE("top-init-card-error", test_top_init(4));
     RUN_CASE("deinit-reinit", test_deinit_reinit());
+    RUN_CASE("app-prefix-failure", test_app_prefix_failure());
+    RUN_CASE("app-prefix-retry", test_app_prefix_retry());
+    RUN_CASE("acmd13-status-data", test_acmd13_data(false));
+    RUN_CASE("acmd13-status-crc", test_acmd13_data(true));
+    RUN_CASE("cmd13-release", test_cmd13_release());
+    RUN_CASE("r2-status", test_r2_status());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
