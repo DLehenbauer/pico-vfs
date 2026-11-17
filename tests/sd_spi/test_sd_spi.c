@@ -249,6 +249,22 @@ static void expect_block(uint8_t value) {
     expect_block_crc(value, !config.enable_crc);
 }
 
+static void fill_pattern(uint8_t *buffer, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+        buffer[i] = i * 37 + (i / 256) * 17 + 11;
+    }
+}
+
+static void expect_status_block(const uint8_t *data, size_t length, bool corrupt_crc) {
+    uint16_t crc = reference_crc16(data, length) ^ (corrupt_crc ? 1 : 0);
+    expect_spi(0xFF, SPI_START_BLOCK, false, 1);
+    for (size_t i = 0; i < length; ++i) {
+        expect_spi(0xFF, data[i], false, 1);
+    }
+    expect_spi(0xFF, crc >> 8, false, 1);
+    expect_spi(0xFF, crc, false, 1);
+}
+
 // CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
 // Discard the stuff byte, following Elm-Chan read guidance: "The received byte
 // immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
@@ -456,6 +472,117 @@ static void test_app_prefix_failure(void) {
             finish(_cmd(&config, commands[cmd], 0, true, &response), cases[i].status);
             CHECK(response == cases[i].response);
         }
+    }
+    current_case = outer_case;
+}
+
+static void expect_acmd13_preamble(void) {
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(ACMD13_SD_STATUS, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xA5, false, 1);
+}
+
+static void test_acmd13_data(bool corrupt_crc) {
+    reset_card();
+    uint8_t expected[64];
+    uint8_t actual[64] = {0};
+    fill_pattern(expected, sizeof(expected));
+    expect_acmd13_preamble();
+    expect_status_block(expected, sizeof(expected), corrupt_crc);
+    expect_release();
+
+    uint32_t response = R1_NO_RESPONSE;
+    int status = _cmd(&config, ACMD13_SD_STATUS, 0, true, &response);
+    CHECK(status == BD_ERROR_OK);
+    CHECK(response == 0xA5);
+    CHECK(!cs_high);
+    status = _read_bytes(&config, actual, sizeof(actual));
+    if (corrupt_crc) {
+        CHECK(status == SD_BLOCK_DEVICE_ERROR_CRC);
+    } else {
+        CHECK(status == BD_ERROR_OK);
+        CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    }
+    finish(status, corrupt_crc ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
+}
+
+static void test_cmd13_release(void) {
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD13_SEND_STATUS, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xA5, false, 1);
+    expect_release();
+
+    uint32_t response = R1_NO_RESPONSE;
+    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response), BD_ERROR_OK);
+    CHECK(response == 0xA5);
+}
+
+// CMD13 and ACMD13 share opcode 13 and return R2: R1 followed by a second
+// status byte. Preserve nonzero R1 status while returning the complete value.
+static void test_r2_status(void) {
+    static const struct {
+        int cmd;
+        bool app;
+        uint8_t r1;
+        uint8_t second;
+        bool reads_second;
+        uint32_t response;
+        int status;
+    } cases[] = {
+        {CMD13_SEND_STATUS, false, 0x00, 0x5A, true, 0x005A, BD_ERROR_OK},
+        {CMD13_SEND_STATUS, false, 0x02, 0xA5, true, 0x02A5,
+         SD_BLOCK_DEVICE_ERROR_ERASE},
+        {CMD13_SEND_STATUS, false, R1_COM_CRC_ERROR, 0, false, R1_COM_CRC_ERROR,
+         SD_BLOCK_DEVICE_ERROR_CRC},
+        {ACMD13_SD_STATUS, true, 0x00, 0xA5, true, 0x00A5, BD_ERROR_OK},
+        {ACMD13_SD_STATUS, true, R1_ILLEGAL_COMMAND, 0, false, R1_ILLEGAL_COMMAND,
+         SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+    };
+    const char *outer_case = current_case;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "%s/case-%zu", outer_case, i);
+        current_case = name;
+        reset_card();
+        bool read_status_block = cases[i].app && cases[i].status == BD_ERROR_OK;
+        uint8_t expected[64];
+        uint8_t actual[64] = {0};
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        if (cases[i].app) {
+            expect_command(CMD55_APP_CMD, 0);
+            expect_spi(0xFF, 0, false, 1);
+            expect_spi(0xFF, 0xFF, false, 1);
+        }
+        expect_command(cases[i].cmd, 0);
+        expect_spi(0xFF, cases[i].r1, false, 1);
+        if (cases[i].reads_second) {
+            expect_spi(0xFF, cases[i].second, false, 1);
+        }
+        if (read_status_block) {
+            fill_pattern(expected, sizeof(expected));
+            expect_status_block(expected, sizeof(expected), false);
+        }
+        expect_release();
+        uint32_t response = R1_NO_RESPONSE;
+        int status = _cmd(&config, cases[i].cmd, 0, cases[i].app, &response);
+        CHECK(status == cases[i].status);
+        CHECK(response == cases[i].response);
+        if (read_status_block) {
+            CHECK(!cs_high);
+            status = _read_bytes(&config, actual, sizeof(actual));
+            CHECK(status == BD_ERROR_OK);
+            CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+        }
+        finish(status, cases[i].status);
     }
     current_case = outer_case;
 }
@@ -732,6 +859,10 @@ static void test_init_clock(void) {
 int main(void) {
     RUN_CASE("app-prefix-failure", test_app_prefix_failure());
     RUN_CASE("app-prefix-retry", test_app_prefix_retry());
+    RUN_CASE("acmd13-status-data", test_acmd13_data(false));
+    RUN_CASE("acmd13-status-crc", test_acmd13_data(true));
+    RUN_CASE("cmd13-release", test_cmd13_release());
+    RUN_CASE("r2-status", test_r2_status());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
