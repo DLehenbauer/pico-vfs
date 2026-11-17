@@ -278,13 +278,13 @@ static void _preclock_then_select(void *_config) {
 
 static void _postclock_then_deselect(void *_config) {
     blockdevice_sd_config_t *config = _config;
-    // Continue post-response clocks for at least N_CR (SD v2.00, section 7.5, p.149).
-    // N_CR = 1..8 byte-times. Conservatively cover its maximum (SD v2.00, Table 7-7, p.153).
+    // Continue post-response clocks for at least N_CR (SanDisk v2.2, section 5.23, p.5-17).
+    // N_CR = 1..8 byte-times. Conservatively cover its maximum (Table 5-5, p.5-19).
     _spi_wait(config, 8);
 
     gpio_put(config->cs, 1);
 
-    // Busy DataOut releases one clock after CS rises (SD v2.00, section 7.5.1.2, p.150).
+    // Busy DataOut releases one clock after CS rises (SanDisk v2.2, section 5.23.2, p.5-17).
     // Send a full byte, following Elm-Chan multi-slave guidance: "send a byte after the
     // CS signal is deasserted." (See: https://elm-chan.org/docs/mmc/mmc_e.html#spibus)
     spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, sizeof(SPI_FILL_CHAR));
@@ -321,7 +321,7 @@ static bool _wait_ready(void *_config, uint64_t timeout) {
     absolute_time_t t = get_absolute_time();
     do {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &response, sizeof(SPI_FILL_CHAR));
-        // Any nonzero byte indicates ready (SD v2.00, section 7.3.2.2, p.143).
+        // Any nonzero byte indicates ready (SD v9.10, section 7.3.2.2, p.302).
         // Retain the full-high check, following Elm-Chan SPI response guidance: "until DO goes
         // high (a 0xFF is received)." (See: https://elm-chan.org/docs/mmc/mmc_e.html#spimode)
         if (response == 0xFF) {
@@ -368,17 +368,18 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
 
     // Discard CMD12's stuff byte before R1, following Elm-Chan read guidance: "The received
     // byte immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
-    // This exact rule is implementation guidance, not explicit wording in SD v2.00, section 7.5.2.2, Figure 7-18, p.151.
+    // Public SD v9.10 omits the CMD12 timing diagram (section 7.5.2.2, p.308).
     if (CMD12_STOP_TRANSMISSION == cmd) {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, 1);
     }
 
-    // N_CR = 1..8 byte-times (SD v2.00, Table 7-7, p.153).
-    // Retain the existing 16-byte polling guard as host tolerance, not the SD limit.
+    // N_CR = 1..8 byte-times before R1 (SanDisk v2.2, Table 5-5, p.5-19).
+    // Poll up to 16 bytes for R1's start bit to accommodate slow cards. This is
+    // host tolerance, not the SD limit.
     for (int i = 0; i < 0x10; i++) {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &response, 1);
 
-        // R1's most significant bit is always zero (SD v2.00, section 7.3.2.1, p.143).
+        // R1's most significant bit is always zero (SD v9.10, section 7.3.2.1, p.302).
         if (!(response & R1_RESPONSE_RECV)) {
             return response;
         }
@@ -412,8 +413,8 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         *resp = R1_NO_RESPONSE;
     }
 
-    // CMD12 terminates CMD18 (SD v2.00, section 7.2.3, p.131).
-    // CS stays low through the stop and response (SD v2.00, section 7.5.2.2, Figure 7-18, p.151).
+    // CMD12 terminates CMD18 (SD v9.10, section 7.2.3, p.290).
+    // CS stays low through the stop and response (SanDisk v2.2, section 5.23.3, p.5-18).
     if (CMD12_STOP_TRANSMISSION != cmd) {
         // Select for a new command. CMD12 must use the already-selected read stream.
         _preclock_then_select(config);
@@ -421,7 +422,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
             debug_if(SD_DBG, "Card not ready yet \n");
 
-            // Commands are rejected during busy (SD v2.00, section 7.2.8, p.133).
+            // Commands are rejected during busy (SD v9.10, section 7.2.8, p.292).
             // Abort and release the bus. _postclock_then_deselect() documents release timing.
             _postclock_then_deselect(config);
             return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
@@ -436,7 +437,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
             // Wait for card to be ready after CMD55
             if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
                 debug_if(SD_DBG, "Card not ready yet \n");
-                // Commands are rejected during busy (SD v2.00, section 7.2.8, p.133).
+                // Commands are rejected during busy (SD v9.10, section 7.2.8, p.292).
                 // Abort before the application command and release the bus, since
                 // normal cleanup below is skipped.
                 _postclock_then_deselect(config);
@@ -519,7 +520,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         case CMD12_STOP_TRANSMISSION:       // Response R1b
         case CMD38_ERASE:
             // Wait for completion. R1b retains R1 status and adds optional busy bytes.
-            // Zero means busy. Nonzero means ready (SD v2.00, section 7.3.2.2, p.143).
+            // Zero means busy. Nonzero means ready (SD v9.10, section 7.3.2.2, p.302).
             if (false == _wait_ready(config, busy_timeout)) {
                 // A timeout means completion is unconfirmed: report NO_RESPONSE
                 // unless R1 already supplied a more specific error.
@@ -626,7 +627,8 @@ static int init_card(void *_config) {
         return status;
     }
 
-    // Check if card supports voltage range: 3.3V
+    // Do not continue initialization with an incompatible OCR voltage range
+    // (SD v9.10, section 7.2.1, p.288). This host uses the 3.3 V range.
     if (!(response & OCR_3_3V)) {
         config->card_type = CARD_UNKNOWN;
         status = SD_BLOCK_DEVICE_ERROR_UNUSABLE;
@@ -735,7 +737,8 @@ static uint64_t _sd_sectors(void *_config) {
     uint32_t hc_c_size;
     uint64_t blocks = 0, capacity = 0;
 
-    // CMD9, Response R2 (R1 byte + 16-byte block read)
+    // CMD9 returns R1 followed by 16 CSD bytes and CRC16, not SPI R2
+    // (SD v9.10, section 7.2.6, p.292).
     if (_cmd(config, CMD9_SEND_CSD, 0x0, 0, NULL) != 0x0) {
         debug_if(SD_DBG, "Didn't get a response from the disk\n");
         return 0;
@@ -750,6 +753,7 @@ static uint64_t _sd_sectors(void *_config) {
     int csd_structure = ext_bits(csd, 127, 126);
     switch (csd_structure) {
         case 0:
+            // CSD v1 capacity formula: SD v9.10, section 5.3.2, p.229.
             c_size = ext_bits(csd, 73, 62);              // c_size        : csd[73:62]
             c_size_mult = ext_bits(csd, 49, 47);         // c_size_mult   : csd[49:47]
             read_bl_len = ext_bits(csd, 83, 80);         // read_bl_len   : csd[83:80] - the *maximum* read block length
@@ -760,11 +764,12 @@ static uint64_t _sd_sectors(void *_config) {
             blocks = capacity / config->block_size;
             debug_if(SD_DBG, "Standard Capacity: c_size: %" PRIu32 " \n", c_size);
 
-            // ERASE_BLK_EN = 1: Erase in multiple of 512 bytes supported
+            // ERASE_BLK_EN selects 512-byte versus SECTOR_SIZE erase units
+            // (SD v9.10, section 5.3.2, pp.230-231).
             if (ext_bits(csd, 46, 46)) {
                 config->erase_size = BLOCK_SIZE_HC;
             } else {
-                // ERASE_BLK_EN = 1: Erase in multiple of SECTOR_SIZE supported
+                // ERASE_BLK_EN = 0: Use the sector-size-derived erase unit.
                 config->erase_size = BLOCK_SIZE_HC * (ext_bits(csd, 45, 39) + 1);
             }
             break;
@@ -773,7 +778,8 @@ static uint64_t _sd_sectors(void *_config) {
             hc_c_size = ext_bits(csd, 69, 48);            // device size : C_SIZE : [69:48]
             blocks = (hc_c_size + 1) << 10;               // block count = C_SIZE+1) * 1K byte (512B is block size)
             debug_if(SD_DBG, "SDHC/SDXC Card: hc_c_size: %" PRIu32 " \n", hc_c_size);
-            // ERASE_BLK_EN is fixed to 1, which means host can erase one or multiple of 512 bytes.
+            // ERASE_BLK_EN is fixed to 1: 512-byte units
+            // (SD v9.10, section 5.3.3, p.235).
             config->erase_size = BLOCK_SIZE_HC;
             break;
 
@@ -787,7 +793,9 @@ static uint64_t _sd_sectors(void *_config) {
 static int _freq(void *_config) {
     blockdevice_sd_config_t *config = _config;
 
-    // Max frequency supported is 25MHZ
+    // Default-speed TRAN_SPEED is 25 MHz; 50 MHz requires High-Speed mode
+    // (SD v9.10, section 5.3.2, p.227). This driver does not switch modes.
+    // Clamping and returning -EINVAL above that limit are API policy.
     if (config->hz <= 25000000) {
         spi_set_baudrate(config->spi_inst, config->hz);
         return 0;
@@ -927,7 +935,7 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
     while (block_count) {
         status = _read(config, buffer, config->block_size);
         if (BD_ERROR_OK != status) {
-            // Read blocks carry CRC16 (SD v2.00, section 7.2.3, pp.130-131).
+            // Read blocks carry CRC16 (SD v9.10, section 7.2.3, pp.289-290).
             // Preserve _read()'s specific error while still attempting stop cleanup.
             break;
         }
@@ -935,7 +943,7 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         --block_count;
     }
 
-    // CMD18 transfers blocks until interrupted by CMD12 (SD v2.00, Table 7-3, p.138).
+    // CMD18 transfers blocks until interrupted by CMD12 (SD v9.10, Table 7-3, p.297).
     // Attempt the stop even after a read failure (host cleanup policy).
     // Keep CS low so CMD12 can interrupt the selected stream. _cmd() checks its R1b/busy
     // completion and releases CS/MISO on return.
@@ -1095,9 +1103,10 @@ static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
     int status = BD_ERROR_OK;
 
     // Erase time scales with the area, not a fixed command timeout. Without cached
-    // SD Status erase parameters, estimate 250 ms per write block (SD v3.01,
-    // section 4.6.2.3, p.57). Counting 512-byte logical blocks is conservative
-    // for larger native write blocks. Retain the command timeout as a minimum.
+    // SD Status erase parameters, estimate 250 ms per write block (SD v9.10,
+    // section 4.6.2.3, p.96). Counting 512-byte logical blocks is conservative
+    // for larger native write blocks. Retain the command timeout as a minimum
+    // (host policy, not a minimum erase time specified by SD).
     uint64_t erase_timeout = (size / config->block_size) * 250;
     if (erase_timeout < SD_COMMAND_TIMEOUT) {
         erase_timeout = SD_COMMAND_TIMEOUT;
