@@ -72,6 +72,14 @@ PDF](https://teslabs.com/openplayer/docs/docs/specs/ProductManualSDCardv2.2final
 
 Page numbers are the printed document pages.
 
+## Request validation policy
+
+Read, program, and trim requests are rejected when their length is zero, their
+range extends past the device, or their granularity is zero. Read and program
+alignment requirements remain in effect; trim continues to apply its inward
+erase-unit alignment policy. This is an API policy, not an SD protocol
+requirement, as is rejecting null read and program buffers.
+
 ## Limitations
 
 The mock clock advances deterministically. The default command timeout is 5 ms

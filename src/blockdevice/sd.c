@@ -882,16 +882,23 @@ static int init(blockdevice_t *device) {
     return BD_ERROR_OK;
 }
 
+// API policy, not wire-protocol requirements: reject empty and out-of-range
+// requests before transfer. Subtraction avoids uint64_t address+size wrap.
+// The same policy applies to program and trim.
 static bool is_valid_read(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
-    return (addr % device->read_size == 0 &&
-            size % device->read_size == 0 &&
-            addr + size <= device->size(device));
+    bd_size_t capacity = device->size(device);
+    return (size != 0 && addr <= capacity && size <= capacity - addr &&
+            device->read_size != 0 &&
+            addr % device->read_size == 0 &&
+            size % device->read_size == 0);
 }
 
 static bool is_valid_program(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
-    return (addr % device->program_size == 0 &&
-            size % device->program_size == 0 &&
-            addr + size <= device->size(device));
+    bd_size_t capacity = device->size(device);
+    return (size != 0 && addr <= capacity && size <= capacity - addr &&
+            device->program_size != 0 &&
+            addr % device->program_size == 0 &&
+            size % device->program_size == 0);
 }
 
 static int deinit(blockdevice_t *device) {
@@ -947,7 +954,7 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         return SD_BLOCK_DEVICE_ERROR_NO_INIT;
     }
 
-    if (!is_valid_read(device, addr, size)) {
+    if (_buffer == NULL || !is_valid_read(device, addr, size)) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
@@ -1055,7 +1062,7 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
         return SD_BLOCK_DEVICE_ERROR_NO_INIT;
     }
 
-    if (!is_valid_program(device, addr, size)) {
+    if (_buffer == NULL || !is_valid_program(device, addr, size)) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
@@ -1142,7 +1149,8 @@ static bool _is_valid_trim(blockdevice_t *device, bd_size_t addr, bd_size_t size
     blockdevice_sd_config_t *config = device->config;
 
     bd_size_t capacity = device->size(device);
-    return (addr <= capacity && size <= capacity - addr && config->erase_size != 0);
+    return (size != 0 && addr <= capacity && size <= capacity - addr &&
+            config->erase_size != 0);
 }
 
 static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
