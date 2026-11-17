@@ -408,6 +408,183 @@ static void test_init_crc(bool enabled, bool rejected) {
     finish(init_card(&config), rejected ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
 }
 
+
+static void reset_init_card(bool crc) {
+    reset_card();
+    config.card_type = SDCARD_NONE;
+    config.enable_crc = crc;
+    config.is_initialized = false;
+    config.hz = 25000000;
+    device.is_initialized = false;
+}
+
+static void expect_init_prefix(uint8_t card_type) {
+    bool v2 = card_type != SDCARD_V1;
+    expect_spi(0xFF, 0xFF, true, 10);
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+    expect_init_command(CMD8_SEND_IF_COND, 0x1AA, v2 ? 1 : 0x05, 0x1AA);
+    if (config.enable_crc) {
+        expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    }
+    expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+}
+
+static void expect_init_complete(uint8_t card_type) {
+    if (card_type != SDCARD_V1) {
+        expect_init_command(CMD58_READ_OCR, 0, 0,
+                            OCR_3_3V | (card_type == SDCARD_V2HC ? OCR_HCS_CCS : 0));
+    }
+    if (!config.enable_crc) {
+        expect_init_command(CMD59_CRC_ON_OFF, 0, 0, 0);
+    }
+}
+
+static void finish_init_failure(int expected) {
+    finish(init(&device), expected);
+    CHECK(config.card_type == CARD_UNKNOWN);
+    CHECK(!config.is_initialized);
+    CHECK(!device.is_initialized);
+}
+
+// Legacy/V2 detection, HCS, ACMD41 polling, and post-init CCS determine these
+// sequences and card types (SD v9.10, section 7.2.1, Figure 7-2, pp.287-289).
+static void test_init_types(void) {
+    for (uint8_t type = SDCARD_V1; type <= SDCARD_V2HC; ++type) {
+        for (unsigned crc = 0; crc < 2; ++crc) {
+            reset_init_card(crc);
+            expect_init_prefix(type);
+            uint32_t arg = type == SDCARD_V1 ? 0 : OCR_HCS_CCS;
+            expect_init_command(ACMD41_SD_SEND_OP_COND, arg, 1, 0);
+            expect_init_command(ACMD41_SD_SEND_OP_COND, arg, 0, 0);
+            expect_init_complete(type);
+
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD9_SEND_CSD, 0);
+            expect_spi(0xFF, 0, false, 1);
+            // CSD v1 describes 1 GiB; CSD v2 describes 8 GiB.
+            uint8_t csd[16] = {0};
+            csd[5] = 9;
+            csd[10] = 0x40;
+            if (type == SDCARD_V2HC) {
+                csd[0] = 0x40;
+                csd[8] = 0x3F;
+                csd[9] = 0xFF;
+            } else {
+                csd[6] = 3;
+                csd[7] = 0xFF;
+                csd[8] = 0xC0;
+                csd[9] = 3;
+                csd[10] |= 0x80;
+            }
+            uint16_t checksum = reference_crc16(csd, sizeof(csd));
+            expect_spi(0xFF, 0xFE, false, 1);
+            for (size_t i = 0; i < sizeof(csd); ++i) {
+                expect_spi(0xFF, csd[i], false, 1);
+            }
+            expect_spi(0xFF, checksum >> 8, false, 1);
+            expect_spi(0xFF, checksum, false, 1);
+            expect_release();
+            expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
+            finish(init(&device), BD_ERROR_OK);
+            CHECK(config.is_initialized);
+            CHECK(device.is_initialized);
+            CHECK(config.card_type == type);
+            CHECK(config.total_sectors == (type == SDCARD_V2HC ? 16777216 : 2097152));
+
+            expect_start(1, type == SDCARD_V2HC ? 2 : 1024, 0);
+            expect_block(0x31);
+            expect_release();
+            uint8_t buffer[512];
+            finish(device.read(&device, buffer, 1024, sizeof(buffer)), BD_ERROR_OK);
+            for (size_t i = 0; i < sizeof(buffer); ++i) {
+                CHECK(buffer[i] == 0x31);
+            }
+        }
+    }
+}
+
+static void test_init_crc_recovery(bool enabled, uint8_t response) {
+    reset_init_card(enabled);
+    time_step_us = 100;
+    expect_init_prefix(SDCARD_V2HC);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 1, 0);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, response, 0);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 1, 0);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 0, 0);
+    expect_init_complete(SDCARD_V2HC);
+    finish(init_card(&config), BD_ERROR_OK);
+    CHECK(config.card_type == SDCARD_V2HC);
+}
+
+// Both idle polling and CRC recovery share one initialization deadline.
+static void test_init_crc_timeout(bool enabled, uint8_t response) {
+    reset_init_card(enabled);
+    expect_init_prefix(SDCARD_V2HC);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, response, 0);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, response, 0);
+    finish_init_failure(SD_BLOCK_DEVICE_ERROR_CRC);
+}
+
+// Initialization deadlines and preserving terminal failures are host policy.
+static void test_init_failures(void) {
+    static const struct {
+        uint8_t acmd41;
+        uint8_t final_ocr;
+        int status;
+    } cases[] = {
+        {1, 0, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE},
+        {0x05, 0, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {0x11, 0, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0x41, 0, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {0, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
+        {0, 0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+    };
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            reset_init_card(crc);
+            expect_init_prefix(SDCARD_V2HC);
+            expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 1, 0);
+            expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, cases[i].acmd41, 0);
+            if (!cases[i].acmd41) {
+                expect_init_command(CMD58_READ_OCR, 0, cases[i].final_ocr, 0);
+            }
+            finish_init_failure(cases[i].status);
+        }
+    }
+}
+
+static void test_init_transport_failure(bool final_ocr, bool busy) {
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        reset_init_card(crc);
+        expect_init_prefix(SDCARD_V2HC);
+        expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 1, 0);
+        if (final_ocr) {
+            expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 0, 0);
+        }
+        expect_select();
+        if (busy) {
+            expect_spi(0xFF, 0, false, SD_COMMAND_TIMEOUT);
+        } else {
+            expect_spi(0xFF, 0xFF, false, 1);
+            for (unsigned retry = 0; retry < 3; ++retry) {
+                if (!final_ocr) {
+                    expect_command(CMD55_APP_CMD, 0);
+                    expect_spi(0xFF, 1, false, 1);
+                    expect_spi(0xFF, 0xFF, false, 1);
+                }
+                expect_command(final_ocr ? CMD58_READ_OCR : ACMD41_SD_SEND_OP_COND,
+                               final_ocr ? 0 : OCR_HCS_CCS);
+                expect_spi(0xFF, 0xFF, false, 16);
+            }
+        }
+        expect_release();
+        finish_init_failure(busy ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE
+                                 : SD_BLOCK_DEVICE_ERROR_NO_DEVICE);
+    }
+}
+
 // Checks CMD17 at SDSC byte address 1024, command CRC7, start token, all 512 data
 // bytes, CRC16, returned data, CS cleanup, and mutex release.
 // Read blocks include the token and CRC bytes (SD v2.00, section 7.3.3.2, p.146).
@@ -1154,6 +1331,20 @@ int main(void) {
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
+    RUN_CASE("init-types", test_init_types());
+    RUN_CASE("init-crc-idle-recovery-enabled", test_init_crc_recovery(true, 0x09));
+    RUN_CASE("init-crc-idle-recovery-disabled", test_init_crc_recovery(false, 0x09));
+    RUN_CASE("init-crc-recovery-enabled", test_init_crc_recovery(true, 0x08));
+    RUN_CASE("init-crc-recovery-disabled", test_init_crc_recovery(false, 0x08));
+    RUN_CASE("init-crc-idle-timeout-enabled", test_init_crc_timeout(true, 0x09));
+    RUN_CASE("init-crc-idle-timeout-disabled", test_init_crc_timeout(false, 0x09));
+    RUN_CASE("init-crc-timeout-enabled", test_init_crc_timeout(true, 0x08));
+    RUN_CASE("init-crc-timeout-disabled", test_init_crc_timeout(false, 0x08));
+    RUN_CASE("init-failures", test_init_failures());
+    RUN_CASE("init-acmd41-no-response", test_init_transport_failure(false, false));
+    RUN_CASE("init-acmd41-busy", test_init_transport_failure(false, true));
+    RUN_CASE("init-final-ocr-no-response", test_init_transport_failure(true, false));
+    RUN_CASE("init-final-ocr-busy", test_init_transport_failure(true, true));
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("start-rejected", test_start_rejected());
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
