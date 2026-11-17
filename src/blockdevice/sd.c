@@ -1092,8 +1092,17 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
         }
 
         if (status == BD_ERROR_OK) {
-            // Stop Tran terminates a successful multiple-block write.
+            // Successful CMD25 ends with Stop Tran, followed by optional busy
+            // (SD v9.10, section 7.2.4, Figure 7-7, p.291, and section 7.3.3.2, p.305).
             _spi_write(config, SPI_STOP_TRAN);
+            // N_BR can delay final busy by 0..1 byte; discard that window before
+            // checking readiness (SanDisk v2.2, sections 5.23.4-5.24, p.5-19).
+            // FreeBSD also clocks a filler byte before checking Stop Tran busy:
+            // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L1644-L1671
+            _spi_write(config, SPI_FILL_CHAR);
+            if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
+                status = SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
+            }
         }
     }
 
