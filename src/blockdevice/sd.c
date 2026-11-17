@@ -764,8 +764,9 @@ static uint64_t _sd_sectors(void *_config) {
             if (ext_bits(csd, 46, 46)) {
                 config->erase_size = BLOCK_SIZE_HC;
             } else {
-                // ERASE_BLK_EN = 1: Erase in multiple of SECTOR_SIZE supported
-                config->erase_size = BLOCK_SIZE_HC * (ext_bits(csd, 45, 39) + 1);
+                // SECTOR_SIZE counts native write blocks, not logical 512-byte sectors.
+                config->erase_size = (1u << ext_bits(csd, 25, 22)) *
+                                     (ext_bits(csd, 45, 39) + 1);
             }
             break;
 
@@ -831,7 +832,6 @@ static int init(blockdevice_t *device) {
         return err;
     }
 
-    device->erase_size = config->erase_size;
     device->is_initialized = true;
     mutex_exit(&config->_mutex);
     return BD_ERROR_OK;

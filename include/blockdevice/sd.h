@@ -28,6 +28,10 @@ extern "C" {
  *
  * Create a block device object for an SPI-connected SD or MMC card.
  *
+ * SD sectors can be overwritten without erasing, so erase() is a no-op and
+ * erase_size remains 512 bytes. trim() performs card erase and requires
+ * CSD-derived alignment, which can be larger than erase_size.
+ *
  * \param spi_inst SPI instance, as defined in the pico-sdk hardware_spi library
  * \param mosi SPI Master Out Slave In(TX) pin
  * \param miso SPI Master In Slave Out(RX) pin

@@ -168,6 +168,7 @@ static void reset_card(void) {
         .read = read,
         .size = size,
         .read_size = 512,
+        .erase_size = 512,
         .is_initialized = true,
     };
     mutex_init(&config._mutex);
@@ -260,10 +261,13 @@ static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t valu
 static void make_ordinary_csd(uint8_t *csd, bool high_capacity) {
     memset(csd, 0, 16);
     set_csd_bits(csd, 127, 126, high_capacity ? 1 : 0);
+    set_csd_bits(csd, 83, 80, 9);
+    set_csd_bits(csd, 25, 22, 9);
     if (high_capacity) {
-        set_csd_bits(csd, 69, 48, 0);
+        set_csd_bits(csd, 69, 48, 8191);
+        set_csd_bits(csd, 46, 46, 1);
+        set_csd_bits(csd, 45, 39, 127);
     } else {
-        set_csd_bits(csd, 83, 80, 9);
         set_csd_bits(csd, 73, 62, 1023);
         set_csd_bits(csd, 49, 47, 0);
         set_csd_bits(csd, 45, 39, 3);
@@ -721,22 +725,60 @@ static void test_init_clock(void) {
     finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
-static void test_erase_geometry(void) {
-    for (unsigned high_capacity = 0; high_capacity < 2; ++high_capacity) {
+static void test_trim_geometry(void) {
+    const struct {
+        bool high_capacity;
+        bool single_block_erase;
+        uint8_t write_bl_len;
+        uint8_t sector_size;
+        size_t trim_size;
+    } cases[] = {
+        {false, false, 9, 3, 2048},
+        {false, false, 10, 3, 4096},
+        {false, false, 11, 3, 8192},
+        {false, false, 11, 127, 262144},
+        {false, true, 9, 127, 512},
+        {false, true, 10, 127, 512},
+        {false, true, 11, 127, 512},
+        {true, true, 9, 127, 512},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_card();
+        config.hz = CONF_SD_TRX_FREQUENCY;
         uint8_t csd[16];
-        make_ordinary_csd(csd, high_capacity);
-        expect_card_init(high_capacity);
+        make_ordinary_csd(csd, cases[i].high_capacity);
+        set_csd_bits(csd, 83, 80, cases[i].write_bl_len);
+        set_csd_bits(csd, 79, 79, cases[i].write_bl_len > 9);
+        set_csd_bits(csd, 46, 46, cases[i].single_block_erase);
+        set_csd_bits(csd, 45, 39, cases[i].sector_size);
+        set_csd_bits(csd, 25, 22, cases[i].write_bl_len);
+        set_csd_bits(csd, 21, 21, cases[i].write_bl_len > 9);
+        csd[15] = reference_crc7(csd, 15);
+        expect_card_init(cases[i].high_capacity);
         expect_csd(csd);
         expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
 
         finish(init(&device), BD_ERROR_OK);
-        size_t expected = high_capacity ? 512u : 2048u;
-        CHECK(device.erase_size == expected);
-        CHECK(device.erase_size == config.erase_size);
-        CHECK(_is_valid_trim(&device, expected, expected));
+        size_t expected = cases[i].trim_size;
+        CHECK(device.erase_size == 512);
+        CHECK(config.erase_size == expected);
+        for (int cmd = CMD32_ERASE_WR_BLK_START_ADDR; cmd <= CMD33_ERASE_WR_BLK_END_ADDR; ++cmd) {
+            uint32_t address = cmd == CMD32_ERASE_WR_BLK_START_ADDR ? expected : 3 * expected - 512;
+            if (cases[i].high_capacity) {
+                address /= 512;
+            }
+            expect_init_command(cmd, address, 0, 0);
+        }
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_command(CMD38_ERASE, 0);
+        expect_spi(0xFF, 0, false, 1);
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_release();
+        finish(trim(&device, expected, 2 * expected), BD_ERROR_OK);
         if (expected > 512) {
-            CHECK(!_is_valid_trim(&device, 512, 512));
+            finish(trim(&device, 512, expected), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+            finish(trim(&device, expected, 512), SD_BLOCK_DEVICE_ERROR_PARAMETER);
         }
     }
 }
@@ -801,6 +843,6 @@ int main(void) {
     RUN_CASE("trim-busy-timeout", test_trim_busy(true, true, false));
     RUN_CASE("trim-busy-wrap", test_trim_busy(true, false, true));
     RUN_CASE("init-clock", test_init_clock());
-    RUN_CASE("erase-geometry", test_erase_geometry());
+    RUN_CASE("trim-geometry", test_trim_geometry());
     return EXIT_SUCCESS;
 }
