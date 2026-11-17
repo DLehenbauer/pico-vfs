@@ -380,6 +380,18 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
         if (!(response & R1_RESPONSE_RECV)) {
             return response;
         }
+
+        // A card stopped mid-byte by CMD12 can send its R1 unaligned, e.g. E0 1F
+        // is 0x00 three bits late. Realign it, as Linux mmc_spi does (ab5a643c).
+        if ((CMD12_STOP_TRANSMISSION == cmd) && (response != 0xFF)) {
+            uint8_t next;
+            spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &next, 1);
+            uint16_t bits = (uint16_t)((response << 8) | next);
+            while (bits & 0x8000) {
+                bits <<= 1;
+            }
+            return (uint8_t)(bits >> 8);
+        }
     }
 
     // Tell _cmd() no valid R1 arrived so it can retry (or report failure if retries are exhausted).
@@ -442,12 +454,6 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
     // Pass the response to the command call if required
     if (NULL != resp) {
         *resp = response;
-    }
-
-    // Some cards keep streaming after CMD12, so its "R1" can be a data byte.
-    // Ignore its status bits and rely on the R1b busy wait below.
-    if ((CMD12_STOP_TRANSMISSION == cmd) && (R1_NO_RESPONSE != response)) {
-        response = 0;
     }
 
     // Process the response R1  : Exit on CRC/Illegal command error/No response
