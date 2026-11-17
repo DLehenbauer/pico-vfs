@@ -6,6 +6,7 @@
 #include "../../src/blockdevice/sd.c"
 
 static const char *current_case;
+static unsigned initialized_baudrate;
 
 #define CHECK(condition)                                                                           \
     do {                                                                                           \
@@ -68,6 +69,12 @@ static uint8_t exchange(uint8_t tx) {
         ++event_index;
     }
     return rx;
+}
+
+unsigned spi_init(spi_inst_t *spi, unsigned baudrate) {
+    CHECK(spi == spi0);
+    initialized_baudrate = baudrate;
+    return baudrate;
 }
 
 int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, size_t len) {
@@ -626,6 +633,18 @@ static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
            timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_OK);
 }
 
+// Exercise the actual SPI setup, not just the configured frequency constant.
+// The compatibility range follows Elm-Chan SPI initialization guidance
+// (See: https://elm-chan.org/docs/mmc/mmc_e.html#spiinit).
+static void test_init_clock(void) {
+    reset_card();
+    initialized_baudrate = 0;
+    expect_spi(0xFF, 0xFF, true, 10);
+    _spi_init(&config);
+    CHECK(initialized_baudrate >= 100000 && initialized_baudrate <= 400000);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+}
+
 int main(void) {
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
@@ -684,5 +703,6 @@ int main(void) {
     RUN_CASE("trim-sdhc-long-busy", test_trim_busy(true, false, false));
     RUN_CASE("trim-busy-timeout", test_trim_busy(true, true, false));
     RUN_CASE("trim-busy-wrap", test_trim_busy(true, false, true));
+    RUN_CASE("init-clock", test_init_clock());
     return EXIT_SUCCESS;
 }
