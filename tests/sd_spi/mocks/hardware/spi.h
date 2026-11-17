@@ -18,10 +18,7 @@ int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, s
 int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, size_t len);
 int spi_write_blocking(spi_inst_t *spi, const uint8_t *src, size_t len);
 
-static inline unsigned spi_init(spi_inst_t *spi, unsigned baudrate) {
-    (void)spi;
-    return baudrate;
-}
+unsigned spi_init(spi_inst_t *spi, unsigned baudrate);
 
 static inline unsigned spi_set_baudrate(spi_inst_t *spi, unsigned baudrate) {
     (void)spi;
