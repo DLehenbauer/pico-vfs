@@ -89,6 +89,10 @@ int spi_write_blocking(spi_inst_t *spi, const uint8_t *src, size_t len) {
 
 void gpio_put(unsigned gpio, bool value) {
     CHECK(gpio == config.cs);
+    // CS expectations describe transitions, not repeated writes of the same level.
+    if (value == cs_high) {
+        return;
+    }
     CHECK(event_index < event_count);
     event_t *event = &events[event_index++];
     CHECK(event->gpio);
@@ -192,7 +196,9 @@ static void expect_command(int cmd, uint32_t arg) {
     uint8_t packet[6] = {
         (uint8_t)(0x40 | cmd), arg >> 24, arg >> 16, arg >> 8, arg, 0xFF,
     };
-    if (config.enable_crc) {
+    // CMD0 before SPI entry, and CMD8 always, need valid CRC even with CRC off
+    // (SD v3.01, section 7.2.2, p.116).
+    if (config.enable_crc || cmd == CMD0_GO_IDLE_STATE || cmd == CMD8_SEND_IF_COND) {
         packet[5] = reference_crc7(packet, 5);
     }
     for (size_t i = 0; i < sizeof(packet); ++i) {
@@ -251,6 +257,48 @@ static void finish(int actual, int expected) {
     CHECK(event_index == event_count);
     CHECK(cs_high);
     CHECK(!config._mutex.locked);
+}
+
+static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_t extra) {
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    if (cmd == ACMD41_SD_SEND_OP_COND) {
+        expect_command(CMD55_APP_CMD, 0);
+        expect_spi(0xFF, 1, false, 1);
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
+    expect_command(cmd, arg);
+    expect_spi(0xFF, response, false, 1);
+    if (cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            expect_spi(0xFF, extra >> shift, false, 1);
+        }
+    }
+    expect_release();
+}
+
+// CMD59 controls CRC mode and should enable it before ACMD41 when requested
+// (SD v3.01, section 7.2.2, p.116, and Table 7-3, p.126).
+// Aborting on rejection is host policy; R1 reports command CRC errors
+// (SD v3.01, section 7.3.2.1, p.129).
+static void test_init_crc(bool enabled, bool rejected) {
+    reset_card();
+    config.enable_crc = enabled;
+    expect_spi(0xFF, 0xFF, true, 10);
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+    expect_init_command(CMD8_SEND_IF_COND, 0x1AA, 1, 0x1AA);
+    if (enabled) {
+        expect_init_command(CMD59_CRC_ON_OFF, 1, rejected ? 0x08 : 1, 0);
+    }
+    if (!rejected) {
+        expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+        expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 0, 0);
+        expect_init_command(CMD58_READ_OCR, 0, 0, OCR_3_3V | OCR_HCS_CCS);
+        if (!enabled) {
+            expect_init_command(CMD59_CRC_ON_OFF, 0, 0, 0);
+        }
+    }
+    finish(init_card(&config), rejected ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
 }
 
 // Checks CMD17 at SDSC byte address 1024, command CRC7, start token, all 512 data
@@ -551,6 +599,9 @@ static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
 }
 
 int main(void) {
+    RUN_CASE("init-crc-enabled", test_init_crc(true, false));
+    RUN_CASE("init-crc-disabled", test_init_crc(false, false));
+    RUN_CASE("init-crc-rejected", test_init_crc(true, true));
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("start-rejected", test_start_rejected());
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
