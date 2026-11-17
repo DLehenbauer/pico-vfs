@@ -43,6 +43,9 @@ static blockdevice_sd_config_t config;
 static blockdevice_t device;
 spi_inst_t mock_spi_instances[2] = {{0}, {1}};
 
+static void finish(int actual, int expected);
+static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_t extra);
+
 static void expect_spi(uint8_t tx, uint8_t rx, bool cs, size_t count) {
     CHECK(event_count < sizeof(events) / sizeof(events[0]));
     events[event_count++] = (event_t){.cs = cs, .tx = tx, .rx = rx, .count = count};
@@ -247,6 +250,86 @@ static void expect_block_crc(uint8_t value, bool corrupt_crc) {
 static void expect_block(uint8_t value) {
     // Deliberately corrupt CRC when checking that disabled CRC is still consumed.
     expect_block_crc(value, !config.enable_crc);
+}
+
+static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
+    for (unsigned bit = lsb; bit <= msb; ++bit) {
+        uint8_t mask = 1u << (bit % 8);
+        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
+                           ((value & (1u << (bit - lsb))) ? mask : 0);
+    }
+}
+
+static void make_csd(uint8_t *csd, bool high_capacity) {
+    memset(csd, 0, sizeof(*csd) * 16);
+    set_csd_bits(csd, 127, 126, high_capacity ? 1 : 0);
+    if (high_capacity) {
+        // Synthetic full-encoding fixture; this exceeds the specified SDXC
+        // user-area maximum and exists only to exercise arithmetic limits.
+        set_csd_bits(csd, 69, 48, 0x3FFFFF);
+    } else {
+        set_csd_bits(csd, 83, 80, 9);
+        set_csd_bits(csd, 73, 62, 1023);
+        set_csd_bits(csd, 49, 47, 0);
+    }
+}
+
+static void expect_csd(const uint8_t *csd, bool corrupt_crc) {
+    uint16_t crc = reference_crc16(csd, 16) ^ corrupt_crc;
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD9_SEND_CSD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, SPI_START_BLOCK, false, 1);
+    for (size_t i = 0; i < 16; ++i) {
+        expect_spi(0xFF, csd[i], false, 1);
+    }
+    expect_spi(0xFF, crc >> 8, false, 1);
+    expect_spi(0xFF, crc, false, 1);
+    expect_release();
+}
+
+static void test_sectors(void) {
+    uint8_t csd[16];
+    reset_card();
+    make_csd(csd, false);
+    expect_csd(csd, false);
+    CHECK(_sd_sectors(&config) == 4096);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    make_csd(csd, true);
+    expect_csd(csd, false);
+    CHECK(_sd_sectors(&config) == (UINT64_C(1) << 32));
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    make_csd(csd, false);
+    set_csd_bits(csd, 127, 126, 2);
+    expect_csd(csd, false);
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    make_csd(csd, false);
+    expect_csd(csd, true);
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    expect_init_command(CMD9_SEND_CSD, 0, R1_ILLEGAL_COMMAND, 0);
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD9_SEND_CSD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 300);
+    expect_release();
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
 // CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
@@ -670,6 +753,7 @@ int main(void) {
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
     RUN_CASE("singleblock", test_singleblock());
+    RUN_CASE("sectors", test_sectors());
     RUN_CASE("start-rejected", test_start_rejected());
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
     RUN_CASE("token-timeout-wrap", test_token_wrap(true));
