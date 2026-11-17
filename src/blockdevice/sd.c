@@ -645,9 +645,11 @@ static int init_card(void *_config) {
      * this bit is set to "0".
      */
     absolute_time_t timeout = make_timeout_time_ms(SD_COMMAND_TIMEOUT);
+    // CRC errors are recoverable; retry within the same initialization deadline.
     do {
         status = _cmd(config, ACMD41_SD_SEND_OP_COND, arg, 1, &response);
-    } while (status == BD_ERROR_OK && (response & R1_IDLE_STATE) &&
+    } while ((status == SD_BLOCK_DEVICE_ERROR_CRC ||
+              (status == BD_ERROR_OK && (response & R1_IDLE_STATE))) &&
              (0 < absolute_time_diff_us(get_absolute_time(), timeout)));
 
     // Preserve command errors; report a still-idle card as an initialization timeout.
