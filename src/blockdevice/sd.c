@@ -545,8 +545,10 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         *resp = response;
     }
 
-    // Do not deselect card if read is in progress.
-    if (((CMD9_SEND_CSD == cmd) || (ACMD22_SEND_NUM_WR_BLOCKS == cmd) ||
+    // Do not deselect card if a read is in progress. ACMD13 returns R2 followed
+    // by the 64-byte SD Status data block; bare CMD13 has only R2.
+    if (((CMD9_SEND_CSD == cmd) || (is_acmd && ACMD13_SD_STATUS == cmd) ||
+            (ACMD22_SEND_NUM_WR_BLOCKS == cmd) ||
             (CMD24_WRITE_BLOCK == cmd) || (CMD25_WRITE_MULTIPLE_BLOCK == cmd) ||
             (CMD17_READ_SINGLE_BLOCK == cmd) || (CMD18_READ_MULTIPLE_BLOCK == cmd))
             && (BD_ERROR_OK == status)) {
