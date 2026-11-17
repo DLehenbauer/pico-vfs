@@ -405,6 +405,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
     blockdevice_sd_config_t *config = _config;
     int32_t status = BD_ERROR_OK;
     uint32_t response;
+    bool prefix_failed = false;
 
     // If resp is provided, initialize it with R1_NO_RESPONSE to prevent callers
     // from using a stale/uninitialized response if no valid R1 arrives.
@@ -430,9 +431,16 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
 
     // Re-try command
     for (int i = 0; i < 3; i++) {
-        // Send CMD55 for APP command first
+        // Every application command requires a successful CMD55 prefix.
         if (is_acmd) {
             response = _cmd_spi(config, CMD55_APP_CMD, 0x0);
+            if (R1_NO_RESPONSE == response) {
+                continue;
+            }
+            if (response & ~R1_IDLE_STATE) {
+                prefix_failed = true;
+                break;
+            }
             // Wait for card to be ready after CMD55
             if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
                 debug_if(SD_DBG, "Card not ready yet \n");
@@ -486,6 +494,12 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         // R1 reports a misaligned address or invalid command argument
         // (SD v3.01, section 7.3.2.1, p.129).
         status = SD_BLOCK_DEVICE_ERROR_PARAMETER;
+    }
+    if (prefix_failed) {
+        // This is CMD55's R1. Do not send the application opcode or consume
+        // bytes from its response or data phase.
+        _postclock_then_deselect(config);
+        return status;
     }
 
     // Idle means initialization is in progress, not operational-command success
