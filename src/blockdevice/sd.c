@@ -255,6 +255,7 @@ static void _spi_init(void *_config) {
     gpio_set_function(config->miso, GPIO_FUNC_SPI);
     gpio_set_function(config->sclk, GPIO_FUNC_SPI);
     gpio_init(config->cs);
+    gpio_put(config->cs, 1);
     gpio_set_dir(config->cs, GPIO_OUT);
     gpio_pull_up(config->miso);
     gpio_set_drive_strength(config->mosi, 1);
@@ -262,10 +263,11 @@ static void _spi_init(void *_config) {
     spi_init(config->spi_inst, CONF_SD_INIT_FREQUENCY);
     spi_set_format(config->spi_inst, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
 
-    gpio_put(config->cs, 1);
-    bool old_cs = gpio_get(config->cs);
+    // Supply at least 74 clocks with CS and DI high (SD v3.01, section 6.4.1, p.111).
+    // The preceding 1 ms settling wait follows Elm-Chan SPI initialization guidance
+    // (See: https://elm-chan.org/docs/mmc/mmc_e.html#spiinit).
+    sleep_ms(1);
     _spi_wait(config, 10);
-    gpio_put(config->cs, old_cs);
 }
 
 static void _preclock_then_select(void *_config) {

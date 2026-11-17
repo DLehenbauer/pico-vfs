@@ -34,10 +34,7 @@ static inline void gpio_init(unsigned gpio) {
     (void)gpio;
 }
 
-static inline void gpio_set_dir(unsigned gpio, bool out) {
-    (void)gpio;
-    (void)out;
-}
+void gpio_set_dir(unsigned gpio, bool out);
 
 static inline void gpio_pull_up(unsigned gpio) {
     (void)gpio;
