@@ -3,8 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 #include "blockdevice/heap.h"
+#include "ff.h"
 #include "filesystem/fat.h"
 #include "filesystem/littlefs.h"
+#include "diskio.h"
 
 #define COLOR_GREEN(format)      ("\e[32m" format "\e[0m")
 #define HEAP_STORAGE_SIZE        (128 * 1024)
@@ -364,9 +366,13 @@ void test_filesystem(void) {
     filesystem_t *fat = filesystem_fat_create();
     assert(fat != NULL);
     setup(heap);
+    heap->erase_size = 2048;
 
     test_api_format(fat, heap);
     test_api_mount(fat, heap);
+    WORD sector_size = 0;
+    assert(disk_ioctl(0, GET_SECTOR_SIZE, &sector_size) == RES_OK);
+    assert(sector_size == 512);
     test_api_file_open_close(fat);
     test_api_file_write_read(fat);
     test_api_file_seek(fat);

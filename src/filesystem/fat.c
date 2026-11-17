@@ -92,9 +92,14 @@ DSTATUS disk_initialize(BYTE pdrv) {
 }
 
 static WORD disk_get_sector_size(BYTE pdrv) {
-    size_t sector_size = _ffs[(int)pdrv]->erase_size;
+    blockdevice_t *device = _ffs[(int)pdrv];
+    size_t sector_size = device->program_size;
 
     WORD ssize = sector_size;
+    if (ssize < 512) {
+        // Preserve erase-block-sized FAT sectors for page-programmable media.
+        ssize = device->erase_size;
+    }
     if (ssize < 512) {
         ssize = 512;
     }
