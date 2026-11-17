@@ -7,6 +7,8 @@
 
 static const char *current_case;
 static unsigned initialized_baudrate;
+static unsigned transfer_baudrate;
+static unsigned format_calls;
 
 #define CHECK(condition)                                                                           \
     do {                                                                                           \
@@ -72,9 +74,21 @@ static uint8_t exchange(uint8_t tx) {
 }
 
 unsigned spi_init(spi_inst_t *spi, unsigned baudrate) {
-    CHECK(spi == spi0);
+    CHECK(spi == config.spi_inst);
     initialized_baudrate = baudrate;
     return baudrate;
+}
+
+unsigned spi_set_baudrate(spi_inst_t *spi, unsigned baudrate) {
+    CHECK(spi == config.spi_inst);
+    transfer_baudrate = baudrate;
+    return baudrate;
+}
+
+void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha, unsigned order) {
+    CHECK(spi == config.spi_inst);
+    CHECK(bits == 8 && cpol == SPI_CPOL_0 && cpha == SPI_CPHA_0 && order == SPI_MSB_FIRST);
+    ++format_calls;
 }
 
 int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, size_t len) {
@@ -153,6 +167,7 @@ static void reset_card(void) {
     now_us = 0;
     time_step_us = 1000;
     startup_pending = false;
+    initialized_baudrate = transfer_baudrate = format_calls = 0;
     config = (blockdevice_sd_config_t){
         .spi_inst = spi0,
         .cs = 17,
@@ -162,12 +177,17 @@ static void reset_card(void) {
         .block_size = 512,
         .erase_size = 512,
         .total_sectors = 4096,
+        .hz = 12000000,
     };
     device = (blockdevice_t){
         .config = &config,
         .read = read,
+        .program = program,
+        .trim = trim,
         .size = size,
         .read_size = 512,
+        .program_size = 512,
+        .erase_size = 512,
         .is_initialized = true,
     };
     mutex_init(&config._mutex);
@@ -289,7 +309,8 @@ static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_
     }
     expect_command(cmd, arg);
     expect_spi(0xFF, response, false, 1);
-    if (cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR) {
+    if ((cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR) &&
+        !(response & (R1_COM_CRC_ERROR | R1_ILLEGAL_COMMAND))) {
         for (int shift = 24; shift >= 0; shift -= 8) {
             expect_spi(0xFF, extra >> shift, false, 1);
         }
@@ -653,6 +674,116 @@ static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
            timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_OK);
 }
 
+
+static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
+    for (unsigned bit = lsb; bit <= msb; ++bit) {
+        uint8_t mask = 1u << (bit % 8);
+        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
+                           ((value & (1u << (bit - lsb))) ? mask : 0);
+    }
+}
+
+static void make_csd(uint8_t *csd) {
+    memset(csd, 0, 16);
+    set_csd_bits(csd, 83, 80, 9);
+    set_csd_bits(csd, 73, 62, 1023);
+    set_csd_bits(csd, 49, 47, 0);
+    set_csd_bits(csd, 45, 39, 3);
+}
+
+static void expect_csd(const uint8_t *csd, bool corrupt_crc) {
+    uint16_t crc = reference_crc16(csd, 16) ^ (corrupt_crc ? 1 : 0);
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD9_SEND_CSD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFE, false, 1);
+    for (size_t i = 0; i < 16; ++i) {
+        expect_spi(0xFF, csd[i], false, 1);
+    }
+    expect_spi(0xFF, crc >> 8, false, 1);
+    expect_spi(0xFF, crc, false, 1);
+    expect_release();
+}
+
+static void expect_card_init(bool fail) {
+    expect_spi(0xFF, 0xFF, true, 10);
+    if (fail) {
+        for (unsigned i = 0; i < SD_CMD0_GO_IDLE_STATE_RETRIES; ++i) {
+            expect_init_command(CMD0_GO_IDLE_STATE, 0, 0, 0);
+        }
+        return;
+    }
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+    expect_init_command(CMD8_SEND_IF_COND, 0x1AA, R1_IDLE_STATE | R1_ILLEGAL_COMMAND, 0x1AA);
+    expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, 0, 0, 0);
+}
+
+static void expect_top_init_setup(unsigned failure) {
+    expect_card_init(failure == 4);
+    if (failure == 4) {
+        return;
+    }
+    uint8_t csd[16];
+    make_csd(csd);
+    expect_csd(csd, failure == 1);
+    if (failure != 1) {
+        expect_init_command(CMD16_SET_BLOCKLEN, 512, failure == 2 ? R1_ILLEGAL_COMMAND : 0, 0);
+    }
+}
+
+static void test_uninitialized_io(bool after_deinit) {
+    reset_card();
+    if (after_deinit) {
+        finish(deinit(&device), BD_ERROR_OK);
+    } else {
+        config.is_initialized = device.is_initialized = false;
+    }
+    config.erase_size = 0;
+    CHECK(!config.is_initialized && !device.is_initialized);
+    uint8_t buffer[512] = {0};
+    finish(read(&device, buffer, 1, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
+    finish(program(&device, buffer, 1, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
+    finish(trim(&device, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
+}
+
+static void test_top_init(unsigned failure) {
+    reset_card();
+    expect_top_init_setup(failure);
+    if (failure == 3) {
+        config.hz = 30000000;
+    }
+    int status = failure == 4 ? SD_BLOCK_DEVICE_ERROR_NO_DEVICE :
+                 failure == 1 || failure == 2 ? BD_ERROR_DEVICE_ERROR :
+                 failure == 3 ? -EINVAL : BD_ERROR_OK;
+    finish(init(&device), status);
+    CHECK(device.is_initialized == (failure == 0));
+    CHECK(config.is_initialized == (failure == 0));
+    if (!failure) {
+        CHECK(transfer_baudrate == 12000000);
+        CHECK(device.size(&device) == 4096 * 512);
+    } else {
+        uint8_t buffer[512] = {0};
+        finish(read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
+        finish(program(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
+        finish(trim(&device, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
+    }
+}
+
+static void test_deinit_reinit(void) {
+    reset_card();
+    finish(deinit(&device), BD_ERROR_OK);
+    CHECK(!config.is_initialized && !device.is_initialized);
+
+    expect_top_init_setup(0);
+    finish(init(&device), BD_ERROR_OK);
+    CHECK(config.is_initialized && device.is_initialized);
+    CHECK(transfer_baudrate == 12000000);
+}
+
+
 // Exercise the actual SPI setup, not just the configured frequency constant.
 // The compatibility range follows Elm-Chan SPI initialization guidance
 // (See: https://elm-chan.org/docs/mmc/mmc_e.html#spiinit).
@@ -662,10 +793,19 @@ static void test_init_clock(void) {
     expect_spi(0xFF, 0xFF, true, 10);
     _spi_init(&config);
     CHECK(initialized_baudrate >= 100000 && initialized_baudrate <= 400000);
+    CHECK(format_calls == 1);
     finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
 int main(void) {
+    RUN_CASE("uninitialized-io", test_uninitialized_io(false));
+    RUN_CASE("deinitialized-io", test_uninitialized_io(true));
+    RUN_CASE("top-init", test_top_init(0));
+    RUN_CASE("top-init-csd-error", test_top_init(1));
+    RUN_CASE("top-init-cmd16-error", test_top_init(2));
+    RUN_CASE("top-init-frequency-error", test_top_init(3));
+    RUN_CASE("top-init-card-error", test_top_init(4));
+    RUN_CASE("deinit-reinit", test_deinit_reinit());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
     RUN_CASE("init-crc-disabled", test_init_crc(false, false));
     RUN_CASE("init-crc-rejected", test_init_crc(true, true));
