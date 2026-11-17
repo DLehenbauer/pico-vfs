@@ -819,15 +819,15 @@ static int _freq(void *_config) {
 static int init(blockdevice_t *device) {
     blockdevice_sd_config_t *config = device->config;
     mutex_enter_blocking(&config->_mutex);
+    config->is_initialized = false;
+    device->is_initialized = false;
 
     int err = init_card(config);
-    config->is_initialized = (err == BD_ERROR_OK);
-    if (!config->is_initialized) {
+    if (err != BD_ERROR_OK) {
         debug_if(SD_DBG, "Fail to initialize card\n");
         mutex_exit(&config->_mutex);
         return err;
     }
-    debug_if(SD_DBG, "init card = %d\n", config->is_initialized);
     config->total_sectors = _sd_sectors(config);
     // CMD9 failed
     if (0 == config->total_sectors) {
@@ -849,7 +849,9 @@ static int init(blockdevice_t *device) {
         return err;
     }
 
+    config->is_initialized = true;
     device->is_initialized = true;
+    debug_if(SD_DBG, "init card = %d\n", config->is_initialized);
     mutex_exit(&config->_mutex);
     return BD_ERROR_OK;
 }
@@ -867,7 +869,11 @@ static bool is_valid_program(blockdevice_t *device, bd_size_t addr, bd_size_t si
 }
 
 static int deinit(blockdevice_t *device) {
+    blockdevice_sd_config_t *config = device->config;
+    mutex_enter_blocking(&config->_mutex);
+    config->is_initialized = false;
     device->is_initialized = false;
+    mutex_exit(&config->_mutex);
     return 0;
 }
 
@@ -910,12 +916,12 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
     blockdevice_sd_config_t *config = device->config;
     mutex_enter_blocking(&config->_mutex);
 
-    if (!is_valid_read(device, addr, size)) {
+    if (!config->is_initialized) {
         mutex_exit(&config->_mutex);
-        return SD_BLOCK_DEVICE_ERROR_PARAMETER;
+        return SD_BLOCK_DEVICE_ERROR_NO_INIT;
     }
 
-    if (!config->is_initialized) {
+    if (!is_valid_read(device, addr, size)) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
@@ -1011,14 +1017,14 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
     blockdevice_sd_config_t *config = device->config;
     mutex_enter_blocking(&config->_mutex);
 
-    if (!is_valid_program(device, addr, size)) {
-        mutex_exit(&config->_mutex);
-        return SD_BLOCK_DEVICE_ERROR_PARAMETER;
-    }
-
     if (!config->is_initialized) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_NO_INIT;
+    }
+
+    if (!is_valid_program(device, addr, size)) {
+        mutex_exit(&config->_mutex);
+        return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
 
     const uint8_t *buffer = (const uint8_t *)_buffer;
@@ -1101,14 +1107,14 @@ static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
     blockdevice_sd_config_t *config = device->config;
     mutex_enter_blocking(&config->_mutex);
 
-    if (!_is_valid_trim(device, addr, size)) {
-        mutex_exit(&config->_mutex);
-        return SD_BLOCK_DEVICE_ERROR_PARAMETER;
-    }
-
     if (!config->is_initialized) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_NO_INIT;
+    }
+
+    if (!_is_valid_trim(device, addr, size)) {
+        mutex_exit(&config->_mutex);
+        return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
     int status = BD_ERROR_OK;
 

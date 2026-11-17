@@ -20,16 +20,5 @@ int spi_write_blocking(spi_inst_t *spi, const uint8_t *src, size_t len);
 
 unsigned spi_init(spi_inst_t *spi, unsigned baudrate);
 
-static inline unsigned spi_set_baudrate(spi_inst_t *spi, unsigned baudrate) {
-    (void)spi;
-    return baudrate;
-}
-
-static inline void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha,
-                                  unsigned order) {
-    (void)spi;
-    (void)bits;
-    (void)cpol;
-    (void)cpha;
-    (void)order;
-}
+unsigned spi_set_baudrate(spi_inst_t *spi, unsigned baudrate);
+void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha, unsigned order);
