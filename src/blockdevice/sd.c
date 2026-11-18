@@ -524,9 +524,12 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
             config->card_type = SDCARD_V2; // fallthrough
         // Note: No break here, need to read rest of the response
         case CMD58_READ_OCR:                // Response R3
-            response  = (_spi_write(config, SPI_FILL_CHAR) << 24);
-            response |= (_spi_write(config, SPI_FILL_CHAR) << 16);
-            response |= (_spi_write(config, SPI_FILL_CHAR) << 8);
+            // Cast before shifting because OCR bit 31 and R7 continuation bytes
+            // may set the sign bit (SD v9.10, sections 7.3.2.4-7.3.2.6,
+            // pp.303-304). The promoted signed shift would overflow.
+            response  = ((uint32_t)_spi_write(config, SPI_FILL_CHAR) << 24);
+            response |= ((uint32_t)_spi_write(config, SPI_FILL_CHAR) << 16);
+            response |= ((uint32_t)_spi_write(config, SPI_FILL_CHAR) << 8);
             response |= _spi_write(config, SPI_FILL_CHAR);
             debug_if(SD_DBG, "R3/R7: 0x%" PRIx32 "\n", response);
             break;
