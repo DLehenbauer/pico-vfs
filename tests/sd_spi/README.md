@@ -74,12 +74,13 @@ Page numbers are the printed document pages.
 
 ## Limitations
 
-Command responses, including R2/R3/R7 continuation bytes, are exercised at
-every bit offset. Read-start tokens, read payloads, and their CRCs remain
-byte-aligned; their realignment is not implemented. Cards that also shift read
-blocks are not supported. With CRC disabled, the driver can mistake a payload
-byte for the start token and return corrupted data without an error. CRC
-checking reduces this risk but cannot guarantee detection.
+Command responses, including R2/R3/R7 continuation bytes, and write-data
+acknowledgments are exercised at every bit offset. Read-start tokens, read
+payloads, and their CRCs remain byte-aligned; their realignment is not
+implemented. Cards that also shift read blocks are not supported. With CRC
+disabled, the driver can mistake a payload byte for the start token and return
+corrupted data without an error. CRC checking reduces this risk but cannot
+guarantee detection.
 
 The mock clock advances deterministically. The default command timeout is 5 ms
 in tests and remains 5 s in production.

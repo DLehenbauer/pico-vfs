@@ -395,36 +395,39 @@ static void test_sectors(void) {
 static void expect_program_data(uint8_t value, uint8_t start) {
     uint8_t buffer[512];
     memset(buffer, value, sizeof(buffer));
-    uint16_t crc = reference_crc16(buffer, sizeof(buffer));
+    uint16_t crc = config.enable_crc ? reference_crc16(buffer, sizeof(buffer)) : 0xFFFF;
     expect_spi(start, 0xFF, false, 1);
     expect_spi(value, 0xFF, false, sizeof(buffer));
     expect_spi(crc >> 8, 0xFF, false, 1);
     expect_spi(crc, 0xFF, false, 1);
 }
 
-static void expect_program_block(uint8_t value, uint8_t start, uint8_t response,
+static void expect_program_block(uint8_t value, uint8_t start, uint8_t response, unsigned shift,
                                 bool timeout) {
     expect_program_data(value, start);
-    expect_spi(0xFF, response, false, 1);
+    uint8_t token = response << 3;
+    expect_response_bits(&token, 5, 3 + shift, true);
     expect_spi(0xFF, 0, false, timeout ? CONF_SD_CMD_TIMEOUT : 2);
     if (!timeout) {
         expect_spi(0xFF, 0xFF, false, 1);
     }
 }
 
-static void expect_multiblock_program(void) {
+static void expect_multiblock_program(unsigned shift) {
+    uint8_t r1 = 0;
     expect_select();
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(CMD55_APP_CMD, 0);
-    expect_spi(0xFF, 0, false, 1);
+    expect_response_bits(&r1, 8, (shift + 1) % 8, false);
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(ACMD23_SET_WR_BLK_ERASE_COUNT, 2);
-    expect_spi(0xFF, 0, false, 1);
+    r1 = 0;
+    expect_response_bits(&r1, 8, shift, false);
     expect_release();
     expect_select();
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(CMD25_WRITE_MULTIPLE_BLOCK, 0);
-    expect_spi(0xFF, 0, false, 1);
+    expect_response_bits(&r1, 8, (shift + 3) % 8, false);
 }
 
 static void fill_pattern(uint8_t *buffer, size_t length) {
@@ -724,34 +727,54 @@ static void test_singleblock(void) {
     CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
 }
 
-static void test_singleblock_program(void) {
-    static const uint8_t responses[] = {
-        SPI_DATA_ACCEPTED, SPI_DATA_CRC_ERROR, SPI_DATA_WRITE_ERROR,
-    };
-    for (size_t i = 0; i < sizeof(responses); ++i) {
-        for (unsigned timeout = 0; timeout < 2; ++timeout) {
-            reset_card();
-            expect_select();
-            expect_spi(0xFF, 0xFF, false, 1);
-            expect_command(CMD24_WRITE_BLOCK, 0);
-            expect_spi(0xFF, 0, false, 1);
-            expect_program_block(0x31, SPI_START_BLOCK, responses[i], timeout);
-            expect_release();
-            uint8_t buffer[512];
-            memset(buffer, 0x31, sizeof(buffer));
-            finish(program(&device, buffer, 0, sizeof(buffer)),
-                   timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE :
-                   responses[i] == SPI_DATA_ACCEPTED ? BD_ERROR_OK :
-                                                      SD_BLOCK_DEVICE_ERROR_WRITE);
-        }
+static void test_write_alignment(unsigned shift, bool enable_crc) {
+    // Accepted, CRC-rejected, and write-rejected tokens are defined by
+    // SD v9.10, section 7.3.3.1, p.305; the remaining values must not succeed.
+    static const uint8_t tokens[] = {0x05, 0x0B, 0x0D, 0x01, 0x0F, 0x00};
+    for (size_t i = 0; i < sizeof(tokens); ++i) {
+        reset_card();
+        config.enable_crc = enable_crc;
+        device.program_size = 512;
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_command(CMD24_WRITE_BLOCK, 0);
+        expect_spi(0xFF, 0, false, 1);
+        uint8_t buffer[512];
+        memset(buffer, 0x31, sizeof(buffer));
+        expect_program_data(0x31, SPI_START_BLOCK);
+        uint8_t token = tokens[i] << 3;
+        expect_response_bits(&token, 5, 3 + shift, false);
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_release();
+        finish(program(&device, buffer, 0, sizeof(buffer)),
+               tokens[i] == SPI_DATA_ACCEPTED ? BD_ERROR_OK : SD_BLOCK_DEVICE_ERROR_WRITE);
     }
 }
 
-static void test_multiblock_program_success(bool stop_timeout) {
+static void test_write_busy_timeout(unsigned shift) {
+    static const uint8_t tokens[] = {SPI_DATA_ACCEPTED, SPI_DATA_CRC_ERROR, SPI_DATA_WRITE_ERROR};
+    for (size_t i = 0; i < sizeof(tokens); ++i) {
+        reset_card();
+        device.program_size = 512;
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_command(CMD24_WRITE_BLOCK, 0);
+        expect_spi(0xFF, 0, false, 1);
+        expect_program_block(0x31, SPI_START_BLOCK, tokens[i], shift, true);
+        expect_release();
+        uint8_t buffer[512];
+        memset(buffer, 0x31, sizeof(buffer));
+        finish(program(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
+    }
+}
+
+static void test_multiblock_program(unsigned shift, bool stop_timeout, bool enable_crc) {
     reset_card();
-    expect_multiblock_program();
-    expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
-    expect_program_block(0xA6, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+    config.enable_crc = enable_crc;
+    device.program_size = 512;
+    expect_multiblock_program(shift);
+    expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, shift, false);
+    expect_program_block(0xA6, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 7 - shift, false);
     expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
     // Stop Tran may be followed by busy (SD v9.10, Figure 7-7, p.291).
     // Discard N_BR even when it looks ready; busy can start in the next byte
@@ -784,9 +807,10 @@ static void test_multiblock_stop_timing(void) {
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_card();
-        expect_multiblock_program();
-        expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
-        expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+        device.program_size = 512;
+        expect_multiblock_program(0);
+        expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 0, false);
+        expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 0, false);
         expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
         expect_spi(0xFF, cases[i].nbr, false, 1);
         if (cases[i].busy_bytes) {
@@ -800,7 +824,45 @@ static void test_multiblock_stop_timing(void) {
     }
 }
 
-static void test_multiblock_program_failure(void) {
+static void test_program_response_failure(bool multiple) {
+    static const struct {
+        uint8_t last_byte;
+        bool busy_timeout;
+    } cases[] = {{0xFF, false}, {0xFF, true}, {0xF2, false}, {0xF2, true}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_card();
+        device.program_size = 512;
+        if (multiple) {
+            expect_multiblock_program(0);
+        } else {
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD24_WRITE_BLOCK, 0);
+            expect_spi(0xFF, 0, false, 1);
+        }
+        expect_program_data(0x31, multiple ? SPI_START_BLK_MUL_WRITE : SPI_START_BLOCK);
+        expect_spi(0xFF, 0xFF, false, 3);
+        // F2 ends in a truncated 0010 token. Reading a fifth byte of FF would
+        // incorrectly complete it as 00101 (accepted).
+        expect_spi(0xFF, cases[i].last_byte, false, 1);
+        expect_spi(0xFF, cases[i].busy_timeout ? 0 : 0xFF, false,
+                   cases[i].busy_timeout ? CONF_SD_CMD_TIMEOUT : 1);
+        if (multiple && !cases[i].busy_timeout) {
+            expect_stop(0, 0, 0, true);
+        } else {
+            expect_release();
+        }
+        uint8_t buffer[1024];
+        memset(buffer, 0x31, sizeof(buffer));
+        finish(program(&device, buffer, 0, multiple ? sizeof(buffer) : 512),
+               cases[i].busy_timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE :
+                                       SD_BLOCK_DEVICE_ERROR_WRITE);
+    }
+}
+
+// CRC/write rejection requires CMD12 (SD v9.10, section 7.3.3.1, p.305), but
+// commands are rejected while busy (section 7.2.8, p.292). Only abort after ready.
+static void test_multiblock_program_failure(unsigned shift) {
     static const struct {
         uint8_t response;
         bool write_timeout;
@@ -808,22 +870,25 @@ static void test_multiblock_program_failure(void) {
         bool abort_timeout;
         bool second_block;
     } cases[] = {
-        {SPI_DATA_CRC_ERROR, false, 0, false, false},
-        {SPI_DATA_WRITE_ERROR, false, R1_ILLEGAL_COMMAND, false, false},
-        {SPI_DATA_ACCEPTED, true, 0, false, false},
-        {SPI_DATA_CRC_ERROR, true, 0, false, false},
-        {SPI_DATA_WRITE_ERROR, true, 0, false, true},
-        {SPI_DATA_CRC_ERROR, false, 0, true, false},
-        {SPI_DATA_WRITE_ERROR, false, 0, false, true},
+        {0x0B, false, 0, false, false},
+        {0x0D, false, R1_ILLEGAL_COMMAND, false, false},
+        {0x05, true, 0, false, false},
+        {0x0B, true, 0, false, false},
+        {0x0D, true, 0, false, true},
+        {0x0B, false, 0, true, false},
+        {0x0B, false, 0, false, true},
+        {0x05, true, 0, false, true},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_card();
-        expect_multiblock_program();
+        device.program_size = 512;
+        expect_multiblock_program(shift);
         if (cases[i].second_block) {
-            expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+            expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 7 - shift,
+                                 false);
         }
         expect_program_block(cases[i].second_block ? 0xA6 : 0x31,
-                             SPI_START_BLK_MUL_WRITE, cases[i].response,
+                             SPI_START_BLK_MUL_WRITE, cases[i].response, shift,
                              cases[i].write_timeout);
         if (cases[i].write_timeout) {
             expect_release();
@@ -838,6 +903,54 @@ static void test_multiblock_program_failure(void) {
         finish(program(&device, buffer, 0, sizeof(buffer)),
                cases[i].write_timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE :
                                         SD_BLOCK_DEVICE_ERROR_WRITE);
+    }
+}
+
+// xxx0sss1 leaves the first three bits undefined (SD v9.10, section 7.3.3.1,
+// p.305). Prefix invariance and the four-byte host-policy cap are separate checks.
+static void test_write_response_bounds(void) {
+    for (unsigned prefix = 0; prefix < 8; ++prefix) {
+        for (unsigned token = 0; token < 16; ++token) {
+            reset_card();
+            cs_high = false;
+            expect_spi(0xFF, (prefix << 5) | token, false, 1);
+            CHECK(_read_data_response(&config) == token);
+            CHECK(event_index == event_count);
+        }
+    }
+
+    reset_card();
+    cs_high = false;
+    expect_spi(0xFF, 0xFF, false, 3);
+    expect_spi(0xFF, 0xE5, false, 1);
+    CHECK(_read_data_response(&config) == SPI_DATA_ACCEPTED);
+    CHECK(event_index == event_count);
+
+    reset_card();
+    cs_high = false;
+    expect_spi(0xFF, 0xFF, false, 3);
+    expect_spi(0xFF, 0xF2, false, 1);
+    CHECK(_read_data_response(&config) == 0xFF);
+    CHECK(event_index == event_count);
+
+    reset_card();
+    cs_high = false;
+    expect_spi(0xFF, 0xFF, false, 4);
+    CHECK(_read_data_response(&config) == 0xFF);
+    CHECK(event_index == event_count);
+}
+
+static void test_write_response_windows(void) {
+    for (unsigned leading = 3; leading < 32; ++leading) {
+        for (unsigned response = 0; response < 16; ++response) {
+            reset_card();
+            cs_high = false;
+            uint8_t token = response << 3;
+            bool complete = leading <= 27;
+            expect_response_bits(&token, complete ? 5 : 32 - leading, leading, true);
+            CHECK(_read_data_response(&config) == (complete ? response : 0xFF));
+            CHECK(event_index == event_count);
+        }
     }
 }
 
@@ -2100,11 +2213,7 @@ int main(void) {
     RUN_CASE("init-final-ocr-busy", test_init_transport_failure(true, true));
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("sectors", test_sectors());
-    RUN_CASE("singleblock-program-status", test_singleblock_program());
-    RUN_CASE("multiblock-program-success", test_multiblock_program_success(false));
-    RUN_CASE("multiblock-program-stop-timeout", test_multiblock_program_success(true));
     RUN_CASE("multiblock-stop-timing", test_multiblock_stop_timing());
-    RUN_CASE("multiblock-program-failure", test_multiblock_program_failure());
     RUN_CASE("start-rejected", test_start_rejected());
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
     RUN_CASE("token-timeout-wrap", test_token_wrap(true));
@@ -2128,7 +2237,25 @@ int main(void) {
         RUN_CASE(name, test_busy_alignment(shift));
         snprintf(name, sizeof(name), "read-command-alignment-%u", shift);
         RUN_CASE(name, test_read_command_alignment(shift));
+        snprintf(name, sizeof(name), "write-alignment-%u", shift);
+        RUN_CASE(name, test_write_alignment(shift, true));
+        snprintf(name, sizeof(name), "write-alignment-crc-disabled-%u", shift);
+        RUN_CASE(name, test_write_alignment(shift, false));
+        snprintf(name, sizeof(name), "write-busy-timeout-%u", shift);
+        RUN_CASE(name, test_write_busy_timeout(shift));
+        snprintf(name, sizeof(name), "multiblock-program-%u", shift);
+        RUN_CASE(name, test_multiblock_program(shift, false, true));
+        snprintf(name, sizeof(name), "multiblock-program-crc-disabled-%u", shift);
+        RUN_CASE(name, test_multiblock_program(shift, false, false));
+        snprintf(name, sizeof(name), "multiblock-program-stop-timeout-%u", shift);
+        RUN_CASE(name, test_multiblock_program(shift, true, true));
+        snprintf(name, sizeof(name), "multiblock-program-failure-%u", shift);
+        RUN_CASE(name, test_multiblock_program_failure(shift));
     }
+    RUN_CASE("write-response-bounds", test_write_response_bounds());
+    RUN_CASE("write-response-windows", test_write_response_windows());
+    RUN_CASE("singleblock-response-failure", test_program_response_failure(false));
+    RUN_CASE("multiblock-response-failure", test_program_response_failure(true));
     RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK, 0));
     RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED, 2));
     RUN_CASE("command-busy-timeout", test_command_busy(false));
