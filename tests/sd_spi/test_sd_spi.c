@@ -45,6 +45,7 @@ static blockdevice_sd_config_t config;
 static blockdevice_t device;
 static unsigned mutex_entries;
 static unsigned mutex_exits;
+static mutex_t *expected_mutex;
 static bool observing_lifecycle;
 static bool initializing;
 static bool entry_config_initialized;
@@ -112,7 +113,7 @@ void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha
 }
 
 int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, size_t len) {
-    CHECK(spi == spi0);
+    CHECK(spi == config.spi_inst);
     for (size_t i = 0; i < len; ++i) {
         uint8_t rx = exchange(src[i]);
         if (dst) {
@@ -123,7 +124,7 @@ int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, s
 }
 
 int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, size_t len) {
-    CHECK(spi == spi0);
+    CHECK(spi == config.spi_inst);
     for (size_t i = 0; i < len; ++i) {
         dst[i] = exchange(repeated_tx_data);
     }
@@ -169,10 +170,11 @@ void sleep_ms(uint32_t ms) {
 
 void mutex_init(mutex_t *mutex) {
     mutex->locked = false;
+    expected_mutex = mutex;
 }
 
 void mutex_enter_blocking(mutex_t *mutex) {
-    CHECK(mutex == &config._mutex);
+    CHECK(mutex == expected_mutex);
     CHECK(!mutex->locked);
     if (observing_lifecycle) {
         CHECK(config.is_initialized == entry_config_initialized);
@@ -183,7 +185,7 @@ void mutex_enter_blocking(mutex_t *mutex) {
 }
 
 void mutex_exit(mutex_t *mutex) {
-    CHECK(mutex == &config._mutex);
+    CHECK(mutex == expected_mutex);
     CHECK(mutex->locked);
     if (observing_lifecycle) {
         CHECK(config.is_initialized == initialized_on_unlock);
@@ -247,6 +249,14 @@ static uint16_t reference_crc16(const uint8_t *data, size_t len) {
         }
     }
     return crc;
+}
+
+static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
+    for (unsigned bit = lsb; bit <= msb; ++bit) {
+        uint8_t mask = 1u << (bit % 8);
+        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
+                           ((value & (1u << (bit - lsb))) ? mask : 0);
+    }
 }
 
 static void expect_select(void) {
@@ -1205,14 +1215,6 @@ static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
 }
 
 
-static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
-    for (unsigned bit = lsb; bit <= msb; ++bit) {
-        uint8_t mask = 1u << (bit % 8);
-        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
-                           ((value & (1u << (bit - lsb))) ? mask : 0);
-    }
-}
-
 static void make_ordinary_csd(uint8_t *csd, bool high_capacity) {
     memset(csd, 0, 16);
     set_csd_bits(csd, 127, 126, high_capacity ? 1 : 0);
@@ -1527,7 +1529,52 @@ static void test_trim_invalid_write_length(void) {
     }
 }
 
+// SPI1 RX includes GPIO24 and GPIO28 (RP2040 datasheet, section 1.4.3,
+// Table 2, pp.12-13); SD does not specify the host's GPIO routing. The
+// ordinary CSD fixture is only enough to initialize a small SDSC card.
+static void test_create_spi1_miso(unsigned miso) {
+    reset_card();
+    config.spi_inst = spi1;
+    expect_spi(0xFF, 0xFF, true, 10);
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD8_SEND_IF_COND, 0x1AA);
+    expect_spi(0xFF, R1_ILLEGAL_COMMAND | R1_IDLE_STATE, false, 1);
+    expect_release();
+    expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
+    expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
+    expect_init_command(ACMD41_SD_SEND_OP_COND, 0, 0, 0);
+
+    uint8_t csd[16];
+    make_ordinary_csd(csd, false);
+    uint16_t crc = reference_crc16(csd, sizeof(csd));
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD9_SEND_CSD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFE, false, 1);
+    for (size_t i = 0; i < sizeof(csd); ++i) {
+        expect_spi(0xFF, csd[i], false, 1);
+    }
+    expect_spi(0xFF, crc >> 8, false, 1);
+    expect_spi(0xFF, crc, false, 1);
+    expect_release();
+    expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
+
+    blockdevice_t *created =
+        blockdevice_sd_create(spi1, 27, miso, 26, 17, 12000000, true);
+    CHECK(created != NULL);
+    blockdevice_sd_config_t *created_config = created->config;
+    CHECK(created->is_initialized && created_config->is_initialized);
+    CHECK(created_config->spi_inst == spi1 && created_config->miso == miso);
+    CHECK(event_index == event_count && !created_config->_mutex.locked);
+    blockdevice_sd_free(created);
+}
+
 int main(void) {
+    RUN_CASE("create-spi1-miso24", test_create_spi1_miso(24));
+    RUN_CASE("create-spi1-miso28", test_create_spi1_miso(28));
     RUN_CASE("initialized-invalid-io", test_initialized_invalid_io());
     RUN_CASE("cold-sdsc-crc", test_cold_init(false, true));
     RUN_CASE("cold-sdsc-no-crc", test_cold_init(false, false));
