@@ -332,10 +332,32 @@ static bool _wait_ready(void *_config, uint64_t timeout) {
 
 }
 
-static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
+typedef struct {
+    uint8_t shift;
+    uint8_t leftover;
+} response_alignment_t;
+
+static uint8_t _read_response_byte(void *_config, response_alignment_t *alignment) {
+    const uint8_t next = _spi_write(_config, SPI_FILL_CHAR);
+    const uint8_t shift = alignment->shift;
+
+    if (!shift) {
+        return next;
+    }
+
+    const uint8_t response = (alignment->leftover << shift) |
+                             (next >> (8 - shift));
+    alignment->leftover = next;
+    return response;
+}
+
+static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
+                         response_alignment_t *alignment) {
     blockdevice_sd_config_t *config = _config;
     uint8_t response;
     uint8_t cmd_packet[PACKET_SIZE] = {0};
+
+    *alignment = (response_alignment_t){0};
 
     // Prepare the command packet
     cmd_packet[0] = SPI_CMD(cmd);
@@ -384,17 +406,19 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg) {
             return response;
         }
 
-        // A card stopped mid-byte by CMD12 can send its R1 unaligned, e.g. E0 1F
-        // is 0x00 three bits late. Realign it, as Linux mmc_spi does (ab5a643c).
-        if ((CMD12_STOP_TRANSMISSION == cmd) && (response != 0xFF)) {
-            uint8_t next;
-            spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &next, 1);
-            uint16_t bits = (uint16_t)((response << 8) | next);
-            while (bits & 0x8000) {
-                bits <<= 1;
-            }
-            return (uint8_t)(bits >> 8);
+        if (response == 0xFF) {
+            continue;
         }
+
+        // SD requires byte-aligned command responses. Accommodate cards that
+        // start R1 after leading clocks within a received byte, preserving the
+        // same alignment for R2/R3/R7 continuation bytes.
+        alignment->leftover = response;
+        while (response & R1_RESPONSE_RECV) {
+            response <<= 1;
+            ++alignment->shift;
+        }
+        return _read_response_byte(config, alignment);
     }
 
     // Tell _cmd() no valid R1 arrived so it can retry (or report failure if retries are exhausted).
@@ -407,6 +431,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
     int32_t status = BD_ERROR_OK;
     uint32_t response;
     bool prefix_failed = false;
+    response_alignment_t alignment;
 
     // If resp is provided, initialize it with R1_NO_RESPONSE to prevent callers
     // from using a stale/uninitialized response if no valid R1 arrives.
@@ -434,7 +459,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
     for (int i = 0; i < 3; i++) {
         // Every application command requires a successful CMD55 prefix.
         if (is_acmd) {
-            response = _cmd_spi(config, CMD55_APP_CMD, 0x0);
+            response = _cmd_spi(config, CMD55_APP_CMD, 0x0, &alignment);
             if (R1_NO_RESPONSE == response) {
                 continue;
             }
@@ -454,7 +479,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         }
 
         // Send command over SPI interface
-        response = _cmd_spi(config, cmd, arg);
+        response = _cmd_spi(config, cmd, arg, &alignment);
         if (R1_NO_RESPONSE == response) {
             debug_if(SD_DBG, "No response CMD:%d \n", cmd);
             continue;
@@ -527,10 +552,10 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
             // Cast before shifting because OCR bit 31 and R7 continuation bytes
             // may set the sign bit (SD v9.10, sections 7.3.2.4-7.3.2.6,
             // pp.303-304). The promoted signed shift would overflow.
-            response  = ((uint32_t)_spi_write(config, SPI_FILL_CHAR) << 24);
-            response |= ((uint32_t)_spi_write(config, SPI_FILL_CHAR) << 16);
-            response |= ((uint32_t)_spi_write(config, SPI_FILL_CHAR) << 8);
-            response |= _spi_write(config, SPI_FILL_CHAR);
+            response  = ((uint32_t)_read_response_byte(config, &alignment) << 24);
+            response |= ((uint32_t)_read_response_byte(config, &alignment) << 16);
+            response |= ((uint32_t)_read_response_byte(config, &alignment) << 8);
+            response |= _read_response_byte(config, &alignment);
             debug_if(SD_DBG, "R3/R7: 0x%" PRIx32 "\n", response);
             break;
 
@@ -550,7 +575,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         // CMD13 and ACMD13 both use opcode 13 and return SPI R2. Preserve R1
         // while appending the second status byte.
         case ACMD13_SD_STATUS:             // Response R2
-            response = (response << 8) | _spi_write(config, SPI_FILL_CHAR);
+            response = (response << 8) | _read_response_byte(config, &alignment);
             debug_if(SD_DBG, "R2: 0x%" PRIx32 "\n", response);
             break;
 
