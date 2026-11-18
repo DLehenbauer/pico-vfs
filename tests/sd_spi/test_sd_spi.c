@@ -1118,11 +1118,7 @@ static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
 
 
 static void make_csd(uint8_t *csd) {
-    memset(csd, 0, 16);
-    set_csd_bits(csd, 83, 80, 9);
-    set_csd_bits(csd, 73, 62, 1023);
-    set_csd_bits(csd, 49, 47, 0);
-    set_csd_bits(csd, 45, 39, 3);
+    make_ordinary_csd(csd, false);
 }
 
 static void expect_csd(const uint8_t *csd, bool corrupt_crc) {
@@ -1181,10 +1177,13 @@ static void expect_top_init_setup(unsigned failure, bool high_capacity) {
     }
 }
 
-static void exercise_initialized_io(void) {
+static void exercise_initialized_io(size_t trim_size) {
     bool high_capacity = config.card_type == SDCARD_V2HC;
     uint8_t buffer[512] = {0};
     observing_ready_io = true;
+    CHECK(config.erase_size == trim_size);
+    CHECK(device.read_size == 512 && device.program_size == 512 && device.erase_size == 512);
+    finish(erase(&device, 2048, sizeof(buffer)), BD_ERROR_OK);
     expect_start(1, high_capacity ? 4 : 2048, 0);
     expect_block(0x31);
     expect_release();
@@ -1208,11 +1207,12 @@ static void exercise_initialized_io(void) {
     expect_release();
     finish(device.program(&device, buffer, 2048, sizeof(buffer)), BD_ERROR_OK);
 
+    bd_size_t trim_address = 2 * trim_size;
     for (int cmd = CMD32_ERASE_WR_BLK_START_ADDR; cmd <= CMD33_ERASE_WR_BLK_END_ADDR; ++cmd) {
         expect_select();
         expect_spi(0xFF, 0xFF, false, 1);
-        uint32_t address = cmd == CMD32_ERASE_WR_BLK_START_ADDR ? 2048 :
-                           2048 + config.erase_size - 512;
+        uint32_t address = cmd == CMD32_ERASE_WR_BLK_START_ADDR ? trim_address :
+                           trim_address + trim_size - 512;
         expect_command(cmd, high_capacity ? address / 512 : address);
         expect_spi(0xFF, 0, false, 1);
         expect_release();
@@ -1223,7 +1223,7 @@ static void exercise_initialized_io(void) {
     expect_spi(0xFF, 0, false, 1);
     expect_spi(0xFF, 0xFF, false, 1);
     expect_release();
-    finish(device.trim(&device, 2048, config.erase_size), BD_ERROR_OK);
+    finish(device.trim(&device, trim_address, trim_size), BD_ERROR_OK);
     observing_ready_io = false;
     CHECK(config.is_initialized && device.is_initialized);
 }
@@ -1281,7 +1281,7 @@ static void test_top_init(unsigned failure) {
         expect_top_init_setup(0, false);
         finish_lifecycle(init, BD_ERROR_OK);
     }
-    exercise_initialized_io();
+    exercise_initialized_io(2048);
 }
 
 static void test_cold_init(bool high_capacity, bool crc_enabled) {
@@ -1294,7 +1294,7 @@ static void test_cold_init(bool high_capacity, bool crc_enabled) {
     finish_lifecycle(init, BD_ERROR_OK);
     CHECK(config.card_type == (high_capacity ? SDCARD_V2HC : SDCARD_V1));
     CHECK(device.size(&device) == 4096 * 512);
-    exercise_initialized_io();
+    exercise_initialized_io(high_capacity ? 512 : 2048);
 }
 
 static void test_deinit_reinit(void) {
@@ -1307,7 +1307,7 @@ static void test_deinit_reinit(void) {
     finish_lifecycle(init, BD_ERROR_OK);
     CHECK(config.is_initialized && device.is_initialized);
     CHECK(transfer_baudrate == 12000000);
-    exercise_initialized_io();
+    exercise_initialized_io(2048);
 }
 
 
@@ -1328,26 +1328,32 @@ static void test_trim_geometry(void) {
     const struct {
         bool high_capacity;
         bool single_block_erase;
+        uint8_t read_bl_len;
         uint8_t write_bl_len;
         uint8_t sector_size;
         size_t trim_size;
     } cases[] = {
-        {false, false, 9, 3, 2048},
-        {false, false, 10, 3, 4096},
-        {false, false, 11, 3, 8192},
-        {false, false, 11, 127, 262144},
-        {false, true, 9, 127, 512},
-        {false, true, 10, 127, 512},
-        {false, true, 11, 127, 512},
-        {true, true, 9, 127, 512},
+        {false, false, 9, 9, 0, 512},
+        {false, false, 9, 10, 0, 1024},
+        {false, false, 9, 11, 0, 2048},
+        {false, false, 9, 9, 2, 1536},
+        {false, false, 9, 9, 3, 2048},
+        {false, false, 11, 9, 3, 2048},
+        {false, false, 9, 10, 3, 4096},
+        {false, false, 9, 11, 3, 8192},
+        {false, false, 9, 11, 127, 262144},
+        {false, true, 9, 9, 127, 512},
+        {false, true, 9, 10, 127, 512},
+        {false, true, 9, 11, 127, 512},
+        {true, true, 9, 9, 127, 512},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_card();
         config.hz = CONF_SD_TRX_FREQUENCY;
         uint8_t csd[16];
         make_ordinary_csd(csd, cases[i].high_capacity);
-        set_csd_bits(csd, 83, 80, cases[i].write_bl_len);
-        set_csd_bits(csd, 79, 79, cases[i].write_bl_len > 9);
+        set_csd_bits(csd, 83, 80, cases[i].read_bl_len);
+        set_csd_bits(csd, 79, 79, cases[i].read_bl_len > 9);
         set_csd_bits(csd, 46, 46, cases[i].single_block_erase);
         set_csd_bits(csd, 45, 39, cases[i].sector_size);
         set_csd_bits(csd, 25, 22, cases[i].write_bl_len);
@@ -1361,23 +1367,50 @@ static void test_trim_geometry(void) {
         size_t expected = cases[i].trim_size;
         CHECK(device.erase_size == 512);
         CHECK(config.erase_size == expected);
-        for (int cmd = CMD32_ERASE_WR_BLK_START_ADDR; cmd <= CMD33_ERASE_WR_BLK_END_ADDR; ++cmd) {
-            uint32_t address = cmd == CMD32_ERASE_WR_BLK_START_ADDR ? expected : 3 * expected - 512;
-            if (cases[i].high_capacity) {
-                address /= 512;
+        bd_size_t end = device.size(&device);
+        end -= end % expected;
+        const bd_size_t addresses[] = {0, expected, end - 2 * expected};
+        for (size_t range = 0; range < sizeof(addresses) / sizeof(addresses[0]); ++range) {
+            for (int cmd = CMD32_ERASE_WR_BLK_START_ADDR; cmd <= CMD33_ERASE_WR_BLK_END_ADDR; ++cmd) {
+                uint32_t address = cmd == CMD32_ERASE_WR_BLK_START_ADDR ? addresses[range] :
+                                   addresses[range] + 2 * expected - 512;
+                if (cases[i].high_capacity) {
+                    address /= 512;
+                }
+                expect_init_command(cmd, address, 0, 0);
             }
-            expect_init_command(cmd, address, 0, 0);
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD38_ERASE, 0);
+            expect_spi(0xFF, 0, false, 1);
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_release();
+            finish(trim(&device, addresses[range], 2 * expected), BD_ERROR_OK);
         }
-        expect_select();
-        expect_spi(0xFF, 0xFF, false, 1);
-        expect_command(CMD38_ERASE, 0);
-        expect_spi(0xFF, 0, false, 1);
-        expect_spi(0xFF, 0xFF, false, 1);
-        expect_release();
-        finish(trim(&device, expected, 2 * expected), BD_ERROR_OK);
         if (expected > 512) {
             finish(trim(&device, 512, expected), SD_BLOCK_DEVICE_ERROR_PARAMETER);
             finish(trim(&device, expected, 512), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+            finish(trim(&device, expected + 512, expected - 512),
+                   SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        }
+        finish(trim(&device, end, expected), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        exercise_initialized_io(expected);
+    }
+}
+
+static void test_trim_invalid_write_length(void) {
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (unsigned write_bl_len = 0; write_bl_len < 9; ++write_bl_len) {
+            reset_init_card(crc);
+            uint8_t csd[16];
+            make_ordinary_csd(csd, false);
+            set_csd_bits(csd, 25, 22, write_bl_len);
+            csd[15] = reference_crc7(csd, 15);
+            expect_card_init(false, false);
+            expect_csd(csd, false);
+            finish_lifecycle(init, BD_ERROR_DEVICE_ERROR);
+            CHECK(config.total_sectors == 0);
+            finish(trim(&device, 0, 512), SD_BLOCK_DEVICE_ERROR_NO_INIT);
         }
     }
 }
@@ -1476,5 +1509,6 @@ int main(void) {
     RUN_CASE("trim-busy-wrap", test_trim_busy(true, false, true));
     RUN_CASE("init-clock", test_init_clock());
     RUN_CASE("trim-geometry", test_trim_geometry());
+    RUN_CASE("trim-invalid-write-length", test_trim_invalid_write_length());
     return EXIT_SUCCESS;
 }

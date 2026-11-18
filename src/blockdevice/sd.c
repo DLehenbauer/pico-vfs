@@ -789,8 +789,13 @@ static uint64_t _sd_sectors(void *_config) {
             if (ext_bits(csd, 46, 46)) {
                 config->erase_size = BLOCK_SIZE_HC;
             } else {
+                uint32_t write_bl_len = ext_bits(csd, 25, 22);
+                // Invalid native lengths must not permit sub-sector trim ranges.
+                if (write_bl_len < 9) {
+                    return 0;
+                }
                 // SECTOR_SIZE counts native write blocks, not logical 512-byte sectors.
-                config->erase_size = (1u << ext_bits(csd, 25, 22)) *
+                config->erase_size = (1u << write_bl_len) *
                                      (ext_bits(csd, 45, 39) + 1);
             }
             break;

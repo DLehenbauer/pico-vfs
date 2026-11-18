@@ -12,11 +12,20 @@ independent bitwise implementations rather than the driver's lookup tables.
 
 The trim geometry cases initialize SDSC and SDHC cards from CSD fixtures, then
 check actual CMD32/CMD33/CMD38 exchanges and reject misaligned ranges without SPI
-traffic. SDSC cases cover both ERASE_BLK_EN values, 512/1024/2048-byte native
-write blocks, and the maximum SECTOR_SIZE field. SECTOR_SIZE counts native write
-blocks, as in the pinned [Linux CSD decoder](https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/core/sd.c#L137-L145).
+traffic. SDSC cases cover both ERASE_BLK_EN values, independent read and write
+block lengths, 512/1024/2048-byte native write blocks, minimum/maximum SECTOR_SIZE,
+and non-power-of-two erase units. Ranges include a single erase unit, multiple
+units, address zero, and the final complete unit at capacity. Read/program and
+no-op erase still accept 512-byte logical sectors with larger trim alignment.
+With ERASE_BLK_EN clear, native write lengths below 512 bytes fail initialization
+in both CRC modes, without CMD16 or subsequent trim traffic. SECTOR_SIZE counts
+native write blocks, as in the pinned [Linux CSD decoder](https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/core/sd.c#L137-L145).
+The pinned [FreeBSD decoder](https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmc.c#L1674-L1675)
+likewise multiplies the erase-sector count by the native write-block length
+before converting to 512-byte sectors.
 Public `erase_size` stays at 512: SD writes overwrite sectors and `erase()` is a
-no-op. Changing it to match trim alignment would change littlefs on-disk geometry.
+no-op. Changing it to match trim alignment would change FAT logical sectors and
+littlefs on-disk geometry.
 
 Lifecycle scenarios check mutex acquisition and both initialization flags at
 lock entry, throughout initialization SPI activity, and before unlocking. Cold
