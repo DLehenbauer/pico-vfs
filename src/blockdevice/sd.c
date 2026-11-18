@@ -804,7 +804,9 @@ static uint64_t _sd_sectors(void *_config) {
 
         case 1:
             hc_c_size = ext_bits(csd, 69, 48);            // device size : C_SIZE : [69:48]
-            blocks = (hc_c_size + 1) << 10;               // block count = C_SIZE+1) * 1K byte (512B is block size)
+            // Widen before shifting: the full 22-bit encoding can represent 2^32
+            // sectors even though the specified SDXC user-area maximum is smaller.
+            blocks = ((uint64_t)hc_c_size + 1) << 10;     // (C_SIZE + 1) * 1024 sectors
             debug_if(SD_DBG, "SDHC/SDXC Card: hc_c_size: %" PRIu32 " \n", hc_c_size);
             // ERASE_BLK_EN is fixed to 1: 512-byte units
             // (SD v9.10, section 5.3.3, p.235).

@@ -54,6 +54,9 @@ static bool initialized_on_unlock;
 static bool observing_ready_io;
 spi_inst_t mock_spi_instances[2] = {{0}, {1}};
 
+static void finish(int actual, int expected);
+static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_t extra);
+
 static void check_spi_state(void) {
     if ((observing_lifecycle && initializing) || observing_ready_io) {
         CHECK(config._mutex.locked);
@@ -311,6 +314,55 @@ static void expect_block_crc(uint8_t value, bool corrupt_crc) {
 static void expect_block(uint8_t value) {
     // Deliberately corrupt CRC when checking that disabled CRC is still consumed.
     expect_block_crc(value, !config.enable_crc);
+}
+
+static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value);
+static void make_csd(uint8_t *csd);
+static void expect_csd(const uint8_t *csd, bool corrupt_crc);
+
+static void test_sectors(void) {
+    uint8_t csd[16];
+    reset_card();
+    make_csd(csd);
+    expect_csd(csd, false);
+    CHECK(_sd_sectors(&config) == 4096);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    make_csd(csd);
+    set_csd_bits(csd, 127, 126, 1);
+    set_csd_bits(csd, 69, 48, 0x3FFFFF);
+    expect_csd(csd, false);
+    CHECK(_sd_sectors(&config) == (UINT64_C(1) << 32));
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    make_csd(csd);
+    set_csd_bits(csd, 127, 126, 2);
+    expect_csd(csd, false);
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    make_csd(csd);
+    expect_csd(csd, true);
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    expect_init_command(CMD9_SEND_CSD, 0, R1_ILLEGAL_COMMAND, 0);
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
+
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD9_SEND_CSD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 300);
+    expect_release();
+    CHECK(_sd_sectors(&config) == 0);
+    finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
 static void expect_program_data(uint8_t value, uint8_t start) {
@@ -1541,6 +1593,7 @@ int main(void) {
     RUN_CASE("init-final-ocr-no-response", test_init_transport_failure(true, false));
     RUN_CASE("init-final-ocr-busy", test_init_transport_failure(true, true));
     RUN_CASE("singleblock", test_singleblock());
+    RUN_CASE("sectors", test_sectors());
     RUN_CASE("singleblock-program-status", test_singleblock_program());
     RUN_CASE("multiblock-program-success", test_multiblock_program_success());
     RUN_CASE("multiblock-program-failure", test_multiblock_program_failure());
