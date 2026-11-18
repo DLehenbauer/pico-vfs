@@ -266,11 +266,11 @@ static void expect_select(void) {
 
 static void expect_release(void) {
     // Eight selected bytes conservatively cover N_CR's 1-8 byte-times, not a
-    // mandatory fixed delay; N_EC has a zero minimum (SD v2.00, section 7.5,
-    // p.149, and Table 7-7, p.153).
+    // mandatory fixed delay; N_EC has a zero minimum (SanDisk v2.2,
+    // section 5.23, p.5-17, and Table 5-5, p.5-19).
     // One deselected byte covers the one-clock DataOut release during R1b busy.
-    // Eight deselected clocks are not a required minimum (SD v2.00,
-    // section 7.5.1.2, p.150).
+    // Eight deselected clocks are not a required minimum (SanDisk v2.2,
+    // section 5.23.2, p.5-17).
     expect_spi(0xFF, 0xFF, false, 8);
     expect_cs(true);
     expect_spi(0xFF, 0xFF, true, 1);
@@ -364,7 +364,7 @@ static void expect_status_block(const uint8_t *data, size_t length, bool corrupt
     expect_spi(0xFF, crc, false, 1);
 }
 
-// CMD12 stays in the selected read stream (SD v2.00, Figure 7-18, p.151).
+// CMD12 stays in the selected read stream (SanDisk v2.2, section 5.23.3, p.5-18).
 // Discard the stuff byte, following Elm-Chan read guidance: "The received byte
 // immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
 static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_delay, bool ready) {
@@ -632,7 +632,7 @@ static void test_init_transport_failure(bool final_ocr, bool busy) {
 
 // Checks CMD17 at SDSC byte address 1024, command CRC7, start token, all 512 data
 // bytes, CRC16, returned data, CS cleanup, and mutex release.
-// Read blocks include the token and CRC bytes (SD v2.00, section 7.3.3.2, p.146).
+// Read blocks include the token and CRC bytes (SD v9.10, section 7.3.3.2, p.305).
 static void test_singleblock(void) {
     reset_card();
     expect_start(1, 1024, 0);
@@ -725,8 +725,8 @@ static void test_multiblock_program_failure(void) {
 // Checks CMD18 rejection with R1 illegal-command status: returns unsupported
 // without reading data or sending CMD12, and completes CS/mutex cleanup.
 //
-// R1 status reference: SD Physical Layer Specification v2.00 (May 9, 2006),
-// section 7.3.2.1.
+// R1 status reference: SD Physical Layer Simplified Specification v9.10
+// (December 1, 2023), section 7.3.2.1, p.302.
 //
 // Error mapping and CS/mutex cleanup are driver behavior, not SD requirements.
 static void test_start_rejected(void) {
@@ -737,10 +737,10 @@ static void test_start_rejected(void) {
     finish(device.read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_UNSUPPORTED);
 }
 
-// R1's bit 7 must be clear (SD v2.00, section 7.3.2.1, p.143).
+// R1's bit 7 must be clear (SD v9.10, section 7.3.2.1, p.302).
 // Exhausting polls with 0x80 or 0xFF is no response, not command success.
 // The existing 16-byte guard and three retries are host tolerance, not N_CR.
-// N_CR is at most eight byte-times (SD v2.00, Table 7-7, p.153).
+// N_CR is at most eight byte-times (SanDisk v2.2, Table 5-5, p.5-19).
 static void test_no_response(bool stop, uint8_t invalid_byte) {
     reset_card();
     if (stop) {
@@ -1002,7 +1002,7 @@ static void test_wide_busy_timeout(void) {
     finish(_wait_ready(&config, (uint64_t)UINT32_MAX + 10), false);
 }
 
-// Commands are rejected during busy (SD v2.00, section 7.2.8, p.133).
+// Commands are rejected during busy (SD v9.10, section 7.2.8, p.292).
 // Check that readiness timeout sends no ordinary/application command and
 // leaves the response sentinel, with exactly one release and no extra bytes.
 static void test_command_busy(bool app_command) {
@@ -1031,10 +1031,11 @@ static void test_command_busy(bool app_command) {
     }
 }
 
-// No extra clocks, ready polling, or CS edges are allowed from the final CRC
-// through CMD12 (SD v2.00, section 7.5.2.2, Figure 7-18, p.151).
-// SDSC byte addressing and SDHC block addressing differ (SD v2.00, Table 7-3,
-// footnote 10, p.140). Busy is optional (Table 7-3, footnote 5, p.140).
+// Keep CS low from the final CRC through CMD12 (SanDisk v2.2, section 5.23.3,
+// p.5-18). The exact sequence without extra clocks or ready polling is driver
+// policy, not a requirement to issue CMD12 immediately.
+// SDSC byte addressing and SDHC block addressing differ (SD v9.10, Table 7-3,
+// footnote 10, p.299). Busy is optional (Table 7-3, footnote 5, p.299).
 static void test_multiblock(bool high_capacity, bool crc_enabled) {
     reset_card();
     config.card_type = high_capacity ? SDCARD_V2HC : SDCARD_V1;
@@ -1051,14 +1052,15 @@ static void test_multiblock(bool high_capacity, bool crc_enabled) {
     CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
 }
 
-// Read blocks carry CRC16 and CMD12 terminates CMD18 (SD v2.00, section 7.2.3,
-// pp.130-131). Preferring the data error over cleanup failure is API policy.
+// Read blocks carry CRC16 and CMD12 terminates CMD18 (SD v9.10, section 7.2.3,
+// pp.289-290). Preferring the data error over cleanup failure is API policy.
 // One block succeeds before failure. The unread third block must not be consumed.
 // The 300 ms token and 5 s default production command budgets are host policy,
-// not comprehensive timing compliance: SDSC timing is card-dependent and SDHC
-// has a 100 ms read bound (SD v2.00, section 4.6.2, p.54, and Table 7-7, p.153).
-// Waiting for 0xFE does not immediately decode read-error tokens (SD v2.00,
-// section 7.3.3.3, p.147).
+// not comprehensive timing compliance: SDSC timing uses TAAC/NSAC, capped at
+// 100 ms; hosts should use at least 100 ms for SDHC/SDXC reads (SD v9.10,
+// section 4.6.2.1, p.95).
+// Waiting for 0xFE does not immediately decode read-error tokens (SD v9.10,
+// section 7.3.3.3, p.306).
 static void test_multiblock_data_failure(bool crc_failure, uint8_t stop_response, bool stop_busy) {
     reset_card();
     expect_start(3, 0, 0);
@@ -1130,12 +1132,12 @@ static void test_idle_command(int cmd, bool is_acmd, uint8_t r1, int expected) {
 }
 
 // R1b permits optional busy bytes; zero means busy and nonzero means ready
-// (SD v2.00, section 7.3.2.2, p.143).
+// (SD v9.10, section 7.3.2.2, p.302).
 // A timeout leaves completion unconfirmed, but must not replace a more
 // specific R1 error. The full-high check and timeout budget remain host policy.
 // Waiting selected is synchronous-driver policy: deselection is permitted during
-// programming and R1b busy (SD v2.00, section 7.2.4, p.132, and section 7.5.1.2,
-// p.150).
+// programming (SD v9.10, section 7.2.4, p.291) and R1b busy (SanDisk v2.2,
+// section 5.23.2, p.5-17).
 static void test_stop_busy(bool wrap, uint8_t response, int expected) {
     reset_card();
     expect_start(2, 0, 0);
