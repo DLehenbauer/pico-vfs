@@ -303,28 +303,39 @@ static void expect_block(uint8_t value) {
     expect_block_crc(value, !config.enable_crc);
 }
 
-static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
-    for (unsigned bit = lsb; bit <= msb; ++bit) {
-        uint8_t mask = 1u << (bit % 8);
-        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
-                           ((value & (1u << (bit - lsb))) ? mask : 0);
+static void expect_program_data(uint8_t value, uint8_t start) {
+    uint8_t buffer[512];
+    memset(buffer, value, sizeof(buffer));
+    uint16_t crc = reference_crc16(buffer, sizeof(buffer));
+    expect_spi(start, 0xFF, false, 1);
+    expect_spi(value, 0xFF, false, sizeof(buffer));
+    expect_spi(crc >> 8, 0xFF, false, 1);
+    expect_spi(crc, 0xFF, false, 1);
+}
+
+static void expect_program_block(uint8_t value, uint8_t start, uint8_t response,
+                                bool timeout) {
+    expect_program_data(value, start);
+    expect_spi(0xFF, response, false, 1);
+    expect_spi(0xFF, 0, false, timeout ? CONF_SD_CMD_TIMEOUT : 2);
+    if (!timeout) {
+        expect_spi(0xFF, 0xFF, false, 1);
     }
 }
 
-static void make_ordinary_csd(uint8_t *csd, bool high_capacity) {
-    memset(csd, 0, 16);
-    set_csd_bits(csd, 127, 126, high_capacity ? 1 : 0);
-    set_csd_bits(csd, 83, 80, 9);
-    set_csd_bits(csd, 25, 22, 9);
-    if (high_capacity) {
-        set_csd_bits(csd, 69, 48, 8191);
-        set_csd_bits(csd, 46, 46, 1);
-        set_csd_bits(csd, 45, 39, 127);
-    } else {
-        set_csd_bits(csd, 73, 62, 1023);
-        set_csd_bits(csd, 49, 47, 0);
-        set_csd_bits(csd, 45, 39, 3);
-    }
+static void expect_multiblock_program(void) {
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(ACMD23_SET_WR_BLK_ERASE_COUNT, 2);
+    expect_spi(0xFF, 0, false, 1);
+    expect_release();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD25_WRITE_MULTIPLE_BLOCK, 0);
+    expect_spi(0xFF, 0, false, 1);
 }
 
 static void fill_pattern(uint8_t *buffer, size_t length) {
@@ -622,6 +633,83 @@ static void test_singleblock(void) {
     memset(expected, 0x31, sizeof(expected));
     finish(device.read(&device, buffer, 1024, sizeof(buffer)), BD_ERROR_OK);
     CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
+}
+
+static void test_singleblock_program(void) {
+    static const uint8_t responses[] = {
+        SPI_DATA_ACCEPTED, SPI_DATA_CRC_ERROR, SPI_DATA_WRITE_ERROR,
+    };
+    for (size_t i = 0; i < sizeof(responses); ++i) {
+        for (unsigned timeout = 0; timeout < 2; ++timeout) {
+            reset_card();
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD24_WRITE_BLOCK, 0);
+            expect_spi(0xFF, 0, false, 1);
+            expect_program_block(0x31, SPI_START_BLOCK, responses[i], timeout);
+            expect_release();
+            uint8_t buffer[512];
+            memset(buffer, 0x31, sizeof(buffer));
+            finish(program(&device, buffer, 0, sizeof(buffer)),
+                   timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE :
+                   responses[i] == SPI_DATA_ACCEPTED ? BD_ERROR_OK :
+                                                      SD_BLOCK_DEVICE_ERROR_WRITE);
+        }
+    }
+}
+
+static void test_multiblock_program_success(void) {
+    reset_card();
+    expect_multiblock_program();
+    expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+    expect_program_block(0xA6, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+    expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
+    expect_release();
+    uint8_t buffer[1024];
+    memset(buffer, 0x31, 512);
+    memset(buffer + 512, 0xA6, 512);
+    finish(program(&device, buffer, 0, sizeof(buffer)), BD_ERROR_OK);
+}
+
+static void test_multiblock_program_failure(void) {
+    static const struct {
+        uint8_t response;
+        bool write_timeout;
+        uint8_t abort_response;
+        bool abort_timeout;
+        bool second_block;
+    } cases[] = {
+        {SPI_DATA_CRC_ERROR, false, 0, false, false},
+        {SPI_DATA_WRITE_ERROR, false, R1_ILLEGAL_COMMAND, false, false},
+        {SPI_DATA_ACCEPTED, true, 0, false, false},
+        {SPI_DATA_CRC_ERROR, true, 0, false, false},
+        {SPI_DATA_WRITE_ERROR, true, 0, false, true},
+        {SPI_DATA_CRC_ERROR, false, 0, true, false},
+        {SPI_DATA_WRITE_ERROR, false, 0, false, true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_card();
+        expect_multiblock_program();
+        if (cases[i].second_block) {
+            expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+        }
+        expect_program_block(cases[i].second_block ? 0xA6 : 0x31,
+                             SPI_START_BLK_MUL_WRITE, cases[i].response,
+                             cases[i].write_timeout);
+        if (cases[i].write_timeout) {
+            expect_release();
+        } else {
+            expect_stop(cases[i].abort_response,
+                        cases[i].abort_timeout ? CONF_SD_CMD_TIMEOUT : 0, 0,
+                        !cases[i].abort_timeout);
+        }
+        uint8_t buffer[1024];
+        memset(buffer, 0x31, 512);
+        memset(buffer + 512, 0xA6, 512);
+        finish(program(&device, buffer, 0, sizeof(buffer)),
+               cases[i].write_timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE :
+                                        SD_BLOCK_DEVICE_ERROR_WRITE);
+    }
 }
 
 // Checks CMD18 rejection with R1 illegal-command status: returns unsupported
@@ -1117,6 +1205,30 @@ static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
 }
 
 
+static void set_csd_bits(uint8_t *csd, unsigned msb, unsigned lsb, uint32_t value) {
+    for (unsigned bit = lsb; bit <= msb; ++bit) {
+        uint8_t mask = 1u << (bit % 8);
+        csd[15 - bit / 8] = (csd[15 - bit / 8] & ~mask) |
+                           ((value & (1u << (bit - lsb))) ? mask : 0);
+    }
+}
+
+static void make_ordinary_csd(uint8_t *csd, bool high_capacity) {
+    memset(csd, 0, 16);
+    set_csd_bits(csd, 127, 126, high_capacity ? 1 : 0);
+    set_csd_bits(csd, 83, 80, 9);
+    set_csd_bits(csd, 25, 22, 9);
+    if (high_capacity) {
+        set_csd_bits(csd, 69, 48, 8191);
+        set_csd_bits(csd, 46, 46, 1);
+        set_csd_bits(csd, 45, 39, 127);
+    } else {
+        set_csd_bits(csd, 73, 62, 1023);
+        set_csd_bits(csd, 49, 47, 0);
+        set_csd_bits(csd, 45, 39, 3);
+    }
+}
+
 static void make_csd(uint8_t *csd) {
     make_ordinary_csd(csd, false);
 }
@@ -1453,6 +1565,9 @@ int main(void) {
     RUN_CASE("init-final-ocr-no-response", test_init_transport_failure(true, false));
     RUN_CASE("init-final-ocr-busy", test_init_transport_failure(true, true));
     RUN_CASE("singleblock", test_singleblock());
+    RUN_CASE("singleblock-program-status", test_singleblock_program());
+    RUN_CASE("multiblock-program-success", test_multiblock_program_success());
+    RUN_CASE("multiblock-program-failure", test_multiblock_program_failure());
     RUN_CASE("start-rejected", test_start_rejected());
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
     RUN_CASE("token-timeout-wrap", test_token_wrap(true));
