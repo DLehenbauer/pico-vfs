@@ -1179,15 +1179,24 @@ blockdevice_t *blockdevice_sd_create(spi_inst_t *spi_inst,
                                      uint32_t hz,
                                      bool enable_crc)
 {
+    // Verify SPI pin mapping is valid for the selected SPI instance:
+    // RP2040 datasheet, section 1.4.3, Table 2, pp.12-13.
+    // https://datasheets.raspberrypi.com/rp2040/rp2040-datasheet.pdf
     if (spi_inst == spi0) {
         assert(mosi == 3 || mosi == 7 || mosi == 19 || mosi == 23);
         assert(miso == 0 || miso == 4 || miso == 16 || miso == 20);
         assert(sclk == 2 || sclk == 6 || sclk == 18 || sclk == 22);
+
+        // Note: this driver manually controls CS, so it is not restricted to
+        //       the hardware CS pin mappings listed in the datasheet.
         // assert(cs == 1 || cs == 5 || cs == 17 || cs == 21);
     } else if (spi_inst == spi1) {
         assert(mosi == 11 || mosi == 15 || mosi == 27);
-        assert(miso == 8 || miso == 12 || mosi == 24 || mosi == 28);
+        assert(miso == 8 || miso == 12 || miso == 24 || miso == 28);
         assert(sclk == 10 || sclk == 14 || sclk == 26);
+
+        // Note: this driver manually controls CS, so it is not restricted to
+        //       the hardware CS pin mappings listed in the datasheet.
         // assert(cs == 9 || cs == 13 || cs == 25 || cs == 29);
     } else {
         assert(spi_inst == spi0 || spi_inst == spi1);
