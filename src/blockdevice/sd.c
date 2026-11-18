@@ -797,8 +797,14 @@ static uint64_t _sd_sectors(void *_config) {
             if (ext_bits(csd, 46, 46)) {
                 config->erase_size = BLOCK_SIZE_HC;
             } else {
-                // ERASE_BLK_EN = 0: Use the sector-size-derived erase unit.
-                config->erase_size = BLOCK_SIZE_HC * (ext_bits(csd, 45, 39) + 1);
+                uint32_t write_bl_len = ext_bits(csd, 25, 22);
+                // Invalid native lengths must not permit sub-sector trim ranges.
+                if (write_bl_len < 9) {
+                    return 0;
+                }
+                // SECTOR_SIZE counts native write blocks, not logical 512-byte sectors.
+                config->erase_size = (1u << write_bl_len) *
+                                     (ext_bits(csd, 45, 39) + 1);
             }
             break;
 
@@ -1116,6 +1122,7 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
 }
 
 static int erase(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
+    // SD writes overwrite logical sectors; the card manages physical flash erase.
     (void)device;
     (void)addr;
     (void)size;
@@ -1125,9 +1132,8 @@ static int erase(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
 static bool _is_valid_trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
     blockdevice_sd_config_t *config = device->config;
 
-    return (addr % config->erase_size == 0 &&
-            size % config->erase_size == 0 &&
-            addr + size <= device->size(device));
+    bd_size_t capacity = device->size(device);
+    return (addr <= capacity && size <= capacity - addr && config->erase_size != 0);
 }
 
 static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
@@ -1142,6 +1148,27 @@ static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
     if (!_is_valid_trim(device, addr, size)) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_PARAMETER;
+    }
+
+    // Trim is advisory, not erase-before-write or secure deletion. Leave partial
+    // boundary units untouched: they remain writable, and rounding outward could
+    // erase live data. This also permits whole-device trim with a partial tail.
+    // Follow Linux's inward alignment policy:
+    // https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/core/core.c#L1734-L1790
+    bd_size_t misalignment = addr % config->erase_size;
+    if (misalignment != 0) {
+        bd_size_t skip = config->erase_size - misalignment;
+        if (size <= skip) {
+            mutex_exit(&config->_mutex);
+            return BD_ERROR_OK;
+        }
+        addr += skip;
+        size -= skip;
+    }
+    size -= size % config->erase_size;
+    if (size == 0) {
+        mutex_exit(&config->_mutex);
+        return BD_ERROR_OK;
     }
     int status = BD_ERROR_OK;
 
