@@ -731,17 +731,57 @@ static void test_singleblock_program(void) {
     }
 }
 
-static void test_multiblock_program_success(void) {
+static void test_multiblock_program_success(bool stop_timeout) {
     reset_card();
     expect_multiblock_program();
     expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
     expect_program_block(0xA6, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
     expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
+    // Stop Tran may be followed by busy (SD v9.10, Figure 7-7, p.291).
+    // Discard N_BR even when it looks ready; busy can start in the next byte
+    // (SanDisk v2.2, sections 5.23.4-5.24, p.5-19).
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_spi(0xFF, 0, false, stop_timeout ? CONF_SD_CMD_TIMEOUT : 2);
+    if (!stop_timeout) {
+        expect_spi(0xFF, 0xFF, false, 1);
+    }
     expect_release();
     uint8_t buffer[1024];
     memset(buffer, 0x31, 512);
     memset(buffer + 512, 0xA6, 512);
-    finish(program(&device, buffer, 0, sizeof(buffer)), BD_ERROR_OK);
+    finish(program(&device, buffer, 0, sizeof(buffer)),
+           stop_timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_OK);
+}
+
+// N_BR spans 0..1 byte before busy (SanDisk v2.2, sections 5.23.4-5.24,
+// p.5-19); final busy is optional (SD v9.10, Figure 7-7, p.291).
+static void test_multiblock_stop_timing(void) {
+    static const struct {
+        uint8_t nbr;
+        uint8_t busy;
+        size_t busy_bytes;
+    } cases[] = {
+        {0xFF, 0x00, 0}, // No busy.
+        {0xFF, 0x00, 1}, // Immediate busy.
+        {0xFE, 0x7F, 1}, // Busy starts during the last bit of N_BR.
+        {0xFF, 0x7F, 1}, // One short busy bit.
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_card();
+        expect_multiblock_program();
+        expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+        expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, false);
+        expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
+        expect_spi(0xFF, cases[i].nbr, false, 1);
+        if (cases[i].busy_bytes) {
+            expect_spi(0xFF, cases[i].busy, false, cases[i].busy_bytes);
+        }
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_release();
+        uint8_t buffer[1024];
+        memset(buffer, 0x31, sizeof(buffer));
+        finish(program(&device, buffer, 0, sizeof(buffer)), BD_ERROR_OK);
+    }
 }
 
 static void test_multiblock_program_failure(void) {
@@ -1865,7 +1905,9 @@ int main(void) {
     RUN_CASE("singleblock", test_singleblock());
     RUN_CASE("sectors", test_sectors());
     RUN_CASE("singleblock-program-status", test_singleblock_program());
-    RUN_CASE("multiblock-program-success", test_multiblock_program_success());
+    RUN_CASE("multiblock-program-success", test_multiblock_program_success(false));
+    RUN_CASE("multiblock-program-stop-timeout", test_multiblock_program_success(true));
+    RUN_CASE("multiblock-stop-timing", test_multiblock_stop_timing());
     RUN_CASE("multiblock-program-failure", test_multiblock_program_failure());
     RUN_CASE("start-rejected", test_start_rejected());
     RUN_CASE("token-busy-wrap", test_token_wrap(false));
