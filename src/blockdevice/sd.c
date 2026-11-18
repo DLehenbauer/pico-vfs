@@ -299,18 +299,24 @@ static inline void debug_if(int condition, const char *format, ...) {
     }
 }
 
-static bool _wait_token(void *_config, uint8_t token) {
+static int _wait_token(void *_config, uint8_t token) {
     blockdevice_sd_config_t *config = _config;
 
     // Use 64-bit elapsed time to avoid 32-bit millisecond rollover.
     absolute_time_t t = get_absolute_time();
     do {
-        if (token == _spi_write(config, SPI_FILL_CHAR)) {
-            return true;
+        uint8_t response = _spi_write(config, SPI_FILL_CHAR);
+        if (token == response) {
+            return BD_ERROR_OK;
+        }
+        // Only FF is read-data padding. Never scan past an error or malformed
+        // token into payload that might contain another FE.
+        if (response != SPI_FILL_CHAR) {
+            return BD_ERROR_DEVICE_ERROR;
         }
     } while (absolute_time_diff_us(t, get_absolute_time()) < 300000); // Wait for 300 msec
     debug_if(SD_DBG, "_wait_token: timeout\n");
-    return false;
+    return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
 }
 
 static bool _wait_ready(void *_config, uint64_t timeout) {
@@ -383,21 +389,23 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
         }
     }
 
+    // Both Linux and FreeBSD prefix every command, including CMD12 and retries,
+    // with FF. FreeBSD notes this prevents unaligned data on some cards.
+    _spi_write(config, SPI_FILL_CHAR);
+
     // send a command
     for (int i = 0; i < PACKET_SIZE; i++) {
         spi_write_read_blocking(config->spi_inst, (const uint8_t *)&cmd_packet[i], NULL, 1);
     }
 
-    // Discard CMD12's stuff byte before R1, following Elm-Chan read guidance: "The received
-    // byte immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
-    // Public SD v9.10 omits the CMD12 timing diagram (section 7.5.2.2, p.308).
-    if (CMD12_STOP_TRANSMISSION == cmd) {
-        spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, 1);
-    }
+    // Ignore the first post-command byte, as Linux and FreeBSD do: it may be
+    // garbage. This also covers CMD12's stuff byte, without a second discard.
+    spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, 1);
 
     // N_CR = 1..8 byte-times before R1 (SanDisk v2.2, Table 5-5, p.5-19).
     // Poll up to 16 bytes for R1's start bit to accommodate slow cards. This is
-    // host tolerance, not the SD limit.
+    // host tolerance, not the SD limit. The discarded slot is separate; a
+    // shifted R1 starting in the final poll may need one more byte to finish.
     for (int i = 0; i < 0x10; i++) {
         spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, &response, 1);
 
@@ -754,10 +762,11 @@ static int _read_bytes(void *_config, uint8_t *buffer, uint32_t length) {
     uint16_t crc;
 
     // read until start byte (0xFE)
-    if (false == _wait_token(config, SPI_START_BLOCK)) {
-        debug_if(SD_DBG, "Read timeout\n");
+    int status = _wait_token(config, SPI_START_BLOCK);
+    if (status != BD_ERROR_OK) {
+        debug_if(SD_DBG, "Read token failed: %d\n", status);
         _postclock_then_deselect(config);
-        return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
+        return status;
     }
 
     // read data
@@ -939,9 +948,10 @@ static int _read(void *_config, uint8_t *buffer, uint32_t length) {
     uint16_t crc;
 
     // read until start byte (0xFE)
-    if (false == _wait_token(config, SPI_START_BLOCK)) {
-        debug_if(SD_DBG, "Read timeout\n");
-        return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
+    int status = _wait_token(config, SPI_START_BLOCK);
+    if (status != BD_ERROR_OK) {
+        debug_if(SD_DBG, "Read token failed: %d\n", status);
+        return status;
     }
 
     // read data
