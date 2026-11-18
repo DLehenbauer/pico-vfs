@@ -6,8 +6,20 @@ endif()
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(sd_spi_tests test_sd_spi.c)
+add_library(sd_spi_test_filesystem STATIC
+  ../../src/blockdevice/heap.c
+  ../../src/filesystem/fat.c
+  ../../vendor/ff15/source/ff.c
+  ../../vendor/ff15/source/ffsystem.c
+  ../../vendor/ff15/source/ffunicode.c
+)
+target_include_directories(sd_spi_test_filesystem PRIVATE
+  mocks ../../include ../../include/filesystem/ChaN ../../vendor/ff15/source
+)
+
+add_executable(sd_spi_tests test_sd_spi.c test_sd_fat.c)
 target_include_directories(sd_spi_tests PRIVATE mocks ../../include)
+target_link_libraries(sd_spi_tests PRIVATE sd_spi_test_filesystem)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(sd_spi_tests PRIVATE -Wall -Wextra -Werror)
 endif()
