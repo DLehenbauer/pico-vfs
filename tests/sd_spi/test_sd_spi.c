@@ -306,7 +306,8 @@ static void expect_release(void) {
     expect_spi(0xFF, 0xFF, true, 1);
 }
 
-static void expect_command(int cmd, uint32_t arg) {
+static void expect_command_with_stuff(int cmd, uint32_t arg, uint8_t stuff) {
+    expect_spi(0xFF, 0xFF, false, 1);
     uint8_t packet[6] = {
         (uint8_t)(0x40 | cmd), arg >> 24, arg >> 16, arg >> 8, arg, 0xFF,
     };
@@ -319,6 +320,12 @@ static void expect_command(int cmd, uint32_t arg) {
         // Tail bytes during command transmission are not response bytes.
         expect_spi(packet[i], 0x5A, false, 1);
     }
+    expect_spi(0xFF, stuff, false, 1);
+}
+
+static void expect_command(int cmd, uint32_t arg) {
+    // An error-looking first slot must never be treated as the actual R1.
+    expect_command_with_stuff(cmd, arg, 0x04);
 }
 
 static void expect_start(size_t blocks, uint32_t address, uint8_t response) {
@@ -448,8 +455,6 @@ static void expect_status_block(const uint8_t *data, size_t length, bool corrupt
 // immediately following CMD12 is a stuff byte" (See: https://elm-chan.org/docs/mmc/mmc_e.html#dataxfer)
 static void expect_stop(uint8_t response, size_t busy_bytes, size_t response_delay, bool ready) {
     expect_command(12, 0);
-    // An error-looking stuff byte must not be interpreted as the actual R1.
-    expect_spi(0xFF, 0x04, false, 1);
     if (response_delay) {
         expect_spi(0xFF, 0xFF, false, response_delay);
     }
@@ -872,10 +877,6 @@ static void test_no_response(bool stop) {
     }
     for (unsigned retry = 0; retry < 3; ++retry) {
         expect_command(stop ? 12 : 18, 0);
-        if (stop) {
-            // An error-looking stuff byte must be discarded before each response.
-            expect_spi(0xFF, 0x04, false, 1);
-        }
         expect_spi(0xFF, 0xFF, false, 16);
     }
     expect_release();
@@ -908,8 +909,7 @@ static void test_stop_unaligned(uint8_t second, int expected) {
     expect_start(2, 0, 0);
     expect_block(0x31);
     expect_block(0xA6);
-    expect_command(12, 0);
-    expect_spi(0xFF, 0x3F, false, 1);
+    expect_command_with_stuff(12, 0, 0x3F);
     expect_spi(0xFF, 0xE0, false, 1);
     expect_spi(0xFF, second, false, 1);
     if (BD_ERROR_OK == expected) {
@@ -1010,6 +1010,33 @@ static void test_command_alignment(unsigned shift) {
     current_case = outer_case;
 }
 
+static void test_command_stuff(unsigned shift) {
+    static const uint8_t stuff[] = {0x00, 0x04, 0x80, 0xFF};
+    static const struct {
+        uint8_t r1;
+        int status;
+    } cases[] = {
+        {0x00, BD_ERROR_OK},
+        {0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {0x08, SD_BLOCK_DEVICE_ERROR_CRC},
+        {0x20, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+    };
+    for (size_t i = 0; i < sizeof(stuff); ++i) {
+        for (size_t j = 0; j < sizeof(cases) / sizeof(cases[0]); ++j) {
+            reset_card();
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command_with_stuff(CMD16_SET_BLOCKLEN, 512, stuff[i]);
+            expect_response_bits(&cases[j].r1, 8, shift, false);
+            expect_release();
+            uint32_t response = R1_NO_RESPONSE;
+            finish(_cmd(&config, CMD16_SET_BLOCKLEN, 512, false, &response), cases[j].status);
+            CHECK(response == cases[j].r1);
+        }
+    }
+}
+
 static void test_command_retry(unsigned shift) {
     static const struct {
         int cmd;
@@ -1087,7 +1114,6 @@ static void test_read_command_alignment(unsigned shift) {
         if (blocks == 2) {
             expect_block(0xA6);
             expect_command(CMD12_STOP_TRANSMISSION, 0);
-            expect_spi(0xFF, 0x04, false, 1);
             expect_response_bits(&r1, 8, (shift + 3) % 8, false);
             expect_spi(0xFF, 0xFF, false, 1);
         }
@@ -1333,8 +1359,8 @@ static void test_command_busy(bool app_command) {
 }
 
 // Keep CS low from the final CRC through CMD12 (SanDisk v2.2, section 5.23.3,
-// p.5-18). The exact sequence without extra clocks or ready polling is driver
-// policy, not a requirement to issue CMD12 immediately.
+// p.5-18). CMD12 gets the same leading FF as other commands, without a ready
+// wait that could consume the selected read stream.
 // SDSC byte addressing and SDHC block addressing differ (SD v9.10, Table 7-3,
 // footnote 10, p.299). Busy is optional (Table 7-3, footnote 5, p.299).
 static void test_multiblock(bool high_capacity, bool crc_enabled) {
@@ -1360,8 +1386,8 @@ static void test_multiblock(bool high_capacity, bool crc_enabled) {
 // not comprehensive timing compliance: SDSC timing uses TAAC/NSAC, capped at
 // 100 ms; hosts should use at least 100 ms for SDHC/SDXC reads (SD v9.10,
 // section 4.6.2.1, p.95).
-// Waiting for 0xFE does not immediately decode read-error tokens (SD v9.10,
-// section 7.3.3.3, p.306).
+// Non-FF/non-FE read tokens fail immediately (SD v9.10, section 7.3.3.3,
+// p.306 defines the data-error tokens; rejecting other bytes is host policy).
 static void test_multiblock_data_failure(bool crc_failure, uint8_t stop_response, bool stop_busy) {
     reset_card();
     expect_start(3, 0, 0);
@@ -1385,6 +1411,119 @@ static void test_singleblock_crc(void) {
     expect_release();
     uint8_t buffer[512];
     finish(device.read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_CRC);
+}
+
+static void test_read_token_rejection(void) {
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (unsigned token = 0; token < 256; ++token) {
+            if (token == 0xFF || token == SPI_START_BLOCK) {
+                continue;
+            }
+            reset_card();
+            config.enable_crc = crc;
+            expect_start(1, 0, 0);
+            expect_spi(0xFF, token, false, 1);
+            // A later FE belongs to the rejected stream, not a new block.
+            expect_spi(0xFF, 0xFE, false, 8);
+            expect_cs(true);
+            expect_spi(0xFF, 0xFF, true, 1);
+            uint8_t buffer[512];
+            memset(buffer, 0xA5, sizeof(buffer));
+            finish(device.read(&device, buffer, 0, sizeof(buffer)), BD_ERROR_DEVICE_ERROR);
+            for (size_t i = 0; i < sizeof(buffer); ++i) {
+                CHECK(buffer[i] == 0xA5);
+            }
+        }
+    }
+}
+
+static void test_shifted_read_rejection(void) {
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (unsigned shift = 1; shift < 8; ++shift) {
+            reset_card();
+            config.enable_crc = crc;
+            uint8_t stream[517] = {0, 0xFF, SPI_START_BLOCK};
+            memset(stream + 3, 0x55, 512);
+            stream[3] = 0x01;
+            stream[4] = 0xFC;
+            uint16_t checksum = reference_crc16(stream + 3, 512);
+            stream[515] = checksum >> 8;
+            stream[516] = checksum;
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD17_READ_SINGLE_BLOCK, 0);
+            // Four wire bytes reach the rejected token; the next eight are
+            // cleanup clocks. Never scan onward to the payload-derived FE.
+            expect_response_bits(stream, 12 * 8 - shift, shift, false);
+            expect_cs(true);
+            expect_spi(0xFF, 0xFF, true, 1);
+            uint8_t buffer[512];
+            memset(buffer, 0xA5, sizeof(buffer));
+            finish(device.read(&device, buffer, 0, sizeof(buffer)), BD_ERROR_DEVICE_ERROR);
+            for (size_t i = 0; i < sizeof(buffer); ++i) {
+                CHECK(buffer[i] == 0xA5);
+            }
+        }
+    }
+}
+
+static void test_register_token_rejection(bool app) {
+    static const uint8_t tokens[] = {0x00, 0x04, 0x80};
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (size_t i = 0; i < sizeof(tokens); ++i) {
+            reset_card();
+            config.enable_crc = crc;
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            if (app) {
+                expect_command(CMD55_APP_CMD, 0);
+                expect_spi(0xFF, 0, false, 1);
+                expect_spi(0xFF, 0xFF, false, 1);
+            }
+            int cmd = app ? ACMD13_SD_STATUS : CMD9_SEND_CSD;
+            expect_command(cmd, 0);
+            expect_spi(0xFF, 0, false, app ? 2 : 1);
+            expect_spi(0xFF, tokens[i], false, 1);
+            expect_release();
+            CHECK(_cmd(&config, cmd, 0, app, NULL) == BD_ERROR_OK);
+            CHECK(!cs_high);
+            uint8_t buffer[64];
+            memset(buffer, 0xA5, sizeof(buffer));
+            finish(_read_bytes(&config, buffer, app ? 64 : 16), BD_ERROR_DEVICE_ERROR);
+            for (size_t j = 0; j < sizeof(buffer); ++j) {
+                CHECK(buffer[j] == 0xA5);
+            }
+        }
+    }
+}
+
+static void test_multiblock_token_rejection(void) {
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (unsigned stop = 0; stop < 3; ++stop) {
+            reset_card();
+            config.enable_crc = crc;
+            expect_start(3, 0, 0);
+            expect_block(0x31);
+            expect_spi(0xFF, stop ? 0x80 : 0x04, false, 1);
+            expect_stop(stop == 1 ? R1_ILLEGAL_COMMAND : 0,
+                        stop == 2 ? CONF_SD_CMD_TIMEOUT : 0, 0, stop != 2);
+            uint8_t buffer[1536];
+            memset(buffer, 0xA5, sizeof(buffer));
+            finish(device.read(&device, buffer, 0, sizeof(buffer)), BD_ERROR_DEVICE_ERROR);
+            CHECK(mutex_entries == 1 && mutex_exits == 1);
+            for (size_t i = 0; i < sizeof(buffer); ++i) {
+                CHECK(buffer[i] == (i < 512 ? 0x31 : 0xA5));
+            }
+            expect_start(1, 1536, 0);
+            expect_block(0x42);
+            expect_release();
+            finish(device.read(&device, buffer, 1536, 512), BD_ERROR_OK);
+            CHECK(mutex_entries == 2 && mutex_exits == 2);
+            for (size_t i = 0; i < 512; ++i) {
+                CHECK(buffer[i] == 0x42);
+            }
+        }
+    }
 }
 
 static void test_repeated_read(void) {
@@ -2061,6 +2200,11 @@ static void test_create_spi1_miso(unsigned miso) {
 }
 
 int main(void) {
+    RUN_CASE("read-token-rejection", test_read_token_rejection());
+    RUN_CASE("shifted-read-rejection", test_shifted_read_rejection());
+    RUN_CASE("csd-token-rejection", test_register_token_rejection(false));
+    RUN_CASE("sd-status-token-rejection", test_register_token_rejection(true));
+    RUN_CASE("multiblock-token-rejection", test_multiblock_token_rejection());
     RUN_CASE("response-arithmetic", test_response_arithmetic());
     RUN_CASE("create-spi1-miso24", test_create_spi1_miso(24));
     RUN_CASE("create-spi1-miso28", test_create_spi1_miso(28));
@@ -2118,6 +2262,8 @@ int main(void) {
         char name[64];
         snprintf(name, sizeof(name), "command-alignment-%u", shift);
         RUN_CASE(name, test_command_alignment(shift));
+        snprintf(name, sizeof(name), "command-stuff-%u", shift);
+        RUN_CASE(name, test_command_stuff(shift));
         snprintf(name, sizeof(name), "command-retry-%u", shift);
         RUN_CASE(name, test_command_retry(shift));
         snprintf(name, sizeof(name), "app-prefix-failure-%u", shift);
