@@ -756,6 +756,40 @@ static void test_write_alignment(unsigned shift, bool enable_crc) {
     }
 }
 
+// Preserve the reference-compatible heuristic, including its known false
+// acceptance of shifted full-byte rejections with an undefined prefix of 001.
+// These are parser-policy checks, not evidence that the card wrote the data.
+static void test_write_response_prefix_ambiguity(bool multiple, bool enable_crc) {
+    static const uint8_t responses[] = {0x2B, 0x2D};
+    for (size_t i = 0; i < sizeof(responses); ++i) {
+        reset_card();
+        config.enable_crc = enable_crc;
+        if (multiple) {
+            expect_multiblock_program(0);
+        } else {
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD24_WRITE_BLOCK, 0);
+            expect_spi(0xFF, 0, false, 1);
+        }
+        expect_program_data(0x31, multiple ? SPI_START_BLK_MUL_WRITE : SPI_START_BLOCK);
+        // Shift the complete xxx0sss1 byte, not just its five status bits.
+        // Four leading clocks yield F2 B0 or F2 D0 with busy following.
+        expect_response_bits(&responses[i], 8, 4, true);
+        expect_spi(0xFF, 0, false, 2);
+        expect_spi(0xFF, 0xFF, false, 1);
+        if (multiple) {
+            expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 0, false);
+            expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
+            expect_spi(0xFF, 0xFF, false, 2);
+        }
+        expect_release();
+        uint8_t buffer[1024];
+        memset(buffer, 0x31, sizeof(buffer));
+        finish(program(&device, buffer, 0, multiple ? sizeof(buffer) : 512), BD_ERROR_OK);
+    }
+}
+
 static void test_write_busy_timeout(unsigned shift) {
     static const uint8_t tokens[] = {SPI_DATA_ACCEPTED, SPI_DATA_CRC_ERROR, SPI_DATA_WRITE_ERROR};
     for (size_t i = 0; i < sizeof(tokens); ++i) {
@@ -2541,6 +2575,12 @@ int main(void) {
     }
     RUN_CASE("write-response-bounds", test_write_response_bounds());
     RUN_CASE("write-response-windows", test_write_response_windows());
+    RUN_CASE("singleblock-prefix-ambiguity", test_write_response_prefix_ambiguity(false, true));
+    RUN_CASE("singleblock-prefix-ambiguity-no-crc",
+             test_write_response_prefix_ambiguity(false, false));
+    RUN_CASE("multiblock-prefix-ambiguity", test_write_response_prefix_ambiguity(true, true));
+    RUN_CASE("multiblock-prefix-ambiguity-no-crc",
+             test_write_response_prefix_ambiguity(true, false));
     RUN_CASE("singleblock-response-failure", test_program_response_failure(false));
     RUN_CASE("multiblock-response-failure", test_program_response_failure(true));
     RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK, 0));

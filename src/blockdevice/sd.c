@@ -1053,7 +1053,7 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
 
 static uint8_t _read_data_response(void *_config) {
     // Tokens must be byte-aligned to CS (SD v9.10, section 7.2, p.286).
-    // Realign acknowledgments to accommodate non-compliant cards that send the
+    // Realign some acknowledgments from non-compliant cards that send the
     // token a few bits late.
     //
     // For example, an accepted token three bits late, with the undefined bits
@@ -1062,11 +1062,15 @@ static uint8_t _read_data_response(void *_config) {
     //      1111 1100 1010 0000
     //       F    C    A    0
     //
-    // Ignoring the three undefined bits and skipping three extra 1 bits yields
+    // Ignoring the first three received bits and skipping three extra 1 bits yields
     // 00101 = 0x05 (SPI_DATA_ACCEPTED), rather than 0xFC & 0x1F = 0x1C.
     //
-    // This quirk is corroborated by FreeBSD's `mmcspi_get_response_token`:
-    // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L1540-L1580
+    // This is a compatibility heuristic, not reliable framing for arbitrary
+    // shifted undefined prefixes. F2 B0 and F2 D0 decode as accepted here and
+    // in both references, but can also encode shifted CRC/write rejections.
+    // Waiting for ready cannot resolve that ambiguity.
+    // https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L619-L652
+    // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L852-L990
 
     // Write-data responses have the format xxx0sss1 (SD v9.10, section 7.3.3.1,
     // p.305). Only the low five bits of the first byte participate in decoding.
@@ -1082,7 +1086,7 @@ static uint8_t _read_data_response(void *_config) {
         bits = (bits << 8) | _spi_write(_config, SPI_FILL_CHAR);
         for (int shift = 7; shift >= 0; --shift) {
             if (!(bits & (0x10u << shift))) {
-                // Return the first token, even if invalid. Searching only for an
+                // Return the first candidate, even if invalid. Searching only for an
                 // accepted value could mistake a later ready transition for success.
                 return (bits >> shift) & SPI_DATA_RESPONSE_MASK;
             }

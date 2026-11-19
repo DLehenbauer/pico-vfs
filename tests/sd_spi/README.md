@@ -105,12 +105,44 @@ alignment requirements remain in effect; trim continues to apply its inward
 erase-unit alignment policy. This is an API policy, not an SD protocol
 requirement, as is rejecting null read and program buffers.
 
+## Write-data response framing policy
+
+The write-response decoder retains a compatibility heuristic used by the pinned
+[Linux write path](https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L619-L652):
+ignore the first three received bits, then interpret the first subsequent zero
+as the start of a five-bit status candidate. The search is capped at four bytes
+and returns the first candidate, even if invalid. The shifted-status fixtures
+put only ones before the five meaningful bits; the aligned fixtures separately
+exercise all undefined three-bit prefixes.
+
+This is not reliable framing for arbitrary shifts of the complete `xxx0sss1`
+byte. For example, a full CRC-error byte `2B` shifted four bits late produces
+`F2 B0` with busy following; a write-error byte `2D` produces `F2 D0`. A zero
+from the shifted undefined prefix is mistaken for the start bit, producing
+`00101` (accepted) in both cases. Both pinned drivers, including
+[FreeBSD's response scanner](https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L852-L990),
+make that interpretation. The full-byte prefix-ambiguity scenarios preserve
+this behavior through single- and multiblock `program()` calls in both CRC
+modes, including readiness polling and normal stop/release cleanup. They
+explicitly demonstrate a known false-success limitation, not successful storage.
+
+The decoder cannot universally distinguish acceptance from rejection without
+reliable framing. Even `E5 80` can represent either an aligned accepted byte
+followed by busy starting one bit later, or a full CRC-error byte `CB` shifted
+one bit late with busy immediately following. Waiting for ready confirms only
+that busy ended; enabling CRC does not validate the acknowledgment's framing.
+The driver deliberately retains reference-compatible tolerance rather than
+rejecting every ambiguous interpretation, which could reject compliant writes
+too. These examples characterize synthetic non-compliant streams, not observed
+physical-card failures.
+
 ## Limitations
 
 Command responses, including R2/R3/R7 continuation bytes, and write-data
-acknowledgments are exercised at every bit offset. Read-start tokens, read
-payloads, and their CRCs remain byte-aligned; their realignment is not
-implemented. A shifted command response
+acknowledgments with high prefixes are exercised at every bit offset. This
+does not establish general shifted-acknowledgment safety; see the framing policy
+above. Read-start tokens, read payloads, and their CRCs remain byte-aligned;
+their realignment is not implemented. A shifted command response
 followed by an aligned read block is supported, but shifted read tokens are
 rejected instead of scanning onward into payload, apart from the narrowly
 scoped initial-zero CSD exception above. This policy is not full shifted-read
