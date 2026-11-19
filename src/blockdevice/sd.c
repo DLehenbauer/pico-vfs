@@ -309,8 +309,7 @@ static int _wait_token(void *_config, uint8_t token, bool allow_initial_zero) {
         if (token == response) {
             return BD_ERROR_OK;
         }
-        // Some cards emit one initial 00 before CSD padding, as Linux tolerates:
-        // https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L693-L701
+        // Tolerate one initial 00 before CSD padding as a compatibility quirk.
         // Never skip later errors or malformed tokens into a payload-derived FE.
         if (response != SPI_FILL_CHAR && !(allow_initial_zero && response == 0)) {
             return BD_ERROR_DEVICE_ERROR;
@@ -391,8 +390,9 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
         }
     }
 
-    // Both Linux and FreeBSD prefix every command, including CMD12 and retries,
-    // with FF. FreeBSD notes this prevents unaligned data on some cards.
+    // Prefix every command, including CMD12 and retries, with FF. FreeBSD
+    // corroborates this workaround for unaligned data on some cards:
+    // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L1195-L1241
     _spi_write(config, SPI_FILL_CHAR);
 
     // send a command
@@ -400,7 +400,7 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
         spi_write_read_blocking(config->spi_inst, (const uint8_t *)&cmd_packet[i], NULL, 1);
     }
 
-    // Ignore the first post-command byte, as Linux and FreeBSD do: it may be
+    // Ignore the first post-command byte, as FreeBSD does: it may be
     // garbage. This also covers CMD12's stuff byte, without a second discard.
     spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, 1);
 
@@ -467,7 +467,10 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
 
     // Re-try command
     for (int i = 0; i < 3; i++) {
-        // Every application command requires a successful CMD55 prefix.
+        // ACMDs require CMD55 (SD v9.10, Table 7-4, p.300). SPI has no APP_CMD
+        // status bit (section 7.2.11, p.292), so check its R1 instead.
+        // Retrying an unanswered prefix and rejecting errors before sending
+        // the application opcode are host policy. Never assume CMD55 succeeded.
         if (is_acmd) {
             response = _cmd_spi(config, CMD55_APP_CMD, 0x0, &alignment);
             if (R1_NO_RESPONSE == response) {
@@ -502,7 +505,9 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         *resp = response;
     }
 
-    // Process the response R1  : Exit on CRC/Illegal command error/No response
+    // Exit on no response or R1 CRC/illegal-command errors.
+    // For CRC/illegal-command errors, only R1 is returned, even for a
+    // multi-byte response (SD v9.10, section 7.3.2, p.302).
     if (R1_NO_RESPONSE == response) {
         _postclock_then_deselect(config);
         debug_if(SD_DBG, "No response CMD:%d response: 0x%" PRIx32 "\n", cmd, response);
@@ -532,8 +537,8 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         status = SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
     if (prefix_failed) {
-        // This is CMD55's R1. Do not send the application opcode or consume
-        // bytes from its response or data phase.
+        // This is CMD55's R1, not the requested command's response. Do not
+        // read that command's continuation bytes or enter its data phase.
         _postclock_then_deselect(config);
         return status;
     }
@@ -552,7 +557,8 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         return SD_BLOCK_DEVICE_ERROR_NO_INIT;
     }
 
-    // Get rest of the response part for other commands
+    // R2 adds one status byte. R3/R7 add four bytes after R1
+    // (SD v9.10, sections 7.3.2.3-7.3.2.6, pp.303-304).
     switch (cmd) {
         case CMD8_SEND_IF_COND:             // Response R7
             debug_if(SD_DBG, "V2-Version Card\n");
@@ -598,8 +604,10 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         *resp = response;
     }
 
-    // Do not deselect card if a read is in progress. ACMD13 returns R2 followed
-    // by the 64-byte SD Status data block; bare CMD13 has only R2.
+    // Keep CS low for data transfers. ACMD13 adds a 64-byte SD Status block;
+    // SD v9.10, Table 7-4, p.300 selects SD Status, whose size is 512 bits
+    // (section 4.10.2, p.125). Bare CMD13 has only R2 (section 7.3.2.3, p.303).
+    // Releasing CS after bare CMD13, but not before ACMD13 data, is driver policy.
     if (((CMD9_SEND_CSD == cmd) || (is_acmd && ACMD13_SD_STATUS == cmd) ||
             (ACMD22_SEND_NUM_WR_BLOCKS == cmd) ||
             (CMD24_WRITE_BLOCK == cmd) || (CMD25_WRITE_MULTIPLE_BLOCK == cmd) ||
@@ -625,7 +633,9 @@ static int _cmd8(void *_config) {
     arg |= (0x1 << 8);  // 2.7-3.6V             // [11:8]supply voltage(VHS)
 
     status = _cmd(config, CMD8_SEND_IF_COND, arg, false, &response);
-    // Verify voltage and pattern for V2 version of card
+    // CMD8 echoes the voltage and check pattern. Illegal-command indicates a
+    // legacy card (SD v9.10, section 7.2.1, pp.287-288). Reject mismatches
+    // rather than retrying them (host policy).
     if ((BD_ERROR_OK == status) && (SDCARD_V2 == config->card_type)) {
         // If check pattern is not matched, CMD8 communication is not valid
         if ((response & 0xFFF) != arg) {
@@ -641,6 +651,8 @@ static uint32_t _go_idle_state(void *_config) {
     blockdevice_sd_config_t *config = _config;
     uint32_t response;
 
+    // CMD0 enters SPI idle (SD v9.10, section 7.2.1, p.287).
+    // The retry count and inter-attempt delay are host policy.
     for (size_t i = 0; i < SD_CMD0_GO_IDLE_STATE_RETRIES; i++) {
         _cmd(config, CMD0_GO_IDLE_STATE, 0x0, 0, &response);
         if (R1_IDLE_STATE == response) {
@@ -697,11 +709,9 @@ static int init_card(void *_config) {
         arg |= OCR_HCS_CCS;
     }
 
-    /* Idle state bit in the R1 response of ACMD41 is used by the card to inform the host
-     * if initialization of ACMD41 is completed. "1" indicates that the card is still initializing.
-     * "0" indicates completion of initialization. The host repeatedly issues ACMD41 until
-     * this bit is set to "0".
-     */
+    // ACMD41's idle bit stays set during initialization. Poll until it clears
+    // (SD v9.10, section 7.2.1, p.288). The deadline and error codes are host
+    // policy: a successful exchange still reporting idle is not completed init.
     absolute_time_t timeout = make_timeout_time_ms(SD_COMMAND_TIMEOUT);
     // CRC errors are recoverable; retry within the same initialization deadline.
     do {
@@ -718,8 +728,9 @@ static int init_card(void *_config) {
     }
 
     if (SDCARD_V2 == config->card_type) {
-        // Read CCS after ACMD41 to choose SDSC versus SDHC/SDXC addressing.
-        // Preserve failure to establish the addressing mode.
+        // Read CCS after ACMD41 to choose SDSC versus SDHC/SDXC addressing
+        // (SD v9.10, section 7.2.1, pp.288-289). Do not let a later CMD59
+        // overwrite failure to establish the addressing mode (host policy).
         status = _cmd(config, CMD58_READ_OCR, 0x0, 0x0, &response);
         if (status != BD_ERROR_OK) {
             config->card_type = CARD_UNKNOWN;
@@ -847,8 +858,10 @@ static uint64_t _sd_sectors(void *_config) {
 
         case 1:
             hc_c_size = ext_bits(csd, 69, 48);            // device size : C_SIZE : [69:48]
-            // Widen before shifting: the full 22-bit encoding can represent 2^32
-            // sectors even though the specified SDXC user-area maximum is smaller.
+            // Capacity = (C_SIZE + 1) * 512 KiB (SD v9.10, section 5.3.3,
+            // p.234). Widen first: the full 22-bit encoding can yield 2^32
+            // sectors, although the specified SDXC user-area maximum is smaller
+            // (p.235). Do not wrap that encoding to zero in C.
             blocks = ((uint64_t)hc_c_size + 1) << 10;     // (C_SIZE + 1) * 1024 sectors
             debug_if(SD_DBG, "SDHC/SDXC Card: hc_c_size: %" PRIu32 " \n", hc_c_size);
             // ERASE_BLK_EN is fixed to 1: 512-byte units
@@ -882,6 +895,8 @@ static int _freq(void *_config) {
 static int init(blockdevice_t *device) {
     blockdevice_sd_config_t *config = device->config;
     mutex_enter_blocking(&config->_mutex);
+    // API policy: only publish initialized state after every setup step succeeds,
+    // including CSD, CMD16, and clock setup. Failed reinitialization invalidates it.
     config->is_initialized = false;
     device->is_initialized = false;
 
@@ -941,6 +956,8 @@ static bool is_valid_program(blockdevice_t *device, bd_size_t addr, bd_size_t si
 static int deinit(blockdevice_t *device) {
     blockdevice_sd_config_t *config = device->config;
     mutex_enter_blocking(&config->_mutex);
+    // Software deinitialization must invalidate both API and operational state.
+    // This is not a card reset or power cycle (SD v9.10, section 7.2.7, p.292).
     config->is_initialized = false;
     device->is_initialized = false;
     mutex_exit(&config->_mutex);
@@ -1001,8 +1018,9 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
     int status = BD_ERROR_OK;
     size_t block_count =  size / config->block_size;
 
-    // SDSC Card (CCS=0) uses byte unit address
-    // SDHC and SDXC Cards (CCS=1) use block unit address (512 Bytes unit)
+    // SDSC uses bytes while SDHC/SDXC uses 512-byte blocks (SD v9.10, Table
+    // 7-3, footnote 10, p.299). Divide in 64 bits before _cmd's 32-bit wire
+    // argument conversion so byte addresses above 4 GiB survive.
     if (SDCARD_V2HC == config->card_type) {
         addr = addr / config->block_size;
     }
@@ -1067,15 +1085,15 @@ static uint8_t _read_data_response(void *_config) {
     //
     // This is a compatibility heuristic, not reliable framing for arbitrary
     // shifted undefined prefixes. F2 B0 and F2 D0 decode as accepted here and
-    // in both references, but can also encode shifted CRC/write rejections.
+    // in FreeBSD's scanner, but can also encode shifted CRC/write rejections.
     // Waiting for ready cannot resolve that ambiguity.
-    // https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L619-L652
     // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L852-L990
 
     // Write-data responses have the format xxx0sss1 (SD v9.10, section 7.3.3.1,
     // p.305). Only the low five bits of the first byte participate in decoding.
     uint16_t bits = _spi_write(_config, SPI_FILL_CHAR);
 
+    // Trivial case: the token is already byte-aligned.
     if (!(bits & 0x10)) {
         return bits & SPI_DATA_RESPONSE_MASK;
     }
@@ -1083,17 +1101,19 @@ static uint8_t _read_data_response(void *_config) {
     // Bound the search to four bytes to tolerate late tokens without polling
     // indefinitely. This is host tolerance, not a spec-defined response delay.
     for (unsigned byte = 1; byte < 4; ++byte) {
+        // Preserve the previous byte's low bits to reconstruct straddling tokens.
         bits = (bits << 8) | _spi_write(_config, SPI_FILL_CHAR);
         for (int shift = 7; shift >= 0; --shift) {
             if (!(bits & (0x10u << shift))) {
-                // Return the first candidate, even if invalid. Searching only for an
-                // accepted value could mistake a later ready transition for success.
+                // Return the first candidate, even if invalid. Scanning for an accepted value
+                // could mistake a later busy/ready transition for a successful response.
                 return (bits >> shift) & SPI_DATA_RESPONSE_MASK;
             }
         }
     }
 
-    // Do not clock a fifth byte to complete a token starting in the last four bits.
+    // No complete token arrived within four bytes. Do not clock a fifth byte
+    // to complete a token starting in the final four bits.
     return 0xFF;
 }
 
@@ -1124,7 +1144,10 @@ static int _write(void *_config, const uint8_t *buffer, uint8_t token, uint32_t 
                  token == SPI_START_BLOCK ? "Single" : "Multiple", (unsigned)response);
     }
 
-    // Wait for last block to be written
+    // A data-response token acknowledges reception, not completion. Programming
+    // holds DataOut low until finished (SD v9.10, section 7.2.4, pp.290-291).
+    // Distinguish busy timeout from token rejection so CMD25 cleanup does not
+    // issue CMD12 to a still-busy card; the error-code distinction is API policy.
     if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
         debug_if(SD_DBG, "%s Block Write timed out waiting for ready\n",
                  token == SPI_START_BLOCK ? "Single" : "Multiple");
@@ -1159,6 +1182,8 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
 
     // SDSC Card (CCS=0) uses byte unit address
     // SDHC and SDXC Cards (CCS=1) use block unit address (512 Bytes unit)
+    // Preserve wide byte addresses until conversion to 512-byte block addresses
+    // (SD v9.10, Table 7-3, footnote 10, p.299), as in read().
     if (SDCARD_V2HC == config->card_type) {
         addr = addr / config->block_size;
     }
@@ -1174,7 +1199,9 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
         // Write data 
         status = _write(config, buffer, SPI_START_BLOCK, config->block_size);
     } else {
-        // Pre-erase setting prior to multiple block write operation
+        // ACMD23 is an optional pre-erase optimization. Continue without it on
+        // rejection (host policy). Stop Tran is required with or without it
+        // (SD v9.10, Table 7-4 and footnote 2, p.300).
         _cmd(config, ACMD23_SET_WR_BLK_ERASE_COUNT, block_count, 1, NULL);
 
         // Multiple block write command
@@ -1192,23 +1219,23 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
             buffer += config->block_size;
         } while (--block_count);     // Receive all blocks of data
 
-        // A ready card can safely be aborted after rejecting a block. Preserve
-        // the write error if CMD12 also fails. Never command a card that is
-        // still busy after a programming timeout.
+        // CRC/write rejection requires CMD12 (SD v9.10, section 7.3.3.1,
+        // p.305). _write has already waited for the card to become ready. _cmd
+        // releases the bus. Preserve the write error even if the abort fails.
         if (status == SD_BLOCK_DEVICE_ERROR_WRITE) {
             _cmd(config, CMD12_STOP_TRANSMISSION, 0, false, NULL);
             mutex_exit(&config->_mutex);
             return status;
         }
 
+        // Commands sent during busy are rejected (SD v9.10, section 7.2.8, p.292).
+        // After a busy timeout, release the bus without sending CMD12 or a stop token.
         if (status == BD_ERROR_OK) {
             // Successful CMD25 ends with Stop Tran, followed by optional busy
             // (SD v9.10, section 7.2.4, Figure 7-7, p.291, and section 7.3.3.2, p.305).
             _spi_write(config, SPI_STOP_TRAN);
             // N_BR can delay final busy by 0..1 byte; discard that window before
             // checking readiness (SanDisk v2.2, sections 5.23.4-5.24, p.5-19).
-            // FreeBSD also clocks a filler byte before checking Stop Tran busy:
-            // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L1644-L1671
             _spi_write(config, SPI_FILL_CHAR);
             if (false == _wait_ready(config, SD_COMMAND_TIMEOUT)) {
                 status = SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
@@ -1221,8 +1248,9 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
     return status;
 }
 
+// A normal write performs the physical erase internally, so an explicit erase
+// is unnecessary (SanDisk SD Card Product Manual v1.9, section 1.5.6, p.1-5).
 static int erase(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
-    // SD writes overwrite logical sectors; the card manages physical flash erase.
     (void)device;
     (void)addr;
     (void)size;
@@ -1237,6 +1265,14 @@ static bool _is_valid_trim(blockdevice_t *device, bd_size_t addr, bd_size_t size
             config->erase_size != 0);
 }
 
+// Trim is a performance hint, not erase-before-write. SPI does not support
+// DISCARD, so this issues ordinary ERASE (SD v9.10, section 4.3.5.2, p.55).
+// ERASE's post-read value is vendor-defined, so it is not a secure-deletion
+// guarantee (SD v9.10, section 4.3.5.1, p.55).
+//
+// With ERASE_BLK_EN clear, an address range expands to whole erase sectors.
+// Round inward to avoid changing data outside the request; partial boundary
+// units remain writable (SD v9.10, section 5.3.2, p.230).
 static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
     blockdevice_sd_config_t *config = device->config;
     mutex_enter_blocking(&config->_mutex);
@@ -1251,11 +1287,6 @@ static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
         return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
 
-    // Trim is advisory, not erase-before-write or secure deletion. Leave partial
-    // boundary units untouched: they remain writable, and rounding outward could
-    // erase live data. This also permits whole-device trim with a partial tail.
-    // Follow Linux's inward alignment policy:
-    // https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/core/core.c#L1734-L1790
     bd_size_t misalignment = addr % config->erase_size;
     if (misalignment != 0) {
         bd_size_t skip = config->erase_size - misalignment;
@@ -1283,9 +1314,13 @@ static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
         erase_timeout = SD_COMMAND_TIMEOUT;
     }
 
+    // CMD32/CMD33 specify the first/last blocks, inclusively (SD v9.10,
+    // Table 7-3, p.298). A one-block range therefore has identical endpoints.
     size -= config->block_size;
     // SDSC Card (CCS=0) uses byte unit address
     // SDHC and SDXC Cards (CCS=1) use block unit address (512 Bytes unit)
+    // (SD v9.10, Table 7-3, footnote 10, p.299).
+    // Convert in 64 bits before forming the 32-bit command arguments
     if (SDCARD_V2HC == config->card_type) {
         size = size / config->block_size;
         addr = addr / config->block_size;
