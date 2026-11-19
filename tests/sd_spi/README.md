@@ -21,9 +21,15 @@ response-start search follows that slot, with one extra byte permitted to finish
 a shifted R1 beginning in the final search byte.
 
 Read-data token validation is deliberately stricter than either reference:
-FF is padding, FE starts a block, and every other byte immediately returns
-`BD_ERROR_DEVICE_ERROR`. Only an all-FF stream can exhaust the 300 ms token wait
-and return `SD_BLOCK_DEVICE_ERROR_NO_RESPONSE`. Tests cover every rejected token
+FF is padding, FE starts a block, and other bytes immediately return
+`BD_ERROR_DEVICE_ERROR`, except for a single initial 00 on CSD reads. This
+preserves the [Linux-documented CSD padding quirk](https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L693-L701)
+without accepting repeated zeros, zeros after FF padding, or zeros on sector
+and SD-status reads. The exception shares the original 300 ms token budget.
+Tests cover full SDSC/SDHC initialization with this quirk, with and without
+following FF padding, and CRC checking enabled/disabled, including corrupt CRCs.
+An all-FF stream (optionally after the initial CSD zero) can exhaust the token
+wait and return `SD_BLOCK_DEVICE_ERROR_NO_RESPONSE`. Tests cover every rejected token
 in both CRC modes, sector and register/status reads, continuous shifted streams
 with payload-derived FE bytes, failed-block buffer preservation, and CMD12
 cleanup/error precedence. Cleanup may clock unread stream bytes, but those
@@ -97,10 +103,10 @@ Command responses, including R2/R3/R7 continuation bytes, are exercised at
 every bit offset. Read-start tokens, read payloads, and their CRCs remain
 byte-aligned; their realignment is not implemented. A shifted command response
 followed by an aligned read block is supported, but shifted read tokens are
-rejected instead of scanning onward into payload. Linux's initial-zero CSD/CID
-quirk is intentionally unsupported: even an initial 00 is rejected. This
-fail-closed policy is not full shifted-read compatibility, and CRC16 does not
-guarantee detection of arbitrary hardware corruption.
+rejected instead of scanning onward into payload, apart from the narrowly
+scoped initial-zero CSD exception above. This policy is not full shifted-read
+compatibility, and CRC16 does not guarantee detection of arbitrary hardware
+corruption.
 
 The mock clock advances deterministically. The default command timeout is 5 ms
 in tests and remains 5 s in production.

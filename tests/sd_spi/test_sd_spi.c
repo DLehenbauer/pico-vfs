@@ -1001,7 +1001,7 @@ static void test_command_alignment(unsigned shift) {
                 CHECK(status == BD_ERROR_OK);
                 CHECK(!cs_high);
                 uint8_t buffer[64];
-                status = _read_bytes(&config, buffer, sizeof(buffer));
+                status = _read_bytes(&config, buffer, sizeof(buffer), false);
                 CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
             }
             finish(status, cases[i].status);
@@ -1197,7 +1197,7 @@ static void test_acmd13_data(bool corrupt_crc) {
     CHECK(status == BD_ERROR_OK);
     CHECK(response == 0xA5);
     CHECK(!cs_high);
-    status = _read_bytes(&config, actual, sizeof(actual));
+    status = _read_bytes(&config, actual, sizeof(actual), false);
     if (corrupt_crc) {
         CHECK(status == SD_BLOCK_DEVICE_ERROR_CRC);
     } else {
@@ -1274,7 +1274,7 @@ static void test_r2_status(void) {
         CHECK(response == cases[i].response);
         if (read_status_block) {
             CHECK(!cs_high);
-            status = _read_bytes(&config, actual, sizeof(actual));
+            status = _read_bytes(&config, actual, sizeof(actual), false);
             CHECK(status == BD_ERROR_OK);
             CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
         }
@@ -1483,13 +1483,58 @@ static void test_register_token_rejection(bool app) {
             int cmd = app ? ACMD13_SD_STATUS : CMD9_SEND_CSD;
             expect_command(cmd, 0);
             expect_spi(0xFF, 0, false, app ? 2 : 1);
+            if (!app && tokens[i] == 0) {
+                expect_spi(0xFF, 0xFF, false, 1);
+            }
             expect_spi(0xFF, tokens[i], false, 1);
             expect_release();
             CHECK(_cmd(&config, cmd, 0, app, NULL) == BD_ERROR_OK);
             CHECK(!cs_high);
             uint8_t buffer[64];
             memset(buffer, 0xA5, sizeof(buffer));
-            finish(_read_bytes(&config, buffer, app ? 64 : 16), BD_ERROR_DEVICE_ERROR);
+            finish(_read_bytes(&config, buffer, app ? 64 : 16, !app), BD_ERROR_DEVICE_ERROR);
+            for (size_t j = 0; j < sizeof(buffer); ++j) {
+                CHECK(buffer[j] == 0xA5);
+            }
+        }
+    }
+}
+
+static void test_csd_initial_zero_rejection(void) {
+    static const struct {
+        uint8_t bytes[3];
+        size_t length;
+        bool timeout;
+    } cases[] = {
+        {{0x00, 0x00}, 2, false},
+        {{0x00, 0xFF, 0x00}, 3, false},
+        {{0x00, 0x04}, 2, false},
+        {{0x00, 0x80}, 2, false},
+        {{0x00}, 1, true},
+    };
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            reset_card();
+            config.enable_crc = crc;
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD9_SEND_CSD, 0);
+            expect_spi(0xFF, 0, false, 1);
+            for (size_t j = 0; j < cases[i].length; ++j) {
+                expect_spi(0xFF, cases[i].bytes[j], false, 1);
+            }
+            if (cases[i].timeout) {
+                // The initial zero consumes one millisecond of the same budget.
+                expect_spi(0xFF, 0xFF, false, 299);
+            }
+            expect_spi(0xFF, 0xFE, false, 8);
+            expect_cs(true);
+            expect_spi(0xFF, 0xFF, true, 1);
+            CHECK(_cmd(&config, CMD9_SEND_CSD, 0, false, NULL) == BD_ERROR_OK);
+            uint8_t buffer[16];
+            memset(buffer, 0xA5, sizeof(buffer));
+            finish(_read_bytes(&config, buffer, sizeof(buffer), true),
+                   cases[i].timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_DEVICE_ERROR);
             for (size_t j = 0; j < sizeof(buffer); ++j) {
                 CHECK(buffer[j] == 0xA5);
             }
@@ -1855,6 +1900,40 @@ static void test_cold_init(bool high_capacity, bool crc_enabled) {
     exercise_initialized_io(high_capacity ? 512 : 2048);
 }
 
+static void test_init_csd_initial_zero(void) {
+    for (unsigned high_capacity = 0; high_capacity < 2; ++high_capacity) {
+        for (unsigned crc = 0; crc < 2; ++crc) {
+            for (unsigned padding = 0; padding < 2; ++padding) {
+                for (unsigned corrupt_crc = 0; corrupt_crc < 2; ++corrupt_crc) {
+                    reset_init_card(crc);
+                    uint8_t csd[16];
+                    make_ordinary_csd(csd, high_capacity);
+                    csd[15] = reference_crc7(csd, 15);
+                    expect_card_init(false, high_capacity);
+                    expect_select();
+                    expect_spi(0xFF, 0xFF, false, 1);
+                    expect_command(CMD9_SEND_CSD, 0);
+                    expect_spi(0xFF, 0, false, 1);
+                    expect_spi(0xFF, 0, false, 1);
+                    if (padding) {
+                        expect_spi(0xFF, 0xFF, false, 3);
+                    }
+                    expect_status_block(csd, sizeof(csd), corrupt_crc);
+                    expect_release();
+                    bool succeeds = !crc || !corrupt_crc;
+                    if (succeeds) {
+                        expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
+                    }
+                    finish_lifecycle(init, succeeds ? BD_ERROR_OK : BD_ERROR_DEVICE_ERROR);
+                    CHECK(config.total_sectors ==
+                          (succeeds ? (high_capacity ? 8388608u : 4096u) : 0));
+                    CHECK(config.card_type == (high_capacity ? SDCARD_V2HC : SDCARD_V1));
+                }
+            }
+        }
+    }
+}
+
 static void test_deinit_reinit(void) {
     reset_card();
     finish_lifecycle(deinit, BD_ERROR_OK);
@@ -2200,6 +2279,8 @@ static void test_create_spi1_miso(unsigned miso) {
 }
 
 int main(void) {
+    RUN_CASE("init-csd-initial-zero", test_init_csd_initial_zero());
+    RUN_CASE("csd-initial-zero-rejection", test_csd_initial_zero_rejection());
     RUN_CASE("read-token-rejection", test_read_token_rejection());
     RUN_CASE("shifted-read-rejection", test_shifted_read_rejection());
     RUN_CASE("csd-token-rejection", test_register_token_rejection(false));
