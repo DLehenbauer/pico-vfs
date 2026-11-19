@@ -1114,7 +1114,7 @@ static void test_command_alignment(unsigned shift) {
                 CHECK(status == BD_ERROR_OK);
                 CHECK(!cs_high);
                 uint8_t buffer[64];
-                status = _read_bytes(&config, buffer, sizeof(buffer));
+                status = _read_bytes(&config, buffer, sizeof(buffer), false);
                 CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
             }
             finish(status, cases[i].status);
@@ -1310,7 +1310,7 @@ static void test_acmd13_data(bool corrupt_crc) {
     CHECK(status == BD_ERROR_OK);
     CHECK(response == 0xA5);
     CHECK(!cs_high);
-    status = _read_bytes(&config, actual, sizeof(actual));
+    status = _read_bytes(&config, actual, sizeof(actual), false);
     if (corrupt_crc) {
         CHECK(status == SD_BLOCK_DEVICE_ERROR_CRC);
     } else {
@@ -1387,7 +1387,7 @@ static void test_r2_status(void) {
         CHECK(response == cases[i].response);
         if (read_status_block) {
             CHECK(!cs_high);
-            status = _read_bytes(&config, actual, sizeof(actual));
+            status = _read_bytes(&config, actual, sizeof(actual), false);
             CHECK(status == BD_ERROR_OK);
             CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
         }
@@ -1596,13 +1596,58 @@ static void test_register_token_rejection(bool app) {
             int cmd = app ? ACMD13_SD_STATUS : CMD9_SEND_CSD;
             expect_command(cmd, 0);
             expect_spi(0xFF, 0, false, app ? 2 : 1);
+            if (!app && tokens[i] == 0) {
+                expect_spi(0xFF, 0xFF, false, 1);
+            }
             expect_spi(0xFF, tokens[i], false, 1);
             expect_release();
             CHECK(_cmd(&config, cmd, 0, app, NULL) == BD_ERROR_OK);
             CHECK(!cs_high);
             uint8_t buffer[64];
             memset(buffer, 0xA5, sizeof(buffer));
-            finish(_read_bytes(&config, buffer, app ? 64 : 16), BD_ERROR_DEVICE_ERROR);
+            finish(_read_bytes(&config, buffer, app ? 64 : 16, !app), BD_ERROR_DEVICE_ERROR);
+            for (size_t j = 0; j < sizeof(buffer); ++j) {
+                CHECK(buffer[j] == 0xA5);
+            }
+        }
+    }
+}
+
+static void test_csd_initial_zero_rejection(void) {
+    static const struct {
+        uint8_t bytes[3];
+        size_t length;
+        bool timeout;
+    } cases[] = {
+        {{0x00, 0x00}, 2, false},
+        {{0x00, 0xFF, 0x00}, 3, false},
+        {{0x00, 0x04}, 2, false},
+        {{0x00, 0x80}, 2, false},
+        {{0x00}, 1, true},
+    };
+    for (unsigned crc = 0; crc < 2; ++crc) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+            reset_card();
+            config.enable_crc = crc;
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD9_SEND_CSD, 0);
+            expect_spi(0xFF, 0, false, 1);
+            for (size_t j = 0; j < cases[i].length; ++j) {
+                expect_spi(0xFF, cases[i].bytes[j], false, 1);
+            }
+            if (cases[i].timeout) {
+                // The initial zero consumes one millisecond of the same budget.
+                expect_spi(0xFF, 0xFF, false, 299);
+            }
+            expect_spi(0xFF, 0xFE, false, 8);
+            expect_cs(true);
+            expect_spi(0xFF, 0xFF, true, 1);
+            CHECK(_cmd(&config, CMD9_SEND_CSD, 0, false, NULL) == BD_ERROR_OK);
+            uint8_t buffer[16];
+            memset(buffer, 0xA5, sizeof(buffer));
+            finish(_read_bytes(&config, buffer, sizeof(buffer), true),
+                   cases[i].timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_DEVICE_ERROR);
             for (size_t j = 0; j < sizeof(buffer); ++j) {
                 CHECK(buffer[j] == 0xA5);
             }
@@ -1929,6 +1974,67 @@ static void test_uninitialized_io(bool after_deinit) {
     finish(trim(&device, 0, 0), SD_BLOCK_DEVICE_ERROR_NO_INIT);
 }
 
+// These parameter errors and pre-transfer rejection are API policy; SD does not
+// define C null pointers, uint64_t overflow, or zero-length blockdevice requests.
+static void test_invalid_io(void) {
+    static const struct {
+        uint64_t address;
+        uint64_t length;
+        bool trim_invalid;
+    } cases[] = {
+        {0, 0, true}, {1, 512, false}, {0, 511, false},
+        {4096 * 512, 512, true}, {4096 * 512 - 512, 1024, true},
+        {UINT64_MAX - 511, 512, true}, {512, UINT64_MAX - 511, true},
+    };
+    uint8_t buffer[512] = {0};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_card();
+        finish(read(&device, buffer, cases[i].address, cases[i].length),
+               SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        finish(program(&device, buffer, cases[i].address, cases[i].length),
+               SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        if (cases[i].trim_invalid) {
+            finish(trim(&device, cases[i].address, cases[i].length),
+                   SD_BLOCK_DEVICE_ERROR_PARAMETER);
+        }
+    }
+
+    reset_card();
+    finish(read(&device, NULL, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+    finish(program(&device, NULL, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+
+    reset_card();
+    device.read_size = 0;
+    finish(read(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+    reset_card();
+    device.program_size = 0;
+    finish(program(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+    reset_card();
+    config.erase_size = 0;
+    finish(trim(&device, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_PARAMETER);
+
+    bd_size_t last_block = device.size(&device) - sizeof(buffer);
+    reset_card();
+    expect_start(1, last_block, R1_ILLEGAL_COMMAND);
+    expect_release();
+    finish(read(&device, buffer, last_block, sizeof(buffer)),
+           SD_BLOCK_DEVICE_ERROR_UNSUPPORTED);
+
+    reset_card();
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD24_WRITE_BLOCK, last_block);
+    expect_spi(0xFF, R1_ILLEGAL_COMMAND, false, 1);
+    expect_release();
+    finish(program(&device, buffer, last_block, sizeof(buffer)),
+           SD_BLOCK_DEVICE_ERROR_UNSUPPORTED);
+
+    reset_card();
+    expect_init_command(CMD32_ERASE_WR_BLK_START_ADDR, last_block, R1_ILLEGAL_COMMAND, 0);
+    finish(trim(&device, last_block, sizeof(buffer)),
+           SD_BLOCK_DEVICE_ERROR_UNSUPPORTED);
+}
+
 static void test_top_init(unsigned failure) {
     reset_card();
     expect_top_init_setup(failure, false);
@@ -1966,6 +2072,40 @@ static void test_cold_init(bool high_capacity, bool crc_enabled) {
     CHECK(config.card_type == (high_capacity ? SDCARD_V2HC : SDCARD_V1));
     CHECK(device.size(&device) == 4096 * 512);
     exercise_initialized_io(high_capacity ? 512 : 2048);
+}
+
+static void test_init_csd_initial_zero(void) {
+    for (unsigned high_capacity = 0; high_capacity < 2; ++high_capacity) {
+        for (unsigned crc = 0; crc < 2; ++crc) {
+            for (unsigned padding = 0; padding < 2; ++padding) {
+                for (unsigned corrupt_crc = 0; corrupt_crc < 2; ++corrupt_crc) {
+                    reset_init_card(crc);
+                    uint8_t csd[16];
+                    make_ordinary_csd(csd, high_capacity);
+                    csd[15] = reference_crc7(csd, 15);
+                    expect_card_init(false, high_capacity);
+                    expect_select();
+                    expect_spi(0xFF, 0xFF, false, 1);
+                    expect_command(CMD9_SEND_CSD, 0);
+                    expect_spi(0xFF, 0, false, 1);
+                    expect_spi(0xFF, 0, false, 1);
+                    if (padding) {
+                        expect_spi(0xFF, 0xFF, false, 3);
+                    }
+                    expect_status_block(csd, sizeof(csd), corrupt_crc);
+                    expect_release();
+                    bool succeeds = !crc || !corrupt_crc;
+                    if (succeeds) {
+                        expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
+                    }
+                    finish_lifecycle(init, succeeds ? BD_ERROR_OK : BD_ERROR_DEVICE_ERROR);
+                    CHECK(config.total_sectors ==
+                          (succeeds ? (high_capacity ? 8388608u : 4096u) : 0));
+                    CHECK(config.card_type == (high_capacity ? SDCARD_V2HC : SDCARD_V1));
+                }
+            }
+        }
+    }
 }
 
 static void test_deinit_reinit(void) {
@@ -2025,8 +2165,6 @@ static void test_advisory_trim(bool high_capacity) {
         {1024, 512, 256, 0, 0},
         {1024, 512, 1024, 0, 0},
         {1024, 1024, 512, 0, 0},
-        {1024, 1024, 0, 0, 0},
-        {1024, 4096 * 512, 0, 0, 0},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_card();
@@ -2313,6 +2451,8 @@ static void test_create_spi1_miso(unsigned miso) {
 }
 
 int main(void) {
+    RUN_CASE("init-csd-initial-zero", test_init_csd_initial_zero());
+    RUN_CASE("csd-initial-zero-rejection", test_csd_initial_zero_rejection());
     RUN_CASE("read-token-rejection", test_read_token_rejection());
     RUN_CASE("shifted-read-rejection", test_shifted_read_rejection());
     RUN_CASE("csd-token-rejection", test_register_token_rejection(false));
@@ -2326,6 +2466,7 @@ int main(void) {
     RUN_CASE("cold-sdsc-no-crc", test_cold_init(false, false));
     RUN_CASE("cold-sdhc-crc", test_cold_init(true, true));
     RUN_CASE("cold-sdhc-no-crc", test_cold_init(true, false));
+    RUN_CASE("invalid-io", test_invalid_io());
     RUN_CASE("uninitialized-io", test_uninitialized_io(false));
     RUN_CASE("deinitialized-io", test_uninitialized_io(true));
     RUN_CASE("top-init", test_top_init(0));

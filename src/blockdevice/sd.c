@@ -299,7 +299,7 @@ static inline void debug_if(int condition, const char *format, ...) {
     }
 }
 
-static int _wait_token(void *_config, uint8_t token) {
+static int _wait_token(void *_config, uint8_t token, bool allow_initial_zero) {
     blockdevice_sd_config_t *config = _config;
 
     // Use 64-bit elapsed time to avoid 32-bit millisecond rollover.
@@ -309,11 +309,13 @@ static int _wait_token(void *_config, uint8_t token) {
         if (token == response) {
             return BD_ERROR_OK;
         }
-        // Only FF is read-data padding. Never scan past an error or malformed
-        // token into payload that might contain another FE.
-        if (response != SPI_FILL_CHAR) {
+        // Some cards emit one initial 00 before CSD padding, as Linux tolerates:
+        // https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L693-L701
+        // Never skip later errors or malformed tokens into a payload-derived FE.
+        if (response != SPI_FILL_CHAR && !(allow_initial_zero && response == 0)) {
             return BD_ERROR_DEVICE_ERROR;
         }
+        allow_initial_zero = false;
     } while (absolute_time_diff_us(t, get_absolute_time()) < 300000); // Wait for 300 msec
     debug_if(SD_DBG, "_wait_token: timeout\n");
     return SD_BLOCK_DEVICE_ERROR_NO_RESPONSE;
@@ -757,12 +759,13 @@ static uint32_t ext_bits(unsigned char *data, int msb, int lsb)
     return bits;
 }
 
-static int _read_bytes(void *_config, uint8_t *buffer, uint32_t length) {
+static int _read_bytes(void *_config, uint8_t *buffer, uint32_t length,
+                       bool allow_initial_zero) {
     blockdevice_sd_config_t *config = _config;
     uint16_t crc;
 
     // read until start byte (0xFE)
-    int status = _wait_token(config, SPI_START_BLOCK);
+    int status = _wait_token(config, SPI_START_BLOCK, allow_initial_zero);
     if (status != BD_ERROR_OK) {
         debug_if(SD_DBG, "Read token failed: %d\n", status);
         _postclock_then_deselect(config);
@@ -806,7 +809,7 @@ static uint64_t _sd_sectors(void *_config) {
         return 0;
     }
     uint8_t csd[16];
-    if (_read_bytes(config, csd, 16) != 0) {
+    if (_read_bytes(config, csd, 16, true) != 0) {
         debug_if(SD_DBG, "Couldn't read csd response from disk\n");
         return 0;
     }
@@ -916,16 +919,23 @@ static int init(blockdevice_t *device) {
     return BD_ERROR_OK;
 }
 
+// API policy, not wire-protocol requirements: reject empty and out-of-range
+// requests before transfer. Subtraction avoids uint64_t address+size wrap.
+// The same policy applies to program and trim.
 static bool is_valid_read(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
-    return (addr % device->read_size == 0 &&
-            size % device->read_size == 0 &&
-            addr + size <= device->size(device));
+    bd_size_t capacity = device->size(device);
+    return (size != 0 && addr <= capacity && size <= capacity - addr &&
+            device->read_size != 0 &&
+            addr % device->read_size == 0 &&
+            size % device->read_size == 0);
 }
 
 static bool is_valid_program(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
-    return (addr % device->program_size == 0 &&
-            size % device->program_size == 0 &&
-            addr + size <= device->size(device));
+    bd_size_t capacity = device->size(device);
+    return (size != 0 && addr <= capacity && size <= capacity - addr &&
+            device->program_size != 0 &&
+            addr % device->program_size == 0 &&
+            size % device->program_size == 0);
 }
 
 static int deinit(blockdevice_t *device) {
@@ -948,7 +958,7 @@ static int _read(void *_config, uint8_t *buffer, uint32_t length) {
     uint16_t crc;
 
     // read until start byte (0xFE)
-    int status = _wait_token(config, SPI_START_BLOCK);
+    int status = _wait_token(config, SPI_START_BLOCK, false);
     if (status != BD_ERROR_OK) {
         debug_if(SD_DBG, "Read token failed: %d\n", status);
         return status;
@@ -982,7 +992,7 @@ static int read(blockdevice_t *device, const void *_buffer, bd_size_t addr, bd_s
         return SD_BLOCK_DEVICE_ERROR_NO_INIT;
     }
 
-    if (!is_valid_read(device, addr, size)) {
+    if (_buffer == NULL || !is_valid_read(device, addr, size)) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
@@ -1132,7 +1142,7 @@ static int program(blockdevice_t *device, const void *_buffer, bd_size_t addr, b
         return SD_BLOCK_DEVICE_ERROR_NO_INIT;
     }
 
-    if (!is_valid_program(device, addr, size)) {
+    if (_buffer == NULL || !is_valid_program(device, addr, size)) {
         mutex_exit(&config->_mutex);
         return SD_BLOCK_DEVICE_ERROR_PARAMETER;
     }
@@ -1219,7 +1229,8 @@ static bool _is_valid_trim(blockdevice_t *device, bd_size_t addr, bd_size_t size
     blockdevice_sd_config_t *config = device->config;
 
     bd_size_t capacity = device->size(device);
-    return (addr <= capacity && size <= capacity - addr && config->erase_size != 0);
+    return (size != 0 && addr <= capacity && size <= capacity - addr &&
+            config->erase_size != 0);
 }
 
 static int trim(blockdevice_t *device, bd_size_t addr, bd_size_t size) {
