@@ -107,9 +107,10 @@ requirement, as is rejecting null read and program buffers.
 
 ## Limitations
 
-Command responses, including R2/R3/R7 continuation bytes, are exercised at
-every bit offset. Read-start tokens, read payloads, and their CRCs remain
-byte-aligned; their realignment is not implemented. A shifted command response
+Command responses, including R2/R3/R7 continuation bytes, and write-data
+acknowledgments are exercised at every bit offset. Read-start tokens, read
+payloads, and their CRCs remain byte-aligned; their realignment is not
+implemented. A shifted command response
 followed by an aligned read block is supported, but shifted read tokens are
 rejected instead of scanning onward into payload, apart from the narrowly
 scoped initial-zero CSD exception above. This policy is not full shifted-read
