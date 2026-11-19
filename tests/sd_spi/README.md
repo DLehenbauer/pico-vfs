@@ -10,6 +10,31 @@ transitions. Unexpected, missing, or out-of-order transfers, including premature
 deselection and duplicate cleanup, fail. CRC7 and CRC16 expectations use
 independent bitwise implementations rather than the driver's lookup tables.
 
+Every command attempt, including CMD55, application commands, retries, and
+CMD12, has one leading FF byte and exactly one ignored byte after the command
+packet. This follows the pinned
+[FreeBSD command framing](https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L1195-L1241)
+and [Linux command framing](https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L408-L426)
+and [response scanning](https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L226-L234).
+Garbage in the ignored slot must not hide a genuine R1 error. The 16-byte
+response-start search follows that slot, with one extra byte permitted to finish
+a shifted R1 beginning in the final search byte.
+
+Read-data token validation is deliberately stricter than either reference:
+FF is padding, FE starts a block, and other bytes immediately return
+`BD_ERROR_DEVICE_ERROR`, except for a single initial 00 on CSD reads. This
+preserves the [Linux-documented CSD padding quirk](https://github.com/torvalds/linux/blob/666539eecdf4db623f5e3c3e55cf9f2dfad24aa4/drivers/mmc/host/mmc_spi.c#L693-L701)
+without accepting repeated zeros, zeros after FF padding, or zeros on sector
+and SD-status reads. The exception shares the original 300 ms token budget.
+Tests cover full SDSC/SDHC initialization with this quirk, with and without
+following FF padding, and CRC checking enabled/disabled, including corrupt CRCs.
+An all-FF stream (optionally after the initial CSD zero) can exhaust the token
+wait and return `SD_BLOCK_DEVICE_ERROR_NO_RESPONSE`. Tests cover every rejected token
+in both CRC modes, sector and register/status reads, continuous shifted streams
+with payload-derived FE bytes, failed-block buffer preservation, and CMD12
+cleanup/error precedence. Cleanup may clock unread stream bytes, but those
+bytes must not be interpreted as another start token or copied into the buffer.
+
 The trim geometry cases initialize SDSC and SDHC cards from CSD fixtures, then
 check actual CMD32/CMD33/CMD38 exchanges and inward-rounded ranges. SDSC cases
 cover both ERASE_BLK_EN values, independent read and write
@@ -81,6 +106,15 @@ erase-unit alignment policy. This is an API policy, not an SD protocol
 requirement, as is rejecting null read and program buffers.
 
 ## Limitations
+
+Command responses, including R2/R3/R7 continuation bytes, are exercised at
+every bit offset. Read-start tokens, read payloads, and their CRCs remain
+byte-aligned; their realignment is not implemented. A shifted command response
+followed by an aligned read block is supported, but shifted read tokens are
+rejected instead of scanning onward into payload, apart from the narrowly
+scoped initial-zero CSD exception above. This policy is not full shifted-read
+compatibility, and CRC16 does not guarantee detection of arbitrary hardware
+corruption.
 
 The mock clock advances deterministically. The default command timeout is 5 ms
 in tests and remains 5 s in production.
