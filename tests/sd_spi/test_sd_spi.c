@@ -2732,11 +2732,12 @@ static void test_init_inputs(void) {
 // Retry count and sleeps are driver policy, not a prescribed reset sequence.
 static void test_idle_retries(bool exhausted) {
     reset_card();
+    time_step_us = 0;
     for (unsigned i = 0; i < (exhausted ? SD_CMD0_GO_IDLE_STATE_RETRIES : 2u); ++i) {
         expect_init_command(CMD0_GO_IDLE_STATE, 0, !exhausted && i == 1 ? 1 : 0, 0);
     }
     finish(_go_idle_state(&config), exhausted ? 0 : R1_IDLE_STATE);
-    CHECK(now_us >= (exhausted ? SD_CMD0_GO_IDLE_STATE_RETRIES : 1u) * 1000);
+    CHECK(now_us == (exhausted ? SD_CMD0_GO_IDLE_STATE_RETRIES : 1u) * 1000);
 }
 
 // Default-speed TRAN_SPEED is 25 MHz; 50 MHz needs High-Speed mode
