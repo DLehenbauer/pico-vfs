@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CONF_SD_CMD_TIMEOUT 5
 #include "../../src/blockdevice/sd.c"
 
 int test_sd_fat_format(blockdevice_t *sd);
@@ -62,6 +61,8 @@ static void expect_init_command(int cmd, uint32_t arg, uint8_t response, uint32_
 
 static void check_spi_state(void) {
     if ((observing_lifecycle && initializing) || observing_ready_io) {
+        // Check both initialization flags under the mutex throughout SPI I/O,
+        // not just after init() returns.
         CHECK(config._mutex.locked);
         CHECK(config.is_initialized == observing_ready_io);
         CHECK(device.is_initialized == observing_ready_io);
@@ -136,11 +137,9 @@ void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha
 
 int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, size_t len) {
     CHECK(spi == config.spi_inst);
+    CHECK(len == 0 || (src != NULL && dst != NULL));
     for (size_t i = 0; i < len; ++i) {
-        uint8_t rx = exchange(src[i]);
-        if (dst) {
-            dst[i] = rx;
-        }
+        dst[i] = exchange(src[i]);
     }
     return (int)len;
 }
@@ -154,7 +153,12 @@ int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, s
 }
 
 int spi_write_blocking(spi_inst_t *spi, const uint8_t *src, size_t len) {
-    return spi_write_read_blocking(spi, src, NULL, len);
+    CHECK(spi == config.spi_inst);
+    CHECK(len == 0 || src != NULL);
+    for (size_t i = 0; i < len; ++i) {
+        exchange(src[i]);
+    }
+    return (int)len;
 }
 
 void gpio_set_dir(unsigned gpio, bool out) {
@@ -204,6 +208,7 @@ void mutex_enter_blocking(mutex_t *mutex) {
     }
     CHECK(!mutex->locked);
     if (observing_lifecycle) {
+        // The operation must acquire the lock before invalidating prior state.
         CHECK(config.is_initialized == entry_config_initialized);
         CHECK(device.is_initialized == entry_device_initialized);
     }
@@ -217,6 +222,7 @@ void mutex_exit(mutex_t *mutex) {
     }
     CHECK(mutex->locked);
     if (observing_lifecycle) {
+        // Publish success or failure before releasing the lifecycle lock.
         CHECK(config.is_initialized == initialized_on_unlock);
         CHECK(device.is_initialized == initialized_on_unlock);
     }
@@ -259,6 +265,7 @@ static void reset_card(void) {
     mutex_init(&config._mutex);
 }
 
+// Independent bitwise CRC7, x^7+x^3+1 (SD v9.10, section 4.5, p.93).
 static uint8_t reference_crc7(const uint8_t *data, size_t len) {
     uint8_t crc = 0;
     for (size_t i = 0; i < len; ++i) {
@@ -270,6 +277,8 @@ static uint8_t reference_crc7(const uint8_t *data, size_t len) {
     return (crc << 1) | 1;
 }
 
+// Independent bitwise CRC16, x^16+x^12+x^5+1 (SD v9.10, section 4.5,
+// p.94; SPI data uses this polynomial too, section 7.2.3, p.289).
 static uint16_t reference_crc16(const uint8_t *data, size_t len) {
     uint16_t crc = 0;
     for (size_t i = 0; i < len; ++i) {
@@ -307,6 +316,9 @@ static void expect_release(void) {
 }
 
 static void expect_command_with_stuff(int cmd, uint32_t arg, uint8_t stuff) {
+    // Every attempt, including CMD55, ACMDs, retries, and CMD12, gets a leading
+    // FF and one ignored post-command byte. FreeBSD corroborates these quirks:
+    // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L1195-L1241
     expect_spi(0xFF, 0xFF, false, 1);
     uint8_t packet[6] = {
         (uint8_t)(0x40 | cmd), arg >> 24, arg >> 16, arg >> 8, arg, 0xFF,
@@ -412,6 +424,9 @@ static void expect_program_data(uint8_t value, uint8_t start) {
 static void expect_program_block(uint8_t value, uint8_t start, uint8_t response, unsigned shift,
                                 bool timeout) {
     expect_program_data(value, start);
+    // Shift only the meaningful five bits, with a high undefined prefix and
+    // immediate busy. Arbitrary shifted full-byte prefixes are ambiguous;
+    // test_write_response_prefix_ambiguity() characterizes that limitation.
     uint8_t token = response << 3;
     expect_response_bits(&token, 5, 3 + shift, true);
     expect_spi(0xFF, 0, false, timeout ? CONF_SD_CMD_TIMEOUT : 2);
@@ -438,6 +453,8 @@ static void expect_multiblock_program(unsigned shift) {
 }
 
 static void fill_pattern(uint8_t *buffer, size_t length) {
+    // Test design, not an SD data pattern: expose repeated-byte, ordering, and
+    // block-stride errors that constant payloads cannot distinguish.
     for (size_t i = 0; i < length; ++i) {
         buffer[i] = i * 37 + (i / 256) * 17 + 11;
     }
@@ -451,6 +468,16 @@ static void expect_status_block(const uint8_t *data, size_t length, bool corrupt
     }
     expect_spi(0xFF, crc >> 8, false, 1);
     expect_spi(0xFF, crc, false, 1);
+}
+
+static void expect_write_payload(const uint8_t *data, size_t length, uint8_t start) {
+    uint16_t crc = config.enable_crc ? reference_crc16(data, length) : 0xFFFF;
+    expect_spi(start, 0xFF, false, 1);
+    for (size_t i = 0; i < length; ++i) {
+        expect_spi(data[i], 0xFF, false, 1);
+    }
+    expect_spi(crc >> 8, 0xFF, false, 1);
+    expect_spi(crc, 0xFF, false, 1);
 }
 
 // CMD12 stays in the selected read stream (SanDisk v2.2, section 5.23.3, p.5-18).
@@ -652,6 +679,7 @@ static void test_init_crc_recovery(bool enabled, uint8_t response) {
 // Both idle polling and CRC recovery share one initialization deadline.
 static void test_init_crc_timeout(bool enabled, uint8_t response) {
     reset_init_card(enabled);
+    time_step_us = (uint64_t)SD_COMMAND_TIMEOUT * 200;
     expect_init_prefix(SDCARD_V2HC);
     expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, response, 0);
     expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, response, 0);
@@ -676,6 +704,9 @@ static void test_init_failures(void) {
     for (unsigned crc = 0; crc < 2; ++crc) {
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
             reset_init_card(crc);
+            if (cases[i].acmd41 == R1_IDLE_STATE) {
+                time_step_us = (uint64_t)SD_COMMAND_TIMEOUT * 200;
+            }
             expect_init_prefix(SDCARD_V2HC);
             expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, 1, 0);
             expect_init_command(ACMD41_SD_SEND_OP_COND, OCR_HCS_CCS, cases[i].acmd41, 0);
@@ -809,6 +840,8 @@ static void test_multiblock_stop_timing(void) {
         {0xFF, 0x00, 1}, // Immediate busy.
         {0xFE, 0x7F, 1}, // Busy starts during the last bit of N_BR.
         {0xFF, 0x7F, 1}, // One short busy bit.
+        {0x7F, 0x00, 0}, // One busy bit entirely within N_BR.
+        {0x00, 0x00, 1}, // Busy spans N_BR and the next byte.
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_card();
@@ -882,6 +915,7 @@ static void test_multiblock_program_failure(unsigned shift) {
         {0x0D, true, 0, false, true},
         {0x0B, false, 0, true, false},
         {0x0B, false, 0, false, true},
+        {0x0D, false, 0, false, true},
         {0x05, true, 0, false, true},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
@@ -924,6 +958,8 @@ static void test_write_response_bounds(void) {
         }
     }
 
+    // A complete token ending at byte four is accepted; a start bit in its
+    // final four bits must not trigger a fifth read to complete a candidate.
     reset_card();
     cs_high = false;
     expect_spi(0xFF, 0xFF, false, 3);
@@ -951,6 +987,8 @@ static void test_write_response_windows(void) {
             reset_card();
             cs_high = false;
             uint8_t token = response << 3;
+            // Return the first candidate, including invalid statuses, rather
+            // than scanning a later busy/ready transition for acceptance.
             bool complete = leading <= 27;
             expect_response_bits(&token, complete ? 5 : 32 - leading, leading, true);
             CHECK(_read_data_response(&config) == (complete ? response : 0xFF));
@@ -1087,6 +1125,8 @@ static void test_command_alignment(unsigned shift) {
             }
             expect_command(cases[i].cmd, 0);
             if (delay) {
+                // The ignored slot is separate from the 16-byte start search.
+                // A shifted R1 in its final slot may need one more wire byte.
                 expect_spi(0xFF, 0xFF, false, 15);
             }
             expect_response_bits(cases[i].bytes, cases[i].length * 8, shift, false);
@@ -1124,6 +1164,7 @@ static void test_command_alignment(unsigned shift) {
 }
 
 static void test_command_stuff(unsigned shift) {
+    // Garbage in the ignored byte must neither fabricate nor hide an R1 error.
     static const uint8_t stuff[] = {0x00, 0x04, 0x80, 0xFF};
     static const struct {
         uint8_t r1;
@@ -1216,6 +1257,8 @@ static void test_busy_alignment(unsigned shift) {
 }
 
 static void test_read_command_alignment(unsigned shift) {
+    // Only the command response is shifted. Read tokens, payloads, and CRCs
+    // remain byte-aligned; this is not support for a shifted read-data stream.
     for (unsigned blocks = 1; blocks <= 2; ++blocks) {
         reset_card();
         expect_select();
@@ -1527,6 +1570,8 @@ static void test_singleblock_crc(void) {
 }
 
 static void test_read_token_rejection(void) {
+    // Strict host policy: FF is padding and FE starts data; reject every other
+    // sector token in both CRC modes without modifying the destination.
     for (unsigned crc = 0; crc < 2; ++crc) {
         for (unsigned token = 0; token < 256; ++token) {
             if (token == 0xFF || token == SPI_START_BLOCK) {
@@ -1551,6 +1596,8 @@ static void test_read_token_rejection(void) {
 }
 
 static void test_shifted_read_rejection(void) {
+    // Do not recover a shifted read token by scanning into payload-derived FE.
+    // CRC16 alone cannot guarantee detection of arbitrary stream corruption.
     for (unsigned crc = 0; crc < 2; ++crc) {
         for (unsigned shift = 1; shift < 8; ++shift) {
             reset_card();
@@ -1581,6 +1628,8 @@ static void test_shifted_read_rejection(void) {
 }
 
 static void test_register_token_rejection(bool app) {
+    // SD Status has no zero exception. CSD tolerates an initial zero only,
+    // never a zero after FF padding; both register reads reject malformed tokens.
     static const uint8_t tokens[] = {0x00, 0x04, 0x80};
     for (unsigned crc = 0; crc < 2; ++crc) {
         for (size_t i = 0; i < sizeof(tokens); ++i) {
@@ -1614,6 +1663,8 @@ static void test_register_token_rejection(bool app) {
 }
 
 static void test_csd_initial_zero_rejection(void) {
+    // The CSD quirk skips exactly one initial 00. Repeated zeros and errors
+    // after that exception still fail, without restarting the 300 ms deadline.
     static const struct {
         uint8_t bytes[3];
         size_t length;
@@ -1667,8 +1718,10 @@ static void test_multiblock_token_rejection(void) {
                         stop == 2 ? CONF_SD_CMD_TIMEOUT : 0, 0, stop != 2);
             uint8_t buffer[1536];
             memset(buffer, 0xA5, sizeof(buffer));
+            // Preserve the token error over CMD12 rejection or busy timeout.
             finish(device.read(&device, buffer, 0, sizeof(buffer)), BD_ERROR_DEVICE_ERROR);
             CHECK(mutex_entries == 1 && mutex_exits == 1);
+            // Keep the completed block and leave failed/unread blocks untouched.
             for (size_t i = 0; i < sizeof(buffer); ++i) {
                 CHECK(buffer[i] == (i < 512 ? 0x31 : 0xA5));
             }
@@ -1764,14 +1817,6 @@ static void test_erase_busy_timeout(void) {
     CHECK(response == 0);
 }
 
-// Without cached SD Status erase parameters, estimate write-block count times
-// 250 ms (SD v3.01, section 4.6.2.3, p.57). This is not the AU-based formula
-// (T_ERASE / N_ERASE) * X + T_OFFSET, with a one-second minimum and partial-AU
-// allowances (SD v3.01, section 4.14.4, p.89).
-// Forty logical sectors give a 10 s estimate: a 6 s erase must succeed despite
-// exceeding the old 5 s production budget. Check both address formats, budget
-// expiration, and rollover. Only trim's CMD38 gets the scaled busy budget;
-// CMD12 and pre-command waits retain the command timeout.
 // Power-up needs at least 74 clocks with CS/DI high (SD v3.01, section 6.4.1, p.111).
 // The 1 ms settling wait follows Elm-Chan SPI initialization guidance
 // (See: https://elm-chan.org/docs/mmc/mmc_e.html#spiinit).
@@ -1787,11 +1832,15 @@ static void test_power_up(void) {
     finish(BD_ERROR_OK, BD_ERROR_OK);
 }
 
+// Forty sectors give a 10 s erase estimate (250 ms/block; SD v9.10,
+// section 4.6.2.3, p.96). Exercise both address formats, expiration, and rollover.
 static void test_trim_busy(bool high_capacity, bool timeout, bool wrap) {
     reset_card();
     config.card_type = high_capacity ? SDCARD_V2HC : SDCARD_V1;
     if (wrap) {
-        now_us = ((uint64_t)UINT32_MAX - 3) * 1000;
+        // Four mock time reads precede busy polling. Start early enough that
+        // the wait itself spans rollover: this is a host-clock regression.
+        now_us = ((uint64_t)UINT32_MAX - 10) * 1000;
     }
     for (int cmd = 32; cmd <= 33; ++cmd) {
         expect_select();
@@ -1896,6 +1945,8 @@ static void exercise_initialized_io(size_t trim_size) {
     uint8_t buffer[512] = {0};
     observing_ready_io = true;
     CHECK(config.erase_size == trim_size);
+    // Private trim alignment must not change FAT sectors or littlefs geometry.
+    // Reads, writes, and no-op erase still accept 512-byte logical sectors.
     CHECK(device.read_size == 512 && device.program_size == 512 && device.erase_size == 512);
     finish(erase(&device, 2048, sizeof(buffer)), BD_ERROR_OK);
     expect_start(1, high_capacity ? 4 : 2048, 0);
@@ -1966,6 +2017,7 @@ static void test_uninitialized_io(bool after_deinit) {
         config.is_initialized = device.is_initialized = false;
     }
     config.erase_size = 0;
+    // NO_INIT takes precedence even for empty trim, before geometry is known.
     CHECK(!config.is_initialized && !device.is_initialized);
     uint8_t buffer[512] = {0};
     finish(read(&device, buffer, 1, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
@@ -1976,6 +2028,7 @@ static void test_uninitialized_io(bool after_deinit) {
 
 // These parameter errors and pre-transfer rejection are API policy; SD does not
 // define C null pointers, uint64_t overflow, or zero-length blockdevice requests.
+// No SPI events are queued for invalid ranges, null buffers, or zero granularity.
 static void test_invalid_io(void) {
     static const struct {
         uint64_t address;
@@ -2056,6 +2109,7 @@ static void test_top_init(unsigned failure) {
         finish(program(&device, buffer, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
         finish(trim(&device, 0, sizeof(buffer)), SD_BLOCK_DEVICE_ERROR_NO_INIT);
         expect_top_init_setup(0, false);
+        // Each top-level setup failure must permit a subsequent successful init.
         finish_lifecycle(init, BD_ERROR_OK);
     }
     exercise_initialized_io(2048);
@@ -2075,6 +2129,8 @@ static void test_cold_init(bool high_capacity, bool crc_enabled) {
 }
 
 static void test_init_csd_initial_zero(void) {
+    // Exercise the initial-zero CSD quirk through complete SDSC/SDHC startup,
+    // with/without FF padding and CRC checking, including corrupt data CRCs.
     for (unsigned high_capacity = 0; high_capacity < 2; ++high_capacity) {
         for (unsigned crc = 0; crc < 2; ++crc) {
             for (unsigned padding = 0; padding < 2; ++padding) {
@@ -2149,6 +2205,14 @@ static void expect_trim_range(bd_size_t addr, bd_size_t length) {
 }
 
 static void test_advisory_trim(bool high_capacity) {
+    // Trim uses ordinary ERASE, not SPI-unsupported DISCARD (SD v9.10,
+    // section 4.3.5.2, p.55), and is not required before writing. Normal writes
+    // erase internally (SanDisk SD Card Product Manual v1.9, section 1.5.6,
+    // p.1-5); vendor-defined post-ERASE data is not a secure-deletion guarantee
+    // (SD v9.10, section 4.3.5.1, p.55).
+    // With ERASE_BLK_EN clear, ranges expand to erase sectors (section 5.3.2,
+    // p.230). Round inward so boundary data outside the request is not erased,
+    // including for non-power-of-two units and wide SDHC addresses.
     static const struct {
         size_t unit;
         bd_size_t addr;
@@ -2173,6 +2237,7 @@ static void test_advisory_trim(bool high_capacity) {
         if (cases[i].trimmed_length != 0) {
             expect_trim_range(cases[i].trimmed_addr, cases[i].trimmed_length);
         }
+        // Nonempty ranges with no full erase unit succeed without card I/O.
         finish(trim(&device, cases[i].addr, cases[i].length), BD_ERROR_OK);
     }
     if (high_capacity) {
@@ -2185,12 +2250,16 @@ static void test_advisory_trim(bool high_capacity) {
 }
 
 static void test_trim_invalid_bounds(void) {
+    // Validate the original byte range before rounding; empty/out-of-bounds
+    // ranges, overflow, and unknown erase granularity must fail without SPI I/O.
     static const struct {
         bd_size_t addr;
         bd_size_t length;
     } cases[] = {
         {4096 * 512, 512},
         {4096 * 512 + 1, 0},
+        {1024, 0},
+        {4096 * 512, 0},
         {4096 * 512 - 512, 1024},
         {UINT64_MAX - 511, 512},
         {512, UINT64_MAX - 511},
@@ -2221,6 +2290,7 @@ static void test_trim_rounded_timeout(bool high_capacity) {
 }
 
 static void test_trim_rounded_rejection(void) {
+    // Advisory rounding must not turn a card error into a successful no-op.
     reset_card();
     config.erase_size = 1024;
     expect_init_command(CMD32_ERASE_WR_BLK_START_ADDR, 1024, 0, 0);
@@ -2230,6 +2300,8 @@ static void test_trim_rounded_rejection(void) {
 }
 
 static void test_trim_partial_tail_format(void) {
+    // FAT's formatter writes header sectors before trimming the whole device.
+    // A partial final erase unit must not make formatting fail.
     for (unsigned crc_enabled = 0; crc_enabled < 2; ++crc_enabled) {
         reset_init_card(crc_enabled);
         uint8_t csd[16];
@@ -2253,38 +2325,38 @@ static void test_trim_partial_tail_format(void) {
         filesystem_io = false;
         finish(status, BD_ERROR_OK);
 
-        uint8_t buffer[512];
-        memset(buffer, 0x31, sizeof(buffer));
+        // Formatting used heap-backed reads/writes and real SD trim. Exercise
+        // SD read/program callbacks separately on the writable, untrimmed tail.
+        uint8_t buffer[512], expected[512];
+        fill_pattern(expected, sizeof(expected));
         bd_size_t tail = device.size(&device) - 512;
         finish(device.erase(&device, tail, sizeof(buffer)), BD_ERROR_OK);
         expect_select();
         expect_spi(0xFF, 0xFF, false, 1);
         expect_command(CMD24_WRITE_BLOCK, tail);
         expect_spi(0xFF, 0, false, 1);
-        expect_spi(SPI_START_BLOCK, 0xFF, false, 1);
-        expect_spi(0x31, 0xFF, false, sizeof(buffer));
-        uint16_t crc = crc_enabled ? reference_crc16(buffer, sizeof(buffer)) : 0xFFFF;
-        expect_spi(crc >> 8, 0xFF, false, 1);
-        expect_spi(crc, 0xFF, false, 1);
+        expect_write_payload(expected, sizeof(expected), SPI_START_BLOCK);
         expect_spi(0xFF, SPI_DATA_ACCEPTED, false, 1);
         expect_spi(0xFF, 0xFF, false, 1);
         expect_release();
-        finish(program(&device, buffer, tail, sizeof(buffer)), BD_ERROR_OK);
+        finish(program(&device, expected, tail, sizeof(expected)), BD_ERROR_OK);
 
         memset(buffer, 0, sizeof(buffer));
         expect_start(1, tail, 0);
-        expect_block(0x31);
+        expect_status_block(expected, sizeof(expected), !crc_enabled);
         expect_release();
         finish(read(&device, buffer, tail, sizeof(buffer)), BD_ERROR_OK);
-        for (size_t i = 0; i < sizeof(buffer); ++i) {
-            CHECK(buffer[i] == 0x31);
-        }
+        CHECK(memcmp(buffer, expected, sizeof(buffer)) == 0);
         observing_ready_io = false;
         CHECK(config.is_initialized && device.is_initialized);
     }
 }
 
-static void test_trim_geometry(void) {
+static void test_trim_geometry(bool crc_enabled) {
+    // SECTOR_SIZE counts native write blocks, not read blocks or logical
+    // sectors (SD v9.10, section 5.3.2, pp.229-230). Cover both ERASE_BLK_EN
+    // values, independent READ_BL_LEN/WRITE_BL_LEN, 512/1024/2048-byte native
+    // writes, both SECTOR_SIZE extremes, and non-power-of-two erase units.
     const struct {
         bool high_capacity;
         bool single_block_erase;
@@ -2309,6 +2381,7 @@ static void test_trim_geometry(void) {
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         reset_card();
+        config.enable_crc = crc_enabled;
         config.hz = CONF_SD_TRX_FREQUENCY;
         uint8_t csd[16];
         make_ordinary_csd(csd, cases[i].high_capacity);
@@ -2329,6 +2402,8 @@ static void test_trim_geometry(void) {
         CHECK(config.erase_size == expected);
         bd_size_t end = device.size(&device);
         end -= end % expected;
+        // Verify wire endpoints at zero, an interior unit, and the final
+        // complete unit, then whole-device inward rounding and partial no-ops.
         const bd_size_t addresses[] = {0, expected, end - 2 * expected};
         for (size_t range = 0; range < sizeof(addresses) / sizeof(addresses[0]); ++range) {
             for (int cmd = CMD32_ERASE_WR_BLK_START_ADDR; cmd <= CMD33_ERASE_WR_BLK_END_ADDR; ++cmd) {
@@ -2360,6 +2435,8 @@ static void test_trim_geometry(void) {
 }
 
 static void test_trim_invalid_write_length(void) {
+    // With ERASE_BLK_EN clear, sub-512-byte native writes cannot supply usable
+    // trim geometry. Fail initialization in either CRC mode, before CMD16 or trim.
     for (unsigned crc = 0; crc < 2; ++crc) {
         for (unsigned write_bl_len = 0; write_bl_len < 9; ++write_bl_len) {
             reset_init_card(crc);
@@ -2408,36 +2485,18 @@ static void test_response_arithmetic(void) {
 
 
 // SPI1 RX includes GPIO24 and GPIO28 (RP2040 datasheet, section 1.4.3,
-// Table 2, pp.12-13); SD does not specify the host's GPIO routing. The
-// ordinary CSD fixture is only enough to initialize a small SDSC card.
-static void test_create_spi1_miso(unsigned miso) {
+// Table 2, pp.12-13); SD does not specify the host's GPIO routing.
+static void test_create_spi1_miso(unsigned miso, bool high_capacity) {
     reset_card();
     config.spi_inst = spi1;
-    expect_spi(0xFF, 0xFF, true, 10);
-    expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
-    expect_select();
-    expect_spi(0xFF, 0xFF, false, 1);
-    expect_command(CMD8_SEND_IF_COND, 0x1AA);
-    expect_spi(0xFF, R1_ILLEGAL_COMMAND | R1_IDLE_STATE, false, 1);
-    expect_release();
-    expect_init_command(CMD59_CRC_ON_OFF, 1, 1, 0);
-    expect_init_command(CMD58_READ_OCR, 0, 1, OCR_3_3V);
-    expect_init_command(ACMD41_SD_SEND_OP_COND, 0, 0, 0);
+    expect_card_init(false, high_capacity);
 
     uint8_t csd[16];
-    make_ordinary_csd(csd, false);
-    uint16_t crc = reference_crc16(csd, sizeof(csd));
-    expect_select();
-    expect_spi(0xFF, 0xFF, false, 1);
-    expect_command(CMD9_SEND_CSD, 0);
-    expect_spi(0xFF, 0, false, 1);
-    expect_spi(0xFF, 0xFE, false, 1);
-    for (size_t i = 0; i < sizeof(csd); ++i) {
-        expect_spi(0xFF, csd[i], false, 1);
+    make_ordinary_csd(csd, high_capacity);
+    if (high_capacity) {
+        set_csd_bits(csd, 69, 48, 0x3FFFFF);
     }
-    expect_spi(0xFF, crc >> 8, false, 1);
-    expect_spi(0xFF, crc, false, 1);
-    expect_release();
+    expect_csd(csd, false);
     expect_init_command(CMD16_SET_BLOCKLEN, 512, 0, 0);
 
     blockdevice_t *created =
@@ -2447,7 +2506,251 @@ static void test_create_spi1_miso(unsigned miso) {
     CHECK(created->is_initialized && created_config->is_initialized);
     CHECK(created_config->spi_inst == spi1 && created_config->miso == miso);
     CHECK(event_index == event_count && !created_config->_mutex.locked);
+    CHECK(created->size(created) == (high_capacity ? UINT64_C(1) << 41 : 4096 * 512));
+    CHECK(created->erase_size == 512);
+    CHECK(transfer_baudrate == 12000000 && format_calls == 1);
+    CHECK(created->deinit(created) == BD_ERROR_OK);
+    CHECK(!created_config->is_initialized && !created->is_initialized);
+    CHECK(!created_config->_mutex.locked);
     blockdevice_sd_free(created);
+}
+
+// Both scanners ignore the first three received bits, but differ in framing:
+// this driver takes the first zero as the start of a five-bit candidate, even
+// if invalid. FreeBSD requires both framing bits via mask 0x11, value 0x01.
+// Both nevertheless decode the rejection streams below as accepted.
+// https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L852-L990
+// Arbitrary shifted undefined prefixes can therefore turn rejection into success.
+// Even E5 80 is ambiguous: an aligned accepted byte followed by delayed busy,
+// or a full CRC-error byte CB shifted one bit late with immediate busy.
+// Waiting for ready only confirms busy ended; CRC does not validate ACK framing.
+// Rejecting every ambiguous interpretation could also reject compliant writes.
+// These synthetic streams characterize a known false-success limitation, not
+// successful storage or observed physical-card failures.
+static void test_write_response_prefix_ambiguity(bool multiple, bool enable_crc) {
+    static const uint8_t responses[] = {0x2B, 0x2D};
+    for (size_t i = 0; i < sizeof(responses); ++i) {
+        reset_card();
+        config.enable_crc = enable_crc;
+        if (multiple) {
+            expect_multiblock_program(0);
+        } else {
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(CMD24_WRITE_BLOCK, 0);
+            expect_spi(0xFF, 0, false, 1);
+        }
+        expect_program_data(0x31, multiple ? SPI_START_BLK_MUL_WRITE : SPI_START_BLOCK);
+        // Shift the complete xxx0sss1 byte, not just its five status bits.
+        // Four leading clocks yield F2 B0 or F2 D0 with busy following.
+        // The prefix zero is mistaken for the start of 00101 (accepted).
+        expect_response_bits(&responses[i], 8, 4, true);
+        expect_spi(0xFF, 0, false, 2);
+        expect_spi(0xFF, 0xFF, false, 1);
+        if (multiple) {
+            // The false acceptance continues through normal CMD25 stop cleanup.
+            expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 0, false);
+            expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
+            expect_spi(0xFF, 0xFF, false, 2);
+        }
+        expect_release();
+        uint8_t buffer[1024];
+        memset(buffer, 0x31, sizeof(buffer));
+        finish(program(&device, buffer, 0, multiple ? sizeof(buffer) : 512), BD_ERROR_OK);
+    }
+}
+
+static void expect_preerase(size_t blocks, uint8_t response) {
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD55_APP_CMD, 0);
+    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(ACMD23_SET_WR_BLK_ERASE_COUNT, blocks);
+    expect_spi(0xFF, response, false, 1);
+    expect_release();
+}
+
+// Byte/block address units: SD v9.10, Table 7-3, footnote 10, p.299.
+// Nonuniform three-block transfers check payload order as well as command choice.
+// The final case uses a synthetic capacity at the 32-bit LBA encoding limit,
+// not the smaller specified SDXC user-area maximum (section 5.3.3, p.235).
+static void test_patterned_io(bool writing, bool crc_enabled) {
+    static const struct {
+        uint8_t type;
+        uint64_t address;
+        size_t blocks;
+    } cases[] = {
+        {SDCARD_V1, 1024, 1}, {SDCARD_V2, 1536, 3},
+        {SDCARD_V2HC, UINT64_C(0x100000200), 1},
+        {SDCARD_V2HC, UINT64_C(0x100000200), 3},
+        {SDCARD_V2HC, (UINT64_C(1) << 41) - 512, 1},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_card();
+        config.card_type = cases[i].type;
+        config.enable_crc = crc_enabled;
+        if (config.card_type == SDCARD_V2HC) {
+            config.total_sectors = UINT64_C(1) << 32;
+        }
+        uint32_t argument = config.card_type == SDCARD_V2HC ?
+                            cases[i].address / 512 : cases[i].address;
+        uint8_t expected[1536], buffer[1536] = {0};
+        size_t length = cases[i].blocks * 512;
+        fill_pattern(expected, length);
+        if (writing) {
+            memcpy(buffer, expected, length);
+            if (cases[i].blocks > 1) {
+                expect_preerase(cases[i].blocks, 0);
+            }
+            expect_select();
+            expect_spi(0xFF, 0xFF, false, 1);
+            expect_command(cases[i].blocks > 1 ? CMD25_WRITE_MULTIPLE_BLOCK : CMD24_WRITE_BLOCK,
+                           argument);
+            expect_spi(0xFF, 0, false, 1);
+        } else {
+            expect_start(cases[i].blocks, argument, 0);
+        }
+        for (size_t block = 0; block < cases[i].blocks; ++block) {
+            if (writing) {
+                expect_write_payload(expected + block * 512, 512,
+                                     cases[i].blocks > 1 ? SPI_START_BLK_MUL_WRITE : SPI_START_BLOCK);
+                expect_spi(0xFF, 0xE5, false, 1);
+                expect_spi(0xFF, 0xFF, false, 1);
+            } else {
+                expect_status_block(expected + block * 512, 512, !crc_enabled);
+            }
+        }
+        if (cases[i].blocks > 1 && !writing) {
+            expect_stop(0, 0, 0, true);
+        } else {
+            if (cases[i].blocks > 1) {
+                expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
+                expect_spi(0xFF, 0xFF, false, 2);
+            }
+            expect_release();
+        }
+        int status = writing ? program(&device, buffer, cases[i].address, length) :
+                               read(&device, buffer, cases[i].address, length);
+        finish(status, BD_ERROR_OK);
+        CHECK(memcmp(buffer, expected, length) == 0);
+    }
+}
+
+// Commands can be rejected (SD v9.10, section 7.2.8, p.292); data phases follow
+// valid read/write commands (sections 7.2.3-7.2.4, pp.289-290). One release
+// and no follow-up after rejection are driver cleanup policy.
+static void test_transfer_rejected(void) {
+    static const int commands[] = {CMD17_READ_SINGLE_BLOCK, CMD18_READ_MULTIPLE_BLOCK,
+                                   CMD24_WRITE_BLOCK, CMD25_WRITE_MULTIPLE_BLOCK,
+                                   CMD32_ERASE_WR_BLK_START_ADDR, CMD33_ERASE_WR_BLK_END_ADDR};
+    uint8_t buffer[1024] = {0};
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+        reset_card();
+        if (commands[i] == CMD25_WRITE_MULTIPLE_BLOCK) {
+            expect_preerase(2, 0);
+        }
+        if (commands[i] == CMD33_ERASE_WR_BLK_END_ADDR) {
+            expect_init_command(CMD32_ERASE_WR_BLK_START_ADDR, 1024, 0, 0);
+        }
+        uint32_t address = commands[i] == CMD33_ERASE_WR_BLK_END_ADDR ? 1536 : 1024;
+        expect_init_command(commands[i], address, R1_ILLEGAL_COMMAND, 0);
+        int status;
+        if (commands[i] == CMD17_READ_SINGLE_BLOCK || commands[i] == CMD18_READ_MULTIPLE_BLOCK) {
+            status = read(&device, buffer, 1024,
+                          commands[i] == CMD17_READ_SINGLE_BLOCK ? 512 : 1024);
+        } else if (commands[i] == CMD24_WRITE_BLOCK || commands[i] == CMD25_WRITE_MULTIPLE_BLOCK) {
+            status = program(&device, buffer, 1024, commands[i] == CMD24_WRITE_BLOCK ? 512 : 1024);
+        } else {
+            status = trim(&device, 1024, 1024);
+        }
+        finish(status, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED);
+    }
+}
+
+// Using pre-erase is optional for the host, but successful CMD25 still needs
+// Stop Tran with or without ACMD23 (SD v9.10, Table 7-4, footnote 2, p.300).
+// Continuing after rejected pre-erase is driver policy, not required by SD.
+static void test_preerase_rejected(void) {
+    reset_card();
+    expect_preerase(2, R1_ILLEGAL_COMMAND);
+    expect_select();
+    expect_spi(0xFF, 0xFF, false, 1);
+    expect_command(CMD25_WRITE_MULTIPLE_BLOCK, 1024);
+    expect_spi(0xFF, 0, false, 1);
+    expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 0, false);
+    expect_program_block(0x31, SPI_START_BLK_MUL_WRITE, SPI_DATA_ACCEPTED, 0, false);
+    expect_spi(SPI_STOP_TRAN, 0xFF, false, 1);
+    expect_spi(0xFF, 0xFF, false, 2);
+    expect_release();
+    uint8_t buffer[1024];
+    memset(buffer, 0x31, sizeof(buffer));
+    finish(program(&device, buffer, 1024, sizeof(buffer)), BD_ERROR_OK);
+}
+
+// CMD32/CMD33 endpoints are inclusive (SD v9.10, Table 7-3, p.298);
+// one-block trim has equal endpoints. The 250 ms/block estimate comes from
+// section 4.6.2.3, p.96; retaining the command-timeout floor is host policy.
+static void test_trim_boundaries(bool high_capacity) {
+    for (unsigned wide = 0; wide < (high_capacity ? 2u : 1u); ++wide) {
+        reset_card();
+        config.card_type = high_capacity ? SDCARD_V2HC : SDCARD_V1;
+        config.total_sectors = high_capacity ? UINT64_C(1) << 32 : 4096;
+        uint64_t address = wide ? UINT64_C(0x100000200) : 1024;
+        uint32_t argument = high_capacity ? address / 512 : address;
+        expect_init_command(CMD32_ERASE_WR_BLK_START_ADDR, argument, 0, 0);
+        expect_init_command(CMD33_ERASE_WR_BLK_END_ADDR, argument, 0, 0);
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        expect_command(CMD38_ERASE, 0);
+        expect_spi(0xFF, 0, false, 1);
+        uint64_t timeout = SD_COMMAND_TIMEOUT > 250 ? SD_COMMAND_TIMEOUT : 250;
+        expect_spi(0xFF, 0, false, timeout);
+        expect_release();
+        finish(trim(&device, address, 512), SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
+    }
+}
+
+static void test_init_inputs(void) {
+    static const struct {
+        uint32_t r7;
+        uint32_t ocr;
+    } cases[] = {{0x1AB, OCR_3_3V}, {0x2AA, OCR_3_3V}, {0x1AA, 0}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        reset_init_card(false);
+        expect_spi(0xFF, 0xFF, true, 10);
+        expect_init_command(CMD0_GO_IDLE_STATE, 0, 1, 0);
+        expect_init_command(CMD8_SEND_IF_COND, 0x1AA, 1, cases[i].r7);
+        if (cases[i].r7 == 0x1AA) {
+            expect_init_command(CMD58_READ_OCR, 0, 1, cases[i].ocr);
+        }
+        finish_init_failure(SD_BLOCK_DEVICE_ERROR_UNUSABLE);
+    }
+}
+
+// CMD0 enters SPI idle (SD v9.10, section 7.2.1, p.287).
+// Retry count and sleeps are driver policy, not a prescribed reset sequence.
+static void test_idle_retries(bool exhausted) {
+    reset_card();
+    time_step_us = 0;
+    for (unsigned i = 0; i < (exhausted ? SD_CMD0_GO_IDLE_STATE_RETRIES : 2u); ++i) {
+        expect_init_command(CMD0_GO_IDLE_STATE, 0, !exhausted && i == 1 ? 1 : 0, 0);
+    }
+    finish(_go_idle_state(&config), exhausted ? 0 : R1_IDLE_STATE);
+    CHECK(now_us == (exhausted ? SD_CMD0_GO_IDLE_STATE_RETRIES : 1u) * 1000);
+}
+
+// Default-speed TRAN_SPEED is 25 MHz; 50 MHz needs High-Speed mode
+// (SD v9.10, section 5.3.2, p.227). Clamp/error behavior is driver policy.
+static void test_frequency(void) {
+    static const uint32_t frequencies[] = {12000000, 25000000, 30000000};
+    for (size_t i = 0; i < sizeof(frequencies) / sizeof(frequencies[0]); ++i) {
+        reset_card();
+        config.hz = frequencies[i];
+        finish(_freq(&config), i == 2 ? -EINVAL : BD_ERROR_OK);
+        CHECK(transfer_baudrate == (i == 2 ? 25000000 : frequencies[i]));
+        CHECK(config.hz == transfer_baudrate);
+    }
 }
 
 int main(void) {
@@ -2459,8 +2762,10 @@ int main(void) {
     RUN_CASE("sd-status-token-rejection", test_register_token_rejection(true));
     RUN_CASE("multiblock-token-rejection", test_multiblock_token_rejection());
     RUN_CASE("response-arithmetic", test_response_arithmetic());
-    RUN_CASE("create-spi1-miso24", test_create_spi1_miso(24));
-    RUN_CASE("create-spi1-miso28", test_create_spi1_miso(28));
+    RUN_CASE("create-spi1-miso24", test_create_spi1_miso(24, false));
+    RUN_CASE("create-spi1-miso28", test_create_spi1_miso(28, false));
+    RUN_CASE("create-spi1-miso24-sdhc", test_create_spi1_miso(24, true));
+    RUN_CASE("create-spi1-miso28-sdhc", test_create_spi1_miso(28, true));
     RUN_CASE("initialized-invalid-io", test_initialized_invalid_io());
     RUN_CASE("cold-sdsc-crc", test_cold_init(false, true));
     RUN_CASE("cold-sdsc-no-crc", test_cold_init(false, false));
@@ -2567,6 +2872,11 @@ int main(void) {
     RUN_CASE("stop-max-response-delay", test_stop_status(0, BD_ERROR_OK, 7));
     RUN_CASE("stop-idle", test_stop_status(0x01, SD_BLOCK_DEVICE_ERROR_NO_INIT, 2));
     RUN_CASE("idle-cmd16", test_idle_command(16, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd9", test_idle_command(9, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd17", test_idle_command(17, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd18", test_idle_command(18, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd24", test_idle_command(24, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
+    RUN_CASE("idle-cmd25", test_idle_command(25, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
     RUN_CASE("idle-cmd32", test_idle_command(32, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
     RUN_CASE("idle-cmd33", test_idle_command(33, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
     RUN_CASE("idle-cmd38", test_idle_command(38, false, 1, SD_BLOCK_DEVICE_ERROR_NO_INIT));
@@ -2589,7 +2899,8 @@ int main(void) {
     RUN_CASE("trim-busy-timeout", test_trim_busy(true, true, false));
     RUN_CASE("trim-busy-wrap", test_trim_busy(true, false, true));
     RUN_CASE("init-clock", test_init_clock());
-    RUN_CASE("trim-geometry", test_trim_geometry());
+    RUN_CASE("trim-geometry", test_trim_geometry(true));
+    RUN_CASE("trim-geometry-crc-disabled", test_trim_geometry(false));
     RUN_CASE("trim-invalid-write-length", test_trim_invalid_write_length());
     RUN_CASE("advisory-trim-sdsc", test_advisory_trim(false));
     RUN_CASE("advisory-trim-sdhc", test_advisory_trim(true));
@@ -2598,5 +2909,23 @@ int main(void) {
     RUN_CASE("trim-sdhc-rounded-timeout", test_trim_rounded_timeout(true));
     RUN_CASE("trim-rounded-rejection", test_trim_rounded_rejection());
     RUN_CASE("trim-partial-tail-format", test_trim_partial_tail_format());
+    RUN_CASE("init-inputs", test_init_inputs());
+    RUN_CASE("idle-retries", test_idle_retries(false));
+    RUN_CASE("idle-exhausted", test_idle_retries(true));
+    RUN_CASE("frequency", test_frequency());
+    RUN_CASE("patterned-read", test_patterned_io(false, true));
+    RUN_CASE("patterned-read-crc-disabled", test_patterned_io(false, false));
+    RUN_CASE("patterned-program", test_patterned_io(true, true));
+    RUN_CASE("patterned-program-crc-disabled", test_patterned_io(true, false));
+    RUN_CASE("transfer-rejected", test_transfer_rejected());
+    RUN_CASE("preerase-rejected", test_preerase_rejected());
+    RUN_CASE("trim-sdsc-boundaries", test_trim_boundaries(false));
+    RUN_CASE("trim-sdhc-boundaries", test_trim_boundaries(true));
+    RUN_CASE("singleblock-prefix-ambiguity", test_write_response_prefix_ambiguity(false, true));
+    RUN_CASE("singleblock-prefix-ambiguity-no-crc",
+             test_write_response_prefix_ambiguity(false, false));
+    RUN_CASE("multiblock-prefix-ambiguity", test_write_response_prefix_ambiguity(true, true));
+    RUN_CASE("multiblock-prefix-ambiguity-no-crc",
+             test_write_response_prefix_ambiguity(true, false));
     return EXIT_SUCCESS;
 }

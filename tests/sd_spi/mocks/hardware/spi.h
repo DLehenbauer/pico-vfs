@@ -17,8 +17,6 @@ extern spi_inst_t mock_spi_instances[2];
 int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, size_t len);
 int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, size_t len);
 int spi_write_blocking(spi_inst_t *spi, const uint8_t *src, size_t len);
-
 unsigned spi_init(spi_inst_t *spi, unsigned baudrate);
-
 unsigned spi_set_baudrate(spi_inst_t *spi, unsigned baudrate);
 void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha, unsigned order);
