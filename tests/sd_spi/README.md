@@ -11,8 +11,7 @@ deselection and duplicate cleanup, fail. CRC7 and CRC16 expectations use
 independent bitwise implementations rather than the driver's lookup tables.
 
 Scenario rationale, protocol citations, and compatibility limitations are
-documented beside the relevant expectations and assertions in
-[`test_sd_spi.c`](test_sd_spi.c).
+documented beside the relevant expectations and assertions in the source.
 
 ## Running
 
@@ -24,6 +23,19 @@ cmake -S tests/sd_spi -B build/sd-spi -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/sd-spi
 ctest --test-dir build/sd-spi --output-on-failure
 ```
+
+CI runs the suite in Debug and Release, and with AddressSanitizer and
+nonrecovering UndefinedBehaviorSanitizer:
+
+```bash
+cmake -S tests/sd_spi -B build/sd-spi-sanitized \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+cmake --build build/sd-spi-sanitized --target sd_spi_tests
+UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/sd-spi-sanitized --output-on-failure
+```
+
+For the combined host build, see [`../README.md`](../README.md).
 
 ## Specification references
 

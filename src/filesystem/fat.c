@@ -15,6 +15,8 @@
 #include "ff.h"
 #include "diskio.h"
 
+_Static_assert(sizeof(LBA_t) >= sizeof(bd_size_t),
+               "FatFs adapter requires 64-bit LBA_t (FF_LBA64=1)");
 
 typedef struct {
     FIL file;
@@ -101,9 +103,53 @@ static WORD disk_get_sector_size(BYTE pdrv) {
     return ssize;
 }
 
-static DWORD disk_get_sector_count(BYTE pdrv) {
-    DWORD scount = (_ffs[(int)pdrv]->size(_ffs[(int)pdrv])) / disk_get_sector_size(pdrv);
-    return scount;
+static LBA_t disk_get_sector_count(BYTE pdrv) {
+    // floor(byte capacity / sector size) leaves any trailing bytes unused
+    // rather than treating them as an error.
+    //
+    // Sector-based drivers such as SD are responsible for reporting correctly
+    // aligned geometry.  We don't enforce alignment here.
+    return _ffs[pdrv]->size(_ffs[pdrv]) / disk_get_sector_size(pdrv);
+}
+
+// Convert a sector range on a registered drive to bytes.
+static bool disk_get_byte_range(BYTE pdrv, LBA_t sector, LBA_t count,
+                               bd_size_t *addr, bd_size_t *size) {
+    const LBA_t sectors = disk_get_sector_count(pdrv);
+
+    // Short-circuiting checks sector <= sectors before subtracting. Comparing
+    // count to the remaining sectors avoids an overflowing sector + count.
+    // Empty ranges, including at the end of the device, reach the backend so
+    // it retains responsibility for accepting or rejecting zero-byte transfers.
+    if (sector > sectors || count > sectors - sector) {
+        // No output has been written, so failure leaves both outputs unchanged.
+        return false;
+    }
+
+    const bd_size_t ssize = disk_get_sector_size(pdrv);
+
+    // Both sector and count are bounded by floor(byte capacity / ssize), so
+    // each product fits bd_size_t. Multiply in that type, not 32-bit arithmetic.
+    *addr = (bd_size_t)sector * ssize;
+    *size = (bd_size_t)count * ssize;
+    return true;
+}
+
+// Convert inclusive sector endpoints using the shared bounds and byte conversion.
+static bool disk_get_byte_range_inclusive(BYTE pdrv, LBA_t first, LBA_t last,
+                                         bd_size_t *addr, bd_size_t *size) {
+    if (first > last) {
+        return false;
+    }
+
+    const LBA_t count = last - first;
+
+    // Ensure count + 1 does not overflow LBA_t.
+    if (count == (LBA_t)-1) {
+        return false;
+    }
+
+    return disk_get_byte_range(pdrv, first, count + 1, addr, size);
 }
 
 DSTATUS disk_status(BYTE pdrv) {
@@ -112,18 +158,20 @@ DSTATUS disk_status(BYTE pdrv) {
 }
 
 DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count) {
-    DWORD ssize = disk_get_sector_size(pdrv);
-    bd_size_t addr = (bd_size_t)sector * ssize;
-    bd_size_t size = count * ssize;
+    bd_size_t addr, size;
+    if (!disk_get_byte_range(pdrv, sector, count, &addr, &size)) {
+        return RES_PARERR;
+    }
     int err = _ffs[(int)pdrv]->read(_ffs[(int)pdrv], (const void *)buff, addr, size);
     return err ? RES_PARERR : RES_OK;
 }
 
 DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count) {
     debug_if(FFS_DBG, "disk_write [%d]\n", pdrv);
-    DWORD ssize = disk_get_sector_size(pdrv);
-    bd_size_t addr = (bd_size_t)sector * ssize;
-    bd_size_t size = count * ssize;
+    bd_size_t addr, size;
+    if (!disk_get_byte_range(pdrv, sector, count, &addr, &size)) {
+        return RES_PARERR;
+    }
 
     int err = _ffs[pdrv]->erase(_ffs[pdrv], addr, size);
     if (err) {
@@ -151,7 +199,8 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
         if (_ffs[pdrv] == NULL) {
             return RES_NOTRDY;
         } else {
-            *((DWORD *)buff) = disk_get_sector_count(pdrv);
+            // FatFs supplies an LBA_t destination, not a DWORD, with FF_LBA64.
+            *((LBA_t *)buff) = disk_get_sector_count(pdrv);
             return RES_OK;
         }
     case GET_SECTOR_SIZE:
@@ -168,10 +217,12 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
         if (_ffs[pdrv] == NULL) {
             return RES_NOTRDY;
         } else {
-            DWORD *sectors = (DWORD *)buff;
-            DWORD ssize = disk_get_sector_size(pdrv);
-            bd_size_t addr = (bd_size_t)sectors[0] * ssize;
-            bd_size_t size = (bd_size_t)(sectors[1] - sectors[0] + 1) * ssize;
+            // FatFs supplies LBA_t[2] with an inclusive last sector.
+            const LBA_t *sectors = (const LBA_t *)buff;
+            bd_size_t addr, size;
+            if (!disk_get_byte_range_inclusive(pdrv, sectors[0], sectors[1], &addr, &size)) {
+                return RES_PARERR;
+            }
             int err = _ffs[pdrv]->trim(_ffs[pdrv], addr, size);
             return err ? RES_PARERR : RES_OK;
         }
