@@ -137,11 +137,9 @@ void spi_set_format(spi_inst_t *spi, unsigned bits, unsigned cpol, unsigned cpha
 
 int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, size_t len) {
     CHECK(spi == config.spi_inst);
+    CHECK(len == 0 || (src != NULL && dst != NULL));
     for (size_t i = 0; i < len; ++i) {
-        uint8_t rx = exchange(src[i]);
-        if (dst) {
-            dst[i] = rx;
-        }
+        dst[i] = exchange(src[i]);
     }
     return (int)len;
 }
@@ -155,7 +153,12 @@ int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, s
 }
 
 int spi_write_blocking(spi_inst_t *spi, const uint8_t *src, size_t len) {
-    return spi_write_read_blocking(spi, src, NULL, len);
+    CHECK(spi == config.spi_inst);
+    CHECK(len == 0 || src != NULL);
+    for (size_t i = 0; i < len; ++i) {
+        exchange(src[i]);
+    }
+    return (int)len;
 }
 
 void gpio_set_dir(unsigned gpio, bool out) {
@@ -2512,8 +2515,10 @@ static void test_create_spi1_miso(unsigned miso, bool high_capacity) {
     blockdevice_sd_free(created);
 }
 
-// FreeBSD corroborates the heuristic: ignore the first three received bits,
-// then take the first zero as the start of a five-bit candidate, even if invalid.
+// Both scanners ignore the first three received bits, but differ in framing:
+// this driver takes the first zero as the start of a five-bit candidate, even
+// if invalid. FreeBSD requires both framing bits via mask 0x11, value 0x01.
+// Both nevertheless decode the rejection streams below as accepted.
 // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L852-L990
 // Arbitrary shifted undefined prefixes can therefore turn rejection into success.
 // Even E5 80 is ambiguous: an aligned accepted byte followed by delayed busy,

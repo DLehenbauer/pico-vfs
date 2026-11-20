@@ -244,7 +244,7 @@ static uint8_t _spi_write(void *_config, uint8_t data) {
 static void _spi_wait(void *_config, size_t count) {
     blockdevice_sd_config_t *config = _config;
     for (size_t i = 0; i < count; i++) {
-        spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, sizeof(SPI_FILL_CHAR));
+        spi_write_blocking(config->spi_inst, &SPI_FILL_CHAR, sizeof(SPI_FILL_CHAR));
     }
 }
 
@@ -272,7 +272,7 @@ static void _spi_init(void *_config) {
 
 static void _preclock_then_select(void *_config) {
     blockdevice_sd_config_t *config = _config;
-    spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, sizeof(SPI_FILL_CHAR));
+    spi_write_blocking(config->spi_inst, &SPI_FILL_CHAR, sizeof(SPI_FILL_CHAR));
     gpio_put(config->cs, 0);
 }
 
@@ -287,7 +287,7 @@ static void _postclock_then_deselect(void *_config) {
     // Busy DataOut releases one clock after CS rises (SanDisk v2.2, section 5.23.2, p.5-17).
     // Send a full byte, following Elm-Chan multi-slave guidance: "send a byte after the
     // CS signal is deasserted." (See: https://elm-chan.org/docs/mmc/mmc_e.html#spibus)
-    spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, sizeof(SPI_FILL_CHAR));
+    spi_write_blocking(config->spi_inst, &SPI_FILL_CHAR, sizeof(SPI_FILL_CHAR));
 }
 
 static inline void debug_if(int condition, const char *format, ...) {
@@ -397,12 +397,12 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
 
     // send a command
     for (int i = 0; i < PACKET_SIZE; i++) {
-        spi_write_read_blocking(config->spi_inst, (const uint8_t *)&cmd_packet[i], NULL, 1);
+        spi_write_blocking(config->spi_inst, (const uint8_t *)&cmd_packet[i], 1);
     }
 
     // Ignore the first post-command byte, as FreeBSD does: it may be
     // garbage. This also covers CMD12's stuff byte, without a second discard.
-    spi_write_read_blocking(config->spi_inst, &SPI_FILL_CHAR, NULL, 1);
+    spi_write_blocking(config->spi_inst, &SPI_FILL_CHAR, 1);
 
     // N_CR = 1..8 byte-times before R1 (SanDisk v2.2, Table 5-5, p.5-19).
     // Poll up to 16 bytes for R1's start bit to accommodate slow cards. This is
