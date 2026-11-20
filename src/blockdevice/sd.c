@@ -1261,8 +1261,10 @@ static bool _is_valid_trim(blockdevice_t *device, bd_size_t addr, bd_size_t size
     blockdevice_sd_config_t *config = device->config;
 
     bd_size_t capacity = device->size(device);
-    return (size != 0 && addr <= capacity && size <= capacity - addr &&
-            config->erase_size != 0);
+
+    // Note that `size == 0` is considered valid, per the blockdevice contract.
+    return (addr <= capacity && size <= capacity - addr &&
+            config->erase_size != 0);   // Missing geometry is an invalid device state.
 }
 
 // Trim is a performance hint, not erase-before-write. SPI does not support

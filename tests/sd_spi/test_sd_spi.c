@@ -2036,7 +2036,7 @@ static void test_invalid_io(void) {
         uint64_t length;
         bool trim_invalid;
     } cases[] = {
-        {0, 0, true}, {1, 512, false}, {0, 511, false},
+        {0, 0, false}, {1, 512, false}, {0, 511, false},
         {4096 * 512, 512, true}, {4096 * 512 - 512, 1024, true},
         {UINT64_MAX - 511, 512, true}, {512, UINT64_MAX - 511, true},
     };
@@ -2250,8 +2250,21 @@ static void test_advisory_trim(bool high_capacity) {
     }
 }
 
+static void test_trim_empty(void) {
+    const bd_size_t addresses[] = {0, 1, 1024, 4096 * 512};
+    const bd_size_t erase_sizes[] = {512, 1024};
+    for (size_t i = 0; i < sizeof(erase_sizes) / sizeof(erase_sizes[0]); ++i) {
+        for (size_t j = 0; j < sizeof(addresses) / sizeof(addresses[0]); ++j) {
+            reset_card();
+            config.erase_size = erase_sizes[i];
+            // No SPI events are queued, even for an unaligned empty range.
+            finish(device.trim(&device, addresses[j], 0), BD_ERROR_OK);
+        }
+    }
+}
+
 static void test_trim_invalid_bounds(void) {
-    // Validate the original byte range before rounding; empty/out-of-bounds
+    // Validate the original byte range before rounding; out-of-bounds
     // ranges, overflow, and unknown erase granularity must fail without SPI I/O.
     static const struct {
         bd_size_t addr;
@@ -2259,8 +2272,7 @@ static void test_trim_invalid_bounds(void) {
     } cases[] = {
         {4096 * 512, 512},
         {4096 * 512 + 1, 0},
-        {1024, 0},
-        {4096 * 512, 0},
+        {UINT64_MAX, 0},
         {4096 * 512 - 512, 1024},
         {UINT64_MAX - 511, 512},
         {512, UINT64_MAX - 511},
@@ -2271,6 +2283,7 @@ static void test_trim_invalid_bounds(void) {
     }
     reset_card();
     config.erase_size = 0;
+    finish(trim(&device, 0, 0), SD_BLOCK_DEVICE_ERROR_PARAMETER);
     finish(trim(&device, 0, 512), SD_BLOCK_DEVICE_ERROR_PARAMETER);
 }
 
@@ -2905,6 +2918,7 @@ int main(void) {
     RUN_CASE("trim-invalid-write-length", test_trim_invalid_write_length());
     RUN_CASE("advisory-trim-sdsc", test_advisory_trim(false));
     RUN_CASE("advisory-trim-sdhc", test_advisory_trim(true));
+    RUN_CASE("trim-empty", test_trim_empty());
     RUN_CASE("trim-invalid-bounds", test_trim_invalid_bounds());
     RUN_CASE("trim-sdsc-rounded-timeout", test_trim_rounded_timeout(false));
     RUN_CASE("trim-sdhc-rounded-timeout", test_trim_rounded_timeout(true));

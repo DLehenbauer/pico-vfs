@@ -126,10 +126,15 @@ static void test_api_erase_program_read(blockdevice_t *device) {
     printf(COLOR_GREEN("ok\n"));
 }
 
-static void test_api_trim(blockdevice_t *device) {
-    test_printf("trim");
+static void test_api_trim_empty(blockdevice_t *device) {
+    test_printf("trim (empty range)");
 
+    // Empty trim at the beginning of the device
     int err = device->trim(device, 0, 0);
+    assert(err == BD_ERROR_OK);
+
+    // Empty trim at the end of the device
+    err = device->trim(device, device->size(device), 0);
     assert(err == BD_ERROR_OK);
 
     printf(COLOR_GREEN("ok\n"));
@@ -165,7 +170,7 @@ void test_blockdevice(void) {
 
     test_api_init(flash);
     test_api_erase_program_read(flash);
-    test_api_trim(flash);
+    test_api_trim_empty(flash);
     test_api_sync(flash);
     test_api_size(flash);
     test_api_attribute(flash);
@@ -187,7 +192,7 @@ void test_blockdevice(void) {
 
         test_api_init(sd);
         test_api_erase_program_read(sd);
-        test_api_trim(sd);
+        test_api_trim_empty(sd);
         test_api_sync(sd);
         test_api_size(sd);
         test_api_attribute(sd);
@@ -206,7 +211,7 @@ void test_blockdevice(void) {
 
     test_api_init(heap);
     test_api_erase_program_read(heap);
-    test_api_trim(heap);
+    test_api_trim_empty(heap);
     test_api_sync(heap);
     test_api_size(heap);
     test_api_attribute(heap);
@@ -229,7 +234,7 @@ void test_blockdevice(void) {
 
     test_api_init(loopback);
     test_api_erase_program_read(loopback);
-    test_api_trim(loopback);
+    test_api_trim_empty(loopback);
     test_api_sync(loopback);
     test_api_size(loopback);
     test_api_attribute(loopback);
