@@ -19,4 +19,5 @@ target_link_libraries(host PRIVATE
 if(PICO_PLATFORM STREQUAL "host")
   add_test(NAME host COMMAND host)
   add_subdirectory(../sd_spi sd_spi)
+  add_subdirectory(../fat_disk fat_disk)
 endif()
