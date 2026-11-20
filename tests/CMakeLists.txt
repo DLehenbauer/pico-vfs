@@ -1,4 +1,6 @@
-set(CMAKE_BUILD_TYPE Debug)
+if(NOT PICO_PLATFORM STREQUAL "host")
+  set(CMAKE_BUILD_TYPE Debug)
+endif()
 
 add_executable(unittests
   main.c

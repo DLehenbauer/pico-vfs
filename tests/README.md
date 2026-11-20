@@ -33,6 +33,16 @@ cmake --build build/sd-spi
 ctest --test-dir build/sd-spi --output-on-failure
 ```
 
-The host CI workflow builds both host executables in the same CMake build and
-runs both suites with CTest. The standalone commands above remain available
-without the Pico SDK.
+The host CI workflow builds both host executables in Debug and Release and
+runs both suites with CTest. It also runs the standalone SD SPI suite with
+AddressSanitizer and nonrecovering UndefinedBehaviorSanitizer:
+
+```bash
+cmake -S tests/sd_spi -B build/sd-spi-sanitized \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+cmake --build build/sd-spi-sanitized --target sd_spi_tests
+UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build/sd-spi-sanitized --output-on-failure
+```
+
+The standalone commands remain available without the Pico SDK.

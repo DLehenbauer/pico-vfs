@@ -146,6 +146,7 @@ int spi_write_read_blocking(spi_inst_t *spi, const uint8_t *src, uint8_t *dst, s
 
 int spi_read_blocking(spi_inst_t *spi, uint8_t repeated_tx_data, uint8_t *dst, size_t len) {
     CHECK(spi == config.spi_inst);
+    CHECK(len == 0 || dst != NULL);
     for (size_t i = 0; i < len; ++i) {
         dst[i] = exchange(repeated_tx_data);
     }

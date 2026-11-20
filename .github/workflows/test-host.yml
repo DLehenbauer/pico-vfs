@@ -1,11 +1,13 @@
 name: Run unittests
 on: [push]
-env:
-  BUILD_TYPE: Debug
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type: [Debug, Release]
+    env:
+      BUILD_TYPE: ${{ matrix.build_type }}
 
     steps:
     - name: Clean workspace
@@ -57,3 +59,16 @@ jobs:
       working-directory: ${{github.workspace}}/pico-vfs/build
       shell: bash
       run: ctest -C $BUILD_TYPE --output-on-failure
+
+    - name: Test SD SPI with AddressSanitizer and UndefinedBehaviorSanitizer
+      if: matrix.build_type == 'Debug'
+      working-directory: ${{github.workspace}}/pico-vfs
+      shell: bash
+      env:
+        UBSAN_OPTIONS: halt_on_error=1
+      run: |
+        cmake -S tests/sd_spi -B build/sd-spi-sanitized \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+        cmake --build build/sd-spi-sanitized --target sd_spi_tests
+        ctest --test-dir build/sd-spi-sanitized --output-on-failure

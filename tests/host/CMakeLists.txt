@@ -1,5 +1,3 @@
-set(CMAKE_BUILD_TYPE Debug)
-
 add_executable(host
   main.c
   test_blockdevice.c
