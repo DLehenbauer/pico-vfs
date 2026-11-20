@@ -36,6 +36,15 @@ typedef struct blockdevice {
     int (*read)(struct blockdevice *device, const void *buffer, bd_size_t addr, bd_size_t size);
     int (*program)(struct blockdevice *device, const void *buffer, bd_size_t addr, bd_size_t size);
     int (*erase)(struct blockdevice *device, bd_size_t addr, bd_size_t size);
+    /*! \brief Advisory trim operation
+     *
+     * trim() is an advisory performance hint, not erase-before-write or secure
+     * deletion. It acts only on complete trim units within [addr, addr + size).
+     * A range that covers no complete trim units succeeds without card I/O.
+     *
+     * Device initialization and range validation apply before rounding. See the
+     * device documentation for trim granularity and other requirements.
+     */
     int (*trim)(struct blockdevice *device, bd_size_t addr, bd_size_t size);
     bd_size_t (*size)(struct blockdevice *device);
     size_t read_size;

@@ -33,7 +33,8 @@ extern "C" {
  *
  * trim() is an advisory performance hint, not erase-before-write or secure
  * deletion. It acts only on complete CSD-derived erase units within the
- * requested range. A range with no complete unit succeeds without card I/O.
+ * requested range. A valid range with no complete unit succeeds without
+ * card I/O.
  *
  * \param spi_inst SPI instance, as defined in the pico-sdk hardware_spi library
  * \param mosi SPI Master Out Slave In(TX) pin
