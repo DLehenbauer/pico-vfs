@@ -2709,6 +2709,7 @@ static void test_response_errors(unsigned shift) {
 static void test_response_no_reply(bool app, bool lose_prefix) {
     for (unsigned discard = 0; discard < 2; ++discard) {
         reset_card();
+        observing_ready_io = true;
         expect_select();
         expect_spi(0xFF, 0xFF, false, 1);
         for (unsigned attempt = 0; attempt < 3; ++attempt) {
@@ -2727,13 +2728,14 @@ static void test_response_no_reply(bool app, bool lose_prefix) {
         expect_release();
         sd_command_response_t response;
         memset(&response, 0xA5, sizeof(response));
-        finish(_cmd(&config, CMD13_SEND_STATUS, 0, app, discard ? NULL : &response),
-               SD_BLOCK_DEVICE_ERROR_NO_DEVICE);
+        mutex_enter_blocking(&config._mutex);
+        int status = _cmd(&config, CMD13_SEND_STATUS, 0, app, discard ? NULL : &response);
         if (!discard) {
             CHECK(response.valid == (app && !lose_prefix ? SD_RESP_PREFIX : 0));
             CHECK(response.prefix_r1 == (app && !lose_prefix ? R1_IDLE_STATE : 0));
             CHECK(response.r1 == 0 && response.r2 == 0 && response.payload == 0);
         }
+        finish_r2_and_read(status, SD_BLOCK_DEVICE_ERROR_NO_DEVICE);
     }
 }
 
@@ -2994,6 +2996,41 @@ static void test_idle_retries(bool exhausted) {
     CHECK(now_us == (exhausted ? SD_CMD0_GO_IDLE_STATE_RETRIES : 1u) * 1000);
 }
 
+static void test_idle_no_response(bool busy) {
+    reset_card();
+    config.is_initialized = device.is_initialized = false;
+    if (!busy) {
+        time_step_us = 0;
+    }
+    // An earlier error-bearing R1 must not replace the absent final R1.
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, R1_IDLE_STATE | R1_COM_CRC_ERROR, 0);
+    for (unsigned i = 1; i < SD_CMD0_GO_IDLE_STATE_RETRIES; ++i) {
+        expect_select();
+        expect_spi(0xFF, busy ? 0 : 0xFF, false, busy ? SD_COMMAND_TIMEOUT : 1);
+        if (!busy) {
+            for (unsigned retry = 0; retry < 3; ++retry) {
+                expect_command(CMD0_GO_IDLE_STATE, 0);
+                expect_spi(0xFF, 0xFF, false, 16);
+            }
+        }
+        expect_release();
+    }
+    mutex_enter_blocking(&config._mutex);
+    uint8_t r1 = _go_idle_state(&config);
+    CHECK(config._mutex.locked);
+    CHECK(cs_high);
+    mutex_exit(&config._mutex);
+    finish(r1, R1_NO_RESPONSE);
+    if (!busy) {
+        CHECK(now_us == SD_CMD0_GO_IDLE_STATE_RETRIES * 1000);
+    }
+
+    // CMD0 may reset the card, so recover through public init before public I/O.
+    expect_top_init_setup(0, false);
+    finish_lifecycle(init, BD_ERROR_OK);
+    exercise_initialized_io(2048);
+}
+
 // Default-speed TRAN_SPEED is 25 MHz; 50 MHz needs High-Speed mode
 // (SD v9.10, section 5.3.2, p.227). Clamp/error behavior is driver policy.
 static void test_frequency(void) {
@@ -3177,6 +3214,8 @@ int main(void) {
     RUN_CASE("init-inputs", test_init_inputs());
     RUN_CASE("idle-retries", test_idle_retries(false));
     RUN_CASE("idle-exhausted", test_idle_retries(true));
+    RUN_CASE("idle-no-response", test_idle_no_response(false));
+    RUN_CASE("idle-readiness-timeout", test_idle_no_response(true));
     RUN_CASE("frequency", test_frequency());
     RUN_CASE("patterned-read", test_patterned_io(false, true));
     RUN_CASE("patterned-read-crc-disabled", test_patterned_io(false, false));

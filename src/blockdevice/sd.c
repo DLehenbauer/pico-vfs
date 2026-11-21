@@ -96,28 +96,28 @@ static void _response_reset(sd_command_response_t *resp) {
 }
 
 static void _response_set_prefix_r1(sd_command_response_t *resp, uint8_t r1) {
-    assert(resp->valid == 0);          // CMD55 must be the first response recorded in an attempt.
-    assert(!(r1 & R1_RESPONSE_RECV));  // Valid R1 has bit 7 clear; this also excludes 0xFF (no response).
+    assert(resp->valid == 0);           // CMD55 must be the first response recorded in an attempt.
+    assert(!(r1 & R1_RESPONSE_RECV));   // Valid R1 has bit 7 clear; this also excludes 0xFF (no response).
     resp->prefix_r1 = r1;
     resp->valid |= SD_RESP_PREFIX;
 }
 
 static void _response_set_r1(sd_command_response_t *resp, uint8_t r1) {
-    assert((resp->valid & ~SD_RESP_PREFIX) == 0);  // Only an optional CMD55 prefix may precede command R1.
-    assert(!(r1 & R1_RESPONSE_RECV));             // Valid R1 has bit 7 clear; this also excludes 0xFF.
+    assert((resp->valid & ~SD_RESP_PREFIX) == 0);   // Only an optional CMD55 prefix may precede command R1.
+    assert(!(r1 & R1_RESPONSE_RECV));               // Valid R1 has bit 7 clear; this also excludes 0xFF.
     resp->r1 = r1;
     resp->valid |= SD_RESP_R1;
 }
 
 static void _response_set_r2(sd_command_response_t *resp, uint8_t second) {
-    assert(resp->valid & SD_RESP_R1);                   // Continuation requires the command's R1 first.
+    assert(resp->valid & SD_RESP_R1);                       // Continuation requires the command's R1 first.
     assert(!(resp->valid & (SD_RESP_R2 | SD_RESP_R3_R7)));  // No duplicate or conflicting continuation.
     resp->r2 = second;
     resp->valid |= SD_RESP_R2;
 }
 
 static void _response_set_r3_r7(sd_command_response_t *resp, uint32_t payload) {
-    assert(resp->valid & SD_RESP_R1);                   // Continuation requires the command's R1 first.
+    assert(resp->valid & SD_RESP_R1);                       // Continuation requires the command's R1 first.
     assert(!(resp->valid & (SD_RESP_R2 | SD_RESP_R3_R7)));  // No duplicate or conflicting continuation.
     resp->payload = payload;
     resp->valid |= SD_RESP_R3_R7;
@@ -505,7 +505,7 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
 //
 // Readiness timeouts leave no command R1. R1b busy timeouts retain received R1.
 // Early rejections omit continuation fields without extra reads. Other R1
-// errors preserve any decoded continuation. NULL resp only discards output.
+// errors preserve any decoded continuation. NULL resp discards output.
 static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_acmd,
                                   sd_command_response_t *resp, uint64_t busy_timeout) {
     blockdevice_sd_config_t *config = _config;
@@ -833,6 +833,7 @@ static int init_card(void *_config) {
     if (!config->enable_crc) {
         // CMD59 bit 0 selects CRC mode (SD v3.01, Table 7-3, p.126).
         // Only send zero when CRC is disabled. Otherwise retain the enabled mode.
+        // Only the return status is needed. NULL leaves the earlier response untouched.
         status = _cmd(config, CMD59_CRC_ON_OFF, config->enable_crc, 0x0, NULL);
     }
     return status;
