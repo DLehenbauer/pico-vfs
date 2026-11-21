@@ -1103,9 +1103,14 @@ static void test_command_alignment(unsigned shift) {
         {CMD58_READ_OCR, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
         {CMD58_READ_OCR, false, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
         {CMD13_SEND_STATUS, false, {0, 0x5A}, 2, 0x5A, BD_ERROR_OK},
+        {CMD13_SEND_STATUS, false, {1, 0x80}, 2, 0x0180,
+         SD_BLOCK_DEVICE_ERROR_NO_INIT},
         {CMD13_SEND_STATUS, false, {2, 0x5A}, 2, 0x025A, SD_BLOCK_DEVICE_ERROR_ERASE},
         {CMD13_SEND_STATUS, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
+        {ACMD13_SD_STATUS, true, {0, 0}, 2, 0, BD_ERROR_OK},
         {ACMD13_SD_STATUS, true, {0, 0xA5}, 2, 0xA5, BD_ERROR_OK},
+        {ACMD13_SD_STATUS, true, {1, 0x80}, 2, 0x0180,
+         SD_BLOCK_DEVICE_ERROR_NO_INIT},
         {ACMD13_SD_STATUS, true, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
         {CMD38_ERASE, false, {0}, 1, 0, BD_ERROR_OK},
     };
@@ -1329,7 +1334,7 @@ static void test_app_prefix_failure(unsigned shift) {
     current_case = outer_case;
 }
 
-static void expect_acmd13_preamble(void) {
+static void expect_acmd13_preamble(uint8_t second) {
     expect_select();
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(CMD55_APP_CMD, 0);
@@ -1337,35 +1342,105 @@ static void expect_acmd13_preamble(void) {
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(ACMD13_SD_STATUS, 0);
     expect_spi(0xFF, 0, false, 1);
-    expect_spi(0xFF, 0xA5, false, 1);
+    expect_spi(0xFF, second, false, 1);
 }
 
-static void test_acmd13_data(bool corrupt_crc) {
-    reset_card();
-    uint8_t expected[64];
-    uint8_t actual[64] = {0};
-    fill_pattern(expected, sizeof(expected));
-    expect_acmd13_preamble();
-    expect_status_block(expected, sizeof(expected), corrupt_crc);
+static void finish_r2_and_read(int status, int expected) {
+    CHECK(config._mutex.locked);
+    CHECK(mutex_entries == 1 && mutex_exits == 0);
+    CHECK(cs_high);
+    mutex_exit(&config._mutex);
+    finish(status, expected);
+
+    // Do not reset the card, bus, time, or mutex before the next public operation.
+    // The next scripted response is ready. This tests host cleanup, not whether
+    // a physical card has independently left idle or recovered from an error.
+    uint8_t buffer[514];
+    memset(buffer, 0xA5, sizeof(buffer));
+    expect_start(1, config.card_type == SDCARD_V2HC ? 1 : 512, 0);
+    expect_block(0x42);
     expect_release();
-
-    uint32_t response = R1_NO_RESPONSE;
-    int status = _cmd(&config, ACMD13_SD_STATUS, 0, true, &response);
-    CHECK(status == BD_ERROR_OK);
-    CHECK(response == 0xA5);
-    CHECK(!cs_high);
-    status = _read_bytes(&config, actual, sizeof(actual), false);
-    if (corrupt_crc) {
-        CHECK(status == SD_BLOCK_DEVICE_ERROR_CRC);
-    } else {
-        CHECK(status == BD_ERROR_OK);
-        CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+    finish(device.read(&device, buffer + 1, 512, 512), BD_ERROR_OK);
+    CHECK(mutex_entries == 2 && mutex_exits == 2);
+    CHECK(buffer[0] == 0xA5 && buffer[513] == 0xA5);
+    for (size_t i = 1; i <= 512; ++i) {
+        CHECK(buffer[i] == 0x42);
     }
-    finish(status, corrupt_crc ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
 }
 
+// Nonzero R2 status must not skip the full 64-byte data phase or its CRC check.
+// FreeBSD likewise completes attached data before translating status:
+// https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L2005-L2198
+//
+// Act as the caller: hold the mutex through command, data, and CS cleanup,
+// then release it before follow-on public I/O. A future public SD Status API
+// still needs equivalent tests through its own entry point.
+static void test_acmd13_data(void) {
+    static const struct {
+        uint8_t token;
+        bool corrupt_crc;
+        int status;
+    } cases[] = {
+        {0xFE, false, BD_ERROR_OK},
+        {0xFE, true, SD_BLOCK_DEVICE_ERROR_CRC},
+        {0xFF, false, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE},
+        {0x00, false, BD_ERROR_DEVICE_ERROR},
+        {0x04, false, BD_ERROR_DEVICE_ERROR},
+        {0x80, false, BD_ERROR_DEVICE_ERROR},
+    };
+    const char *outer_case = current_case;
+    for (unsigned hc = 0; hc < 2; ++hc) {
+        for (unsigned crc = 0; crc < 2; ++crc) {
+            for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+                char name[96];
+                snprintf(name, sizeof(name), "%s/hc-%u/crc-%u/case-%zu",
+                         outer_case, hc, crc, i);
+                current_case = name;
+                reset_card();
+                config.card_type = hc ? SDCARD_V2HC : SDCARD_V1;
+                config.enable_crc = crc;
+                observing_ready_io = true;
+                uint8_t expected[64];
+                uint8_t actual[66];
+                memset(actual, 0xA5, sizeof(actual));
+                fill_pattern(expected, sizeof(expected));
+                expect_acmd13_preamble(0xA5);
+                if (cases[i].token == 0xFE) {
+                    expect_status_block(expected, sizeof(expected), cases[i].corrupt_crc);
+                } else {
+                    expect_spi(0xFF, cases[i].token, false,
+                               cases[i].token == 0xFF ? 300 : 1);
+                }
+                expect_release();
+
+                uint32_t response = R1_NO_RESPONSE;
+                mutex_enter_blocking(&config._mutex);
+                CHECK(_cmd(&config, ACMD13_SD_STATUS, 0, true, &response) == BD_ERROR_OK);
+                CHECK(response == 0xA5);
+                CHECK(!cs_high);
+                int status = _read_bytes(&config, actual + 1, 64, false);
+                int expected_status = cases[i].corrupt_crc && !crc ?
+                    BD_ERROR_OK : cases[i].status;
+                CHECK(status == expected_status);
+                CHECK(actual[0] == 0xA5 && actual[65] == 0xA5);
+                if (cases[i].token == 0xFE) {
+                    CHECK(memcmp(actual + 1, expected, sizeof(expected)) == 0);
+                } else {
+                    for (size_t j = 0; j < sizeof(actual); ++j) {
+                        CHECK(actual[j] == 0xA5);
+                    }
+                }
+                finish_r2_and_read(status, expected_status);
+            }
+        }
+    }
+    current_case = outer_case;
+}
+
+// Bare CMD13 releases CS after R2, including when second-byte flags are set.
 static void test_cmd13_release(void) {
     reset_card();
+    observing_ready_io = true;
     expect_select();
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(CMD13_SEND_STATUS, 0);
@@ -1374,68 +1449,104 @@ static void test_cmd13_release(void) {
     expect_release();
 
     uint32_t response = R1_NO_RESPONSE;
-    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response), BD_ERROR_OK);
+    mutex_enter_blocking(&config._mutex);
+    int status = _cmd(&config, CMD13_SEND_STATUS, 0, false, &response);
     CHECK(response == 0xA5);
+    finish_r2_and_read(status, BD_ERROR_OK);
 }
 
-// CMD13 and ACMD13 share opcode 13 and return R2: R1 followed by a second
-// status byte. Preserve nonzero R1 status while returning the complete value.
+// Both commands return R2 (SD v9.10, Table 7-4, p.300 and section 7.3.2.3,
+// p.303). Cover every second-byte flag and mixed flags without converting them
+// to command failures.
+//
+// FreeBSD corroborates preserving them as status:
+// https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L1677-L1765
+//
+// Check existing R1 error precedence, diagnostic packing, mutex-held CS cleanup,
+// and follow-on public I/O without resetting the mock state.
+// CRC/illegal-command errors have only R1 (p.302). Other responses retain both
+// bytes, and ACMD13 reads its data block whenever R1 succeeds.
 static void test_r2_status(void) {
+    static const uint8_t second_cases[] = {
+        0x00,
+        0x01, // Locked
+        0x02, // WP skip / lock failure
+        0x04, // General error
+        0x08, // Card controller error
+        0x10, // Card ECC failure, not wire CRC
+        0x20, // WP violation
+        0x40, // Erase parameters
+        0x80, // Range / CSD overwrite
+        0x1C,
+        0x9C,
+        0xDC,
+        0xFF,
+    };
     static const struct {
-        int cmd;
-        bool app;
         uint8_t r1;
-        uint8_t second;
-        bool reads_second;
-        uint32_t response;
         int status;
-    } cases[] = {
-        {CMD13_SEND_STATUS, false, 0x00, 0x5A, true, 0x005A, BD_ERROR_OK},
-        {CMD13_SEND_STATUS, false, 0x02, 0xA5, true, 0x02A5,
-         SD_BLOCK_DEVICE_ERROR_ERASE},
-        {CMD13_SEND_STATUS, false, R1_COM_CRC_ERROR, 0, false, R1_COM_CRC_ERROR,
-         SD_BLOCK_DEVICE_ERROR_CRC},
-        {ACMD13_SD_STATUS, true, 0x00, 0xA5, true, 0x00A5, BD_ERROR_OK},
-        {ACMD13_SD_STATUS, true, R1_ILLEGAL_COMMAND, 0, false, R1_ILLEGAL_COMMAND,
-         SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+    } r1_cases[] = {
+        {0x00, BD_ERROR_OK},
+        {0x01, SD_BLOCK_DEVICE_ERROR_NO_INIT},
+        {0x02, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0x10, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0x20, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0x61, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0x72, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0x08, SD_BLOCK_DEVICE_ERROR_CRC},
+        {0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {0x7F, SD_BLOCK_DEVICE_ERROR_CRC},
     };
     const char *outer_case = current_case;
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-        char name[64];
-        snprintf(name, sizeof(name), "%s/case-%zu", outer_case, i);
-        current_case = name;
-        reset_card();
-        bool read_status_block = cases[i].app && cases[i].status == BD_ERROR_OK;
-        uint8_t expected[64];
-        uint8_t actual[64] = {0};
-        expect_select();
-        expect_spi(0xFF, 0xFF, false, 1);
-        if (cases[i].app) {
-            expect_command(CMD55_APP_CMD, 0);
-            expect_spi(0xFF, 0, false, 1);
-            expect_spi(0xFF, 0xFF, false, 1);
+    for (unsigned app = 0; app < 2; ++app) {
+        for (size_t r = 0; r < sizeof(r1_cases) / sizeof(r1_cases[0]); ++r) {
+            for (size_t s = 0; s < sizeof(second_cases) / sizeof(second_cases[0]); ++s) {
+                char name[96];
+                snprintf(name, sizeof(name), "%s/app-%u/r1-%zu/second-%zu",
+                         outer_case, app, r, s);
+                current_case = name;
+                reset_card();
+                observing_ready_io = true;
+                uint8_t r1 = r1_cases[r].r1;
+                bool reads_second = !(r1 & (0x04 | 0x08));
+                int expected_status = r1_cases[r].status;
+                uint32_t expected_response = reads_second ?
+                    ((uint32_t)r1 << 8) | second_cases[s] : r1;
+                bool read_status_block = app && expected_status == BD_ERROR_OK;
+                uint8_t expected[64];
+                uint8_t actual[64] = {0};
+                expect_select();
+                expect_spi(0xFF, 0xFF, false, 1);
+                if (app) {
+                    expect_command(CMD55_APP_CMD, 0);
+                    expect_spi(0xFF, 0, false, 1);
+                    expect_spi(0xFF, 0xFF, false, 1);
+                }
+                expect_command(CMD13_SEND_STATUS, 0);
+                expect_spi(0xFF, r1, false, 1);
+                if (reads_second) {
+                    expect_spi(0xFF, second_cases[s], false, 1);
+                }
+                if (read_status_block) {
+                    fill_pattern(expected, sizeof(expected));
+                    expect_status_block(expected, sizeof(expected), false);
+                }
+                expect_release();
+                uint32_t response = R1_NO_RESPONSE;
+                mutex_enter_blocking(&config._mutex);
+                int status = _cmd(&config, CMD13_SEND_STATUS, 0, app, &response);
+                CHECK(status == expected_status);
+                CHECK(response == expected_response);
+                if (read_status_block) {
+                    CHECK(!cs_high);
+                    status = _read_bytes(&config, actual, sizeof(actual), false);
+                    CHECK(status == BD_ERROR_OK);
+                    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+                }
+                finish_r2_and_read(status, expected_status);
+            }
         }
-        expect_command(cases[i].cmd, 0);
-        expect_spi(0xFF, cases[i].r1, false, 1);
-        if (cases[i].reads_second) {
-            expect_spi(0xFF, cases[i].second, false, 1);
-        }
-        if (read_status_block) {
-            fill_pattern(expected, sizeof(expected));
-            expect_status_block(expected, sizeof(expected), false);
-        }
-        expect_release();
-        uint32_t response = R1_NO_RESPONSE;
-        int status = _cmd(&config, cases[i].cmd, 0, cases[i].app, &response);
-        CHECK(status == cases[i].status);
-        CHECK(response == cases[i].response);
-        if (read_status_block) {
-            CHECK(!cs_high);
-            status = _read_bytes(&config, actual, sizeof(actual), false);
-            CHECK(status == BD_ERROR_OK);
-            CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
-        }
-        finish(status, cases[i].status);
     }
     current_case = outer_case;
 }
@@ -2794,8 +2905,7 @@ int main(void) {
     RUN_CASE("top-init-frequency-error", test_top_init(3));
     RUN_CASE("top-init-card-error", test_top_init(4));
     RUN_CASE("deinit-reinit", test_deinit_reinit());
-    RUN_CASE("acmd13-status-data", test_acmd13_data(false));
-    RUN_CASE("acmd13-status-crc", test_acmd13_data(true));
+    RUN_CASE("acmd13-status-data-recovery", test_acmd13_data());
     RUN_CASE("cmd13-release", test_cmd13_release());
     RUN_CASE("r2-status", test_r2_status());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
