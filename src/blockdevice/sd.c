@@ -73,6 +73,56 @@ typedef struct {
 #define R1_ADDRESS_ERROR        (1 << 5)
 #define R1_PARAMETER_ERROR      (1 << 6)
 
+enum {
+    SD_RESP_PREFIX = 1u << 0,
+    SD_RESP_R1 = 1u << 1,
+    SD_RESP_R2 = 1u << 2,
+    SD_RESP_R3_R7 = 1u << 3,
+};
+
+// Flags identify bytes decoded in the final command attempt, not success or
+// semantic validity. R2 and R3/R7 are mutually exclusive and require R1.
+// Missing fields are zero; CMD55's response never substitutes for command R1.
+typedef struct {
+    uint32_t payload;   // R3/R7's four bytes after R1. MSB-first. Valid with SD_RESP_R3_R7.
+    uint8_t prefix_r1;  // CMD55 prefix R1, including rejection. Valid with SD_RESP_PREFIX.
+    uint8_t r1;         // Requested command's R1, including errors. Valid with SD_RESP_R1.
+    uint8_t r2;         // R2's second status byte (not packed with R1). Valid with SD_RESP_R2.
+    uint8_t valid;      // SD_RESP_* bitmask of decoded fields, independent of return status.
+} sd_command_response_t;
+
+static void _response_reset(sd_command_response_t *resp) {
+    *resp = (sd_command_response_t){0};
+}
+
+static void _response_set_prefix_r1(sd_command_response_t *resp, uint8_t r1) {
+    assert(resp->valid == 0);          // CMD55 must be the first response recorded in an attempt.
+    assert(!(r1 & R1_RESPONSE_RECV));  // Valid R1 has bit 7 clear; this also excludes 0xFF (no response).
+    resp->prefix_r1 = r1;
+    resp->valid |= SD_RESP_PREFIX;
+}
+
+static void _response_set_r1(sd_command_response_t *resp, uint8_t r1) {
+    assert((resp->valid & ~SD_RESP_PREFIX) == 0);  // Only an optional CMD55 prefix may precede command R1.
+    assert(!(r1 & R1_RESPONSE_RECV));             // Valid R1 has bit 7 clear; this also excludes 0xFF.
+    resp->r1 = r1;
+    resp->valid |= SD_RESP_R1;
+}
+
+static void _response_set_r2(sd_command_response_t *resp, uint8_t second) {
+    assert(resp->valid & SD_RESP_R1);                   // Continuation requires the command's R1 first.
+    assert(!(resp->valid & (SD_RESP_R2 | SD_RESP_R3_R7)));  // No duplicate or conflicting continuation.
+    resp->r2 = second;
+    resp->valid |= SD_RESP_R2;
+}
+
+static void _response_set_r3_r7(sd_command_response_t *resp, uint32_t payload) {
+    assert(resp->valid & SD_RESP_R1);                   // Continuation requires the command's R1 first.
+    assert(!(resp->valid & (SD_RESP_R2 | SD_RESP_R3_R7)));  // No duplicate or conflicting continuation.
+    resp->payload = payload;
+    resp->valid |= SD_RESP_R3_R7;
+}
+
 /* R2 second-byte status (SD v9.10, section 7.3.2.3, p.303). */
 #define R2_CARD_LOCKED                      (1 << 0)
 #define R2_WP_ERASE_SKIP_OR_LOCK_FAILED     (1 << 1)
@@ -452,19 +502,23 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
 // Successful ACMD13 leaves CS asserted for _read_bytes(), which releases it
 // on completion or failure. If the caller skips the read, it must release CS.
 // Failed commands release CS before returning.
+//
+// Readiness timeouts leave no command R1. R1b busy timeouts retain received R1.
+// Early rejections omit continuation fields without extra reads. Other R1
+// errors preserve any decoded continuation. NULL resp only discards output.
 static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_acmd,
-                                  uint32_t *resp, uint64_t busy_timeout) {
+                                  sd_command_response_t *resp, uint64_t busy_timeout) {
     blockdevice_sd_config_t *config = _config;
     int32_t status = BD_ERROR_OK;
-    uint32_t response;
+    uint8_t r1;
     bool prefix_failed = false;
     response_alignment_t alignment;
 
-    // If resp is provided, initialize it with R1_NO_RESPONSE to prevent callers
-    // from using a stale/uninitialized response if no valid R1 arrives.
-    if (NULL != resp) {
-        *resp = R1_NO_RESPONSE;
+    sd_command_response_t discarded_response;
+    if (NULL == resp) {
+        resp = &discarded_response;
     }
+    _response_reset(resp);
 
     // CMD12 terminates CMD18 (SD v9.10, section 7.2.3, p.290).
     // CS stays low through the stop and response (SanDisk v2.2, section 5.23.3, p.5-18).
@@ -484,16 +538,18 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
 
     // Re-try command
     for (int i = 0; i < 3; i++) {
+        _response_reset(resp);
         // ACMDs require CMD55 (SD v9.10, Table 7-4, p.300). SPI has no APP_CMD
         // status bit (section 7.2.11, p.292), so check its R1 instead.
         // Retrying an unanswered prefix and rejecting errors before sending
         // the application opcode are host policy. Never assume CMD55 succeeded.
         if (is_acmd) {
-            response = _cmd_spi(config, CMD55_APP_CMD, 0x0, &alignment);
-            if (R1_NO_RESPONSE == response) {
+            r1 = _cmd_spi(config, CMD55_APP_CMD, 0x0, &alignment);
+            if (R1_NO_RESPONSE == r1) {
                 continue;
             }
-            if (response & ~R1_IDLE_STATE) {
+            _response_set_prefix_r1(resp, r1);
+            if (r1 & ~R1_IDLE_STATE) {
                 prefix_failed = true;
                 break;
             }
@@ -509,46 +565,42 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         }
 
         // Send command over SPI interface
-        response = _cmd_spi(config, cmd, arg, &alignment);
-        if (R1_NO_RESPONSE == response) {
+        r1 = _cmd_spi(config, cmd, arg, &alignment);
+        if (R1_NO_RESPONSE == r1) {
             debug_if(SD_DBG, "No response CMD:%d \n", cmd);
             continue;
         }
+        _response_set_r1(resp, r1);
         break;
     }
 
-    // Pass the response to the command call if required
-    if (NULL != resp) {
-        *resp = response;
-    }
-
     // Exit on no response or R1 CRC/illegal-command errors.
-    // For CRC/illegal-command errors, only R1 is returned, even for a
+    // For CRC/illegal-command errors, the card supplies only R1, even for a
     // multi-byte response (SD v9.10, section 7.3.2, p.302).
-    if (R1_NO_RESPONSE == response) {
+    if (R1_NO_RESPONSE == r1) {
         _postclock_then_deselect(config);
-        debug_if(SD_DBG, "No response CMD:%d response: 0x%" PRIx32 "\n", cmd, response);
+        debug_if(SD_DBG, "No response CMD:%d response: 0x%02x\n", cmd, (unsigned)r1);
         return SD_BLOCK_DEVICE_ERROR_NO_DEVICE;         // No device
     }
-    if (response & R1_COM_CRC_ERROR) {
+    if (r1 & R1_COM_CRC_ERROR) {
         _postclock_then_deselect(config);
-        debug_if(SD_DBG, "CRC error CMD:%d response 0x%" PRIx32 "\n", cmd, response);
+        debug_if(SD_DBG, "CRC error CMD:%d response 0x%02x\n", cmd, (unsigned)r1);
         return SD_BLOCK_DEVICE_ERROR_CRC;               // CRC error
     }
-    if (response & R1_ILLEGAL_COMMAND) {
+    if (r1 & R1_ILLEGAL_COMMAND) {
         _postclock_then_deselect(config);
-        debug_if(SD_DBG, "Illegal command CMD:%d response 0x%" PRIx32 "\n", cmd, response);
+        debug_if(SD_DBG, "Illegal command CMD:%d response 0x%02x\n", cmd, (unsigned)r1);
         if (CMD8_SEND_IF_COND == cmd) {                 // Illegal command is for Ver1 or not SD Card
             config->card_type = CARD_UNKNOWN;
         }
         return SD_BLOCK_DEVICE_ERROR_UNSUPPORTED;       // Command not supported
     }
 
-    debug_if(SD_DBG, "CMD:%d \t arg:0x%" PRIx32 " \t Response:0x%" PRIx32 "\n", cmd, arg, response);
+    debug_if(SD_DBG, "CMD:%d \t arg:0x%" PRIx32 " \t R1:0x%02x\n", cmd, arg, (unsigned)r1);
     // Set status for other errors
-    if ((response & R1_ERASE_RESET) || (response & R1_ERASE_SEQUENCE_ERROR)) {
+    if ((r1 & R1_ERASE_RESET) || (r1 & R1_ERASE_SEQUENCE_ERROR)) {
         status = SD_BLOCK_DEVICE_ERROR_ERASE;           // Erase error
-    } else if ((response & R1_ADDRESS_ERROR) || (response & R1_PARAMETER_ERROR)) {
+    } else if ((r1 & R1_ADDRESS_ERROR) || (r1 & R1_PARAMETER_ERROR)) {
         // R1 reports a misaligned address or invalid command argument
         // (SD v3.01, section 7.3.2.1, p.129).
         status = SD_BLOCK_DEVICE_ERROR_PARAMETER;
@@ -569,7 +621,7 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
                         cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR ||
                         cmd == CMD59_CRC_ON_OFF || cmd == CMD55_APP_CMD ||
                         (is_acmd && cmd == ACMD41_SD_SEND_OP_COND);
-    if (BD_ERROR_OK == status && (response & R1_IDLE_STATE) && !accepts_idle) {
+    if (BD_ERROR_OK == status && (r1 & R1_IDLE_STATE) && !accepts_idle) {
         status = SD_BLOCK_DEVICE_ERROR_NO_INIT;
         if (CMD13_SEND_STATUS != cmd) {
             _postclock_then_deselect(config);
@@ -584,16 +636,18 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
             debug_if(SD_DBG, "V2-Version Card\n");
             config->card_type = SDCARD_V2; // fallthrough
         // Note: No break here, need to read rest of the response
-        case CMD58_READ_OCR:                // Response R3
+        case CMD58_READ_OCR: {              // Response R3
             // Cast before shifting because OCR bit 31 and R7 continuation bytes
             // may set the sign bit (SD v9.10, sections 7.3.2.4-7.3.2.6,
             // pp.303-304). The promoted signed shift would overflow.
-            response  = ((uint32_t)_read_response_byte(config, &alignment) << 24);
-            response |= ((uint32_t)_read_response_byte(config, &alignment) << 16);
-            response |= ((uint32_t)_read_response_byte(config, &alignment) << 8);
-            response |= _read_response_byte(config, &alignment);
-            debug_if(SD_DBG, "R3/R7: 0x%" PRIx32 "\n", response);
+            uint32_t payload = ((uint32_t)_read_response_byte(config, &alignment) << 24);
+            payload |= ((uint32_t)_read_response_byte(config, &alignment) << 16);
+            payload |= ((uint32_t)_read_response_byte(config, &alignment) << 8);
+            payload |= _read_response_byte(config, &alignment);
+            _response_set_r3_r7(resp, payload);
+            debug_if(SD_DBG, "R3/R7: 0x%" PRIx32 "\n", resp->payload);
             break;
+        }
 
         case CMD12_STOP_TRANSMISSION:       // Response R1b
         case CMD38_ERASE:
@@ -611,24 +665,16 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         // CMD13 and ACMD13 both return R2 (SD v9.10, Table 7-4, p.300 and
         // section 7.3.2.3, p.303); only ACMD13 adds a data block.
         case CMD13_SEND_STATUS: {          // Response R2
-            uint8_t second = _read_response_byte(config, &alignment);
-            response = (response << 8) | second;
-            // Only R1 determines command failure, but preserve `(R1 << 8) | second`
-            // for caller interpretation.
-            //
-            // FreeBSD corroborates this interpretation:
+            _response_set_r2(resp, _read_response_byte(config, &alignment));
+            // Only R1 determines command failure. FreeBSD corroborates this interpretation:
             // https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L1677-L1765
-            debug_if(SD_DBG, "R2: 0x%" PRIx32 "\n", response);
+            debug_if(SD_DBG, "R2: R1=0x%02x status=0x%02x\n",
+                     (unsigned)resp->r1, (unsigned)resp->r2);
             break;
         }
 
         default:                            // Response R1
             break;
-    }
-
-    // Pass the updated response to the command
-    if (NULL != resp) {
-        *resp = response;
     }
 
     // Keep CS low for data transfers. ACMD13 adds a 64-byte SD Status block.
@@ -651,14 +697,14 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
     return status;
 }
 
-static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, uint32_t *resp) {
+static int _cmd(void *_config, int cmd, uint32_t arg, bool is_acmd, sd_command_response_t *resp) {
     return _cmd_with_busy_timeout(_config, cmd, arg, is_acmd, resp, SD_COMMAND_TIMEOUT);
 }
 
 static int _cmd8(void *_config) {
     blockdevice_sd_config_t *config = _config;
     uint32_t arg = (CMD8_PATTERN << 0);         // [7:0]check pattern
-    uint32_t response = 0;
+    sd_command_response_t response;
     int32_t status = BD_ERROR_OK;
 
     arg |= (0x1 << 8);  // 2.7-3.6V             // [11:8]supply voltage(VHS)
@@ -669,8 +715,8 @@ static int _cmd8(void *_config) {
     // rather than retrying them (host policy).
     if ((BD_ERROR_OK == status) && (SDCARD_V2 == config->card_type)) {
         // If check pattern is not matched, CMD8 communication is not valid
-        if ((response & 0xFFF) != arg) {
-            debug_if(SD_DBG, "CMD8 Pattern mismatch 0x%" PRIx32 " : 0x%" PRIx32 "\n", arg, response);
+        if ((response.payload & 0xFFF) != arg) {
+            debug_if(SD_DBG, "CMD8 Pattern mismatch 0x%" PRIx32 " : 0x%" PRIx32 "\n", arg, response.payload);
             config->card_type = CARD_UNKNOWN;
             status = SD_BLOCK_DEVICE_ERROR_UNUSABLE;
         }
@@ -678,26 +724,31 @@ static int _cmd8(void *_config) {
     return status;
 }
 
-static uint32_t _go_idle_state(void *_config) {
+// Returns the final CMD0 attempt's R1, or R1_NO_RESPONSE if no R1 was decoded.
+// Only exactly R1_IDLE_STATE confirms idle; zero and error-bearing R1 do not.
+// Retries until idle or the retry limit. This returns wire status, not a driver
+// error code; _cmd() errors are not propagated.
+static uint8_t _go_idle_state(void *_config) {
     blockdevice_sd_config_t *config = _config;
-    uint32_t response;
+    sd_command_response_t response;
 
     // CMD0 enters SPI idle (SD v9.10, section 7.2.1, p.287).
     // The retry count and inter-attempt delay are host policy.
     for (size_t i = 0; i < SD_CMD0_GO_IDLE_STATE_RETRIES; i++) {
         _cmd(config, CMD0_GO_IDLE_STATE, 0x0, 0, &response);
-        if (R1_IDLE_STATE == response) {
+        if (R1_IDLE_STATE == response.r1) {
             break;
         }
         sleep_ms(1);
     }
-    return response;
+    return response.valid & SD_RESP_R1 ? response.r1 : R1_NO_RESPONSE;
 }
 
 static int init_card(void *_config) {
     blockdevice_sd_config_t *config = _config;
     int32_t status = BD_ERROR_OK;
-    uint32_t response, arg;
+    sd_command_response_t response;
+    uint32_t arg;
 
     _spi_init(config);
     if (_go_idle_state(config) != R1_IDLE_STATE) {
@@ -728,7 +779,7 @@ static int init_card(void *_config) {
 
     // Do not continue initialization with an incompatible OCR voltage range
     // (SD v9.10, section 7.2.1, p.288). This host uses the 3.3 V range.
-    if (!(response & OCR_3_3V)) {
+    if (!(response.payload & OCR_3_3V)) {
         config->card_type = CARD_UNKNOWN;
         status = SD_BLOCK_DEVICE_ERROR_UNUSABLE;
         return status;
@@ -748,11 +799,11 @@ static int init_card(void *_config) {
     do {
         status = _cmd(config, ACMD41_SD_SEND_OP_COND, arg, 1, &response);
     } while ((status == SD_BLOCK_DEVICE_ERROR_CRC ||
-              (status == BD_ERROR_OK && (response & R1_IDLE_STATE))) &&
+              (status == BD_ERROR_OK && (response.r1 & R1_IDLE_STATE))) &&
              (0 < absolute_time_diff_us(get_absolute_time(), timeout)));
 
     // Preserve command errors; report a still-idle card as an initialization timeout.
-    if ((BD_ERROR_OK != status) || (0x00 != response)) {
+    if ((BD_ERROR_OK != status) || (0x00 != response.r1)) {
         config->card_type = CARD_UNKNOWN;
         debug_if(SD_DBG, "Timeout waiting for card\n");
         return status == BD_ERROR_OK ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : status;
@@ -768,7 +819,7 @@ static int init_card(void *_config) {
             return status;
         }
         // High Capacity card
-        if (response & OCR_HCS_CCS) {
+        if (response.payload & OCR_HCS_CCS) {
             config->card_type = SDCARD_V2HC;
             debug_if(SD_DBG, "Card Initialized: High Capacity Card \n");
         } else {
@@ -782,7 +833,7 @@ static int init_card(void *_config) {
     if (!config->enable_crc) {
         // CMD59 bit 0 selects CRC mode (SD v3.01, Table 7-3, p.126).
         // Only send zero when CRC is disabled. Otherwise retain the enabled mode.
-        status = _cmd(config, CMD59_CRC_ON_OFF, config->enable_crc, 0x0, &response);
+        status = _cmd(config, CMD59_CRC_ON_OFF, config->enable_crc, 0x0, NULL);
     }
     return status;
 }
