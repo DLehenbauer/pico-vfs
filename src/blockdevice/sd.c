@@ -74,14 +74,14 @@ typedef struct {
 #define R1_PARAMETER_ERROR      (1 << 6)
 
 /* R2 second-byte status (SD v9.10, section 7.3.2.3, p.303). */
-#define R2_CARD_LOCKED          (1 << 0)
-#define R2_WP_ERASE_SKIP_OR_LOCK_FAILED (1 << 1)
-#define R2_ERROR                (1 << 2)
-#define R2_CC_ERROR             (1 << 3)
-#define R2_CARD_ECC_FAILED      (1 << 4)
-#define R2_WP_VIOLATION         (1 << 5)
-#define R2_ERASE_PARAMETER      (1 << 6)
-#define R2_OUT_OF_RANGE_OR_CSD_OVERWRITE (1 << 7)
+#define R2_CARD_LOCKED                      (1 << 0)
+#define R2_WP_ERASE_SKIP_OR_LOCK_FAILED     (1 << 1)
+#define R2_ERROR                            (1 << 2)
+#define R2_CC_ERROR                         (1 << 3)
+#define R2_CARD_ECC_FAILED                  (1 << 4)
+#define R2_WP_VIOLATION                     (1 << 5)
+#define R2_ERASE_PARAMETER                  (1 << 6)
+#define R2_OUT_OF_RANGE_OR_CSD_OVERWRITE    (1 << 7)
 
 /* R3 Response : OCR Register */
 #define OCR_HCS_CCS             (0x1 << 30)
@@ -410,8 +410,11 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
         spi_write_blocking(config->spi_inst, (const uint8_t *)&cmd_packet[i], 1);
     }
 
-    // Ignore the first post-command byte, as FreeBSD does: it may be
-    // garbage. This also covers CMD12's stuff byte, without a second discard.
+    // Ignore the first post-command byte, as it may be garbage. This also
+    // covers CMD12's stuff byte, without a second discard.
+    //
+    // FreeBSD corroborates this behavior:
+    // https://github.com/freebsd/freebsd-src/blob/253c83058deb5ff77dc0a3b60bf7c1d10f9ef5e8/sys/dev/mmc/mmcspi.c#L1218-L1225
     spi_write_blocking(config->spi_inst, &SPI_FILL_CHAR, 1);
 
     // N_CR = 1..8 byte-times before R1 (SanDisk v2.2, Table 5-5, p.5-19).
@@ -445,11 +448,10 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
     return R1_NO_RESPONSE;
 }
 
-// Command helpers do not lock. A production ACMD13 caller must hold _mutex
-// across _cmd() and _read_bytes(config, buffer, 64, false), then unlock on every
-// exit. _cmd() releases CS on error; successful ACMD13 leaves CS low and
-// _read_bytes() releases it on success, token timeout, or CRC failure. If the
-// caller aborts between these helpers, it must release CS itself exactly once.
+// Caller holds _mutex throughout the command and any data transfer.
+// Successful ACMD13 leaves CS asserted for _read_bytes(), which releases it
+// on completion or failure. If the caller skips the read, it must release CS.
+// Failed commands release CS before returning.
 static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_acmd,
                                   uint32_t *resp, uint64_t busy_timeout) {
     blockdevice_sd_config_t *config = _config;
@@ -611,22 +613,11 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         case CMD13_SEND_STATUS: {          // Response R2
             uint8_t second = _read_response_byte(config, &alignment);
             response = (response << 8) | second;
-            // Host policy: retain any R1 error (including idle), otherwise
-            // prefer protection, erase, parameter, then generic device errors.
-            // ECC failure is internal to the card, not a transport CRC error.
-            // Overloaded bits cannot be disambiguated without command history.
-            if (BD_ERROR_OK == status) {
-                if (second & (R2_CARD_LOCKED | R2_WP_ERASE_SKIP_OR_LOCK_FAILED |
-                              R2_WP_VIOLATION)) {
-                    status = SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED;
-                } else if (second & R2_ERASE_PARAMETER) {
-                    status = SD_BLOCK_DEVICE_ERROR_ERASE;
-                } else if (second & R2_OUT_OF_RANGE_OR_CSD_OVERWRITE) {
-                    status = SD_BLOCK_DEVICE_ERROR_PARAMETER;
-                } else if (second & (R2_ERROR | R2_CC_ERROR | R2_CARD_ECC_FAILED)) {
-                    status = BD_ERROR_DEVICE_ERROR;
-                }
-            }
+            // Only R1 determines command failure, but preserve `(R1 << 8) | second`
+            // for caller interpretation.
+            //
+            // FreeBSD corroborates this interpretation:
+            // https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L1677-L1765
             debug_if(SD_DBG, "R2: 0x%" PRIx32 "\n", response);
             break;
         }
@@ -640,10 +631,14 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
         *resp = response;
     }
 
-    // Keep CS low for data transfers. ACMD13 adds a 64-byte SD Status block;
+    // Keep CS low for data transfers. ACMD13 adds a 64-byte SD Status block.
     // SD v9.10, Table 7-4, p.300 selects SD Status, whose size is 512 bits
     // (section 4.10.2, p.125). Bare CMD13 has only R2 (section 7.3.2.3, p.303).
+    //
     // Releasing CS after bare CMD13, but not before ACMD13 data, is driver policy.
+    // Second-byte status flags do not abort ACMD13 data. FreeBSD corroborates
+    // completing attached data before translating the response status:
+    // https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L2005-L2198
     if (((CMD9_SEND_CSD == cmd) || (is_acmd && ACMD13_SD_STATUS == cmd) ||
             (ACMD22_SEND_NUM_WR_BLOCKS == cmd) ||
             (CMD24_WRITE_BLOCK == cmd) || (CMD25_WRITE_MULTIPLE_BLOCK == cmd) ||

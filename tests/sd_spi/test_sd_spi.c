@@ -1102,15 +1102,13 @@ static void test_command_alignment(unsigned shift) {
          0xC0FF8000, BD_ERROR_OK},
         {CMD58_READ_OCR, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
         {CMD58_READ_OCR, false, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
-        {CMD13_SEND_STATUS, false, {0, 0x5A}, 2, 0x5A,
-         SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED},
+        {CMD13_SEND_STATUS, false, {0, 0x5A}, 2, 0x5A, BD_ERROR_OK},
         {CMD13_SEND_STATUS, false, {1, 0x80}, 2, 0x0180,
          SD_BLOCK_DEVICE_ERROR_NO_INIT},
         {CMD13_SEND_STATUS, false, {2, 0x5A}, 2, 0x025A, SD_BLOCK_DEVICE_ERROR_ERASE},
         {CMD13_SEND_STATUS, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
         {ACMD13_SD_STATUS, true, {0, 0}, 2, 0, BD_ERROR_OK},
-        {ACMD13_SD_STATUS, true, {0, 0xA5}, 2, 0xA5,
-         SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED},
+        {ACMD13_SD_STATUS, true, {0, 0xA5}, 2, 0xA5, BD_ERROR_OK},
         {ACMD13_SD_STATUS, true, {1, 0x80}, 2, 0x0180,
          SD_BLOCK_DEVICE_ERROR_NO_INIT},
         {ACMD13_SD_STATUS, true, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
@@ -1336,7 +1334,7 @@ static void test_app_prefix_failure(unsigned shift) {
     current_case = outer_case;
 }
 
-static void expect_acmd13_preamble(void) {
+static void expect_acmd13_preamble(uint8_t second) {
     expect_select();
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(CMD55_APP_CMD, 0);
@@ -1344,22 +1342,29 @@ static void expect_acmd13_preamble(void) {
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(ACMD13_SD_STATUS, 0);
     expect_spi(0xFF, 0, false, 1);
-    expect_spi(0xFF, 0, false, 1);
+    expect_spi(0xFF, second, false, 1);
 }
 
+// Nonzero R2 status must not skip the full 64-byte data phase or its CRC check.
+// FreeBSD likewise completes attached data before translating status:
+// https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L2005-L2198
+//
+// These private-helper tests do not establish a public caller's mutex contract.
+// Public-entry tests must cover the full block, token timeout, CRC failure,
+// CS/mutex release on every exit, and subsequent I/O.
 static void test_acmd13_data(bool corrupt_crc) {
     reset_card();
     uint8_t expected[64];
     uint8_t actual[64] = {0};
     fill_pattern(expected, sizeof(expected));
-    expect_acmd13_preamble();
+    expect_acmd13_preamble(0xA5);
     expect_status_block(expected, sizeof(expected), corrupt_crc);
     expect_release();
 
     uint32_t response = R1_NO_RESPONSE;
     int status = _cmd(&config, ACMD13_SD_STATUS, 0, true, &response);
     CHECK(status == BD_ERROR_OK);
-    CHECK(response == 0);
+    CHECK(response == 0xA5);
     CHECK(!cs_high);
     status = _read_bytes(&config, actual, sizeof(actual), false);
     if (corrupt_crc) {
@@ -1371,6 +1376,7 @@ static void test_acmd13_data(bool corrupt_crc) {
     finish(status, corrupt_crc ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
 }
 
+// Bare CMD13 releases CS after R2, including when second-byte flags are set.
 static void test_cmd13_release(void) {
     reset_card();
     expect_select();
@@ -1381,33 +1387,35 @@ static void test_cmd13_release(void) {
     expect_release();
 
     uint32_t response = R1_NO_RESPONSE;
-    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response),
-           SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED);
+    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response), BD_ERROR_OK);
     CHECK(response == 0xA5);
 }
 
 // Both commands return R2 (SD v9.10, Table 7-4, p.300 and section 7.3.2.3,
-// p.303). Error mapping is host policy: R1 takes precedence, then protection,
-// erase parameters, range/CSD overwrite, and generic device errors. Preserve
-// both bytes, except CRC/illegal-command errors which have only R1 (p.302).
+// p.303). Cover every second-byte flag and mixed flags without converting them
+// to command failures.
+//
+// FreeBSD corroborates preserving them as status:
+// https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L1677-L1765
+//
+// Check existing R1 error precedence, diagnostic packing, and CS cleanup.
+// CRC/illegal-command errors have only R1 (p.302). Other responses retain both
+// bytes, and ACMD13 reads its data block whenever R1 succeeds.
 static void test_r2_status(void) {
-    static const struct {
-        uint8_t second;
-        int status;
-    } second_cases[] = {
-        {0x00, BD_ERROR_OK},
-        {0x01, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED}, // Locked
-        {0x02, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED}, // WP skip / lock failure
-        {0x04, BD_ERROR_DEVICE_ERROR}, // General error
-        {0x08, BD_ERROR_DEVICE_ERROR}, // Card controller error
-        {0x10, BD_ERROR_DEVICE_ERROR}, // Card ECC failure, not wire CRC
-        {0x20, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED}, // WP violation
-        {0x40, SD_BLOCK_DEVICE_ERROR_ERASE}, // Erase parameters
-        {0x80, SD_BLOCK_DEVICE_ERROR_PARAMETER}, // Range / CSD overwrite
-        {0x1C, BD_ERROR_DEVICE_ERROR},
-        {0x9C, SD_BLOCK_DEVICE_ERROR_PARAMETER},
-        {0xDC, SD_BLOCK_DEVICE_ERROR_ERASE},
-        {0xFF, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED},
+    static const uint8_t second_cases[] = {
+        0x00,
+        0x01, // Locked
+        0x02, // WP skip / lock failure
+        0x04, // General error
+        0x08, // Card controller error
+        0x10, // Card ECC failure, not wire CRC
+        0x20, // WP violation
+        0x40, // Erase parameters
+        0x80, // Range / CSD overwrite
+        0x1C,
+        0x9C,
+        0xDC,
+        0xFF,
     };
     static const struct {
         uint8_t r1;
@@ -1436,10 +1444,9 @@ static void test_r2_status(void) {
                 reset_card();
                 uint8_t r1 = r1_cases[r].r1;
                 bool reads_second = !(r1 & (0x04 | 0x08));
-                int expected_status = r1_cases[r].status == BD_ERROR_OK ?
-                                      second_cases[s].status : r1_cases[r].status;
+                int expected_status = r1_cases[r].status;
                 uint32_t expected_response = reads_second ?
-                    ((uint32_t)r1 << 8) | second_cases[s].second : r1;
+                    ((uint32_t)r1 << 8) | second_cases[s] : r1;
                 bool read_status_block = app && expected_status == BD_ERROR_OK;
                 uint8_t expected[64];
                 uint8_t actual[64] = {0};
@@ -1453,7 +1460,7 @@ static void test_r2_status(void) {
                 expect_command(CMD13_SEND_STATUS, 0);
                 expect_spi(0xFF, r1, false, 1);
                 if (reads_second) {
-                    expect_spi(0xFF, second_cases[s].second, false, 1);
+                    expect_spi(0xFF, second_cases[s], false, 1);
                 }
                 if (read_status_block) {
                     fill_pattern(expected, sizeof(expected));

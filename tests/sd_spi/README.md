@@ -13,15 +13,6 @@ independent bitwise implementations rather than the driver's lookup tables.
 Scenario rationale, protocol citations, and compatibility limitations are
 documented beside the relevant expectations and assertions in the source.
 
-CMD13 and ACMD13 tests cover every R2 second-byte flag, mixed flags, R1 error
-precedence, preserved diagnostic bytes, and CS release on errors. Both commands
-use the same R2 decoding; only successful ACMD13 leaves CS selected for data.
-There is no public SD Status caller yet. Any future caller must serialize
-`_cmd()` and `_read_bytes(..., 64, false)` under the device mutex, release CS on
-every exit without duplicate cleanup, and always unlock. Its public-entry tests
-must cover all 64 bytes, token timeout, CRC failure, CS/mutex release, and
-subsequent I/O; current private-helper tests do not establish that contract.
-
 ## Running
 
 The scenarios use the production command timeout of 5 s with deterministic
