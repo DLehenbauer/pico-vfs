@@ -1081,37 +1081,37 @@ static void test_command_alignment(unsigned shift) {
         bool app;
         uint8_t bytes[5];
         size_t length;
-        uint32_t response;
+        uint32_t payload;
         int status;
     } cases[] = {
-        {CMD16_SET_BLOCKLEN, false, {0x00}, 1, 0x00, BD_ERROR_OK},
-        {CMD16_SET_BLOCKLEN, false, {0x01}, 1, 0x01, SD_BLOCK_DEVICE_ERROR_NO_INIT},
-        {CMD16_SET_BLOCKLEN, false, {0x02}, 1, 0x02, SD_BLOCK_DEVICE_ERROR_ERASE},
-        {CMD16_SET_BLOCKLEN, false, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
-        {CMD16_SET_BLOCKLEN, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
-        {CMD16_SET_BLOCKLEN, false, {0x10}, 1, 0x10, SD_BLOCK_DEVICE_ERROR_ERASE},
-        {CMD16_SET_BLOCKLEN, false, {0x20}, 1, 0x20, SD_BLOCK_DEVICE_ERROR_PARAMETER},
-        {CMD16_SET_BLOCKLEN, false, {0x40}, 1, 0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER},
-        {CMD16_SET_BLOCKLEN, false, {0x41}, 1, 0x41, SD_BLOCK_DEVICE_ERROR_PARAMETER},
-        {CMD16_SET_BLOCKLEN, false, {0x7F}, 1, 0x7F, SD_BLOCK_DEVICE_ERROR_CRC},
+        {CMD16_SET_BLOCKLEN, false, {0x00}, 1, 0, BD_ERROR_OK},
+        {CMD16_SET_BLOCKLEN, false, {0x01}, 1, 0, SD_BLOCK_DEVICE_ERROR_NO_INIT},
+        {CMD16_SET_BLOCKLEN, false, {0x02}, 1, 0, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {CMD16_SET_BLOCKLEN, false, {0x04}, 1, 0, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {CMD16_SET_BLOCKLEN, false, {0x08}, 1, 0, SD_BLOCK_DEVICE_ERROR_CRC},
+        {CMD16_SET_BLOCKLEN, false, {0x10}, 1, 0, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {CMD16_SET_BLOCKLEN, false, {0x20}, 1, 0, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {CMD16_SET_BLOCKLEN, false, {0x40}, 1, 0, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {CMD16_SET_BLOCKLEN, false, {0x41}, 1, 0, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {CMD16_SET_BLOCKLEN, false, {0x7F}, 1, 0, SD_BLOCK_DEVICE_ERROR_CRC},
         {CMD8_SEND_IF_COND, false, {1, 0x81, 0xA5, 0x5A, 0xC3}, 5,
          0x81A55AC3, BD_ERROR_OK},
-        {CMD8_SEND_IF_COND, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
-        {CMD8_SEND_IF_COND, false, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {CMD8_SEND_IF_COND, false, {0x08}, 1, 0, SD_BLOCK_DEVICE_ERROR_CRC},
+        {CMD8_SEND_IF_COND, false, {0x04}, 1, 0, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
         {CMD58_READ_OCR, false, {0, 0xC0, 0xFF, 0x80, 0}, 5,
          0xC0FF8000, BD_ERROR_OK},
-        {CMD58_READ_OCR, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
-        {CMD58_READ_OCR, false, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
-        {CMD13_SEND_STATUS, false, {0, 0x5A}, 2, 0x5A, BD_ERROR_OK},
-        {CMD13_SEND_STATUS, false, {1, 0x80}, 2, 0x0180,
+        {CMD58_READ_OCR, false, {0x08}, 1, 0, SD_BLOCK_DEVICE_ERROR_CRC},
+        {CMD58_READ_OCR, false, {0x04}, 1, 0, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {CMD13_SEND_STATUS, false, {0, 0x5A}, 2, 0, BD_ERROR_OK},
+        {CMD13_SEND_STATUS, false, {1, 0x80}, 2, 0,
          SD_BLOCK_DEVICE_ERROR_NO_INIT},
-        {CMD13_SEND_STATUS, false, {2, 0x5A}, 2, 0x025A, SD_BLOCK_DEVICE_ERROR_ERASE},
-        {CMD13_SEND_STATUS, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
+        {CMD13_SEND_STATUS, false, {2, 0x5A}, 2, 0, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {CMD13_SEND_STATUS, false, {0x08}, 1, 0, SD_BLOCK_DEVICE_ERROR_CRC},
         {ACMD13_SD_STATUS, true, {0, 0}, 2, 0, BD_ERROR_OK},
-        {ACMD13_SD_STATUS, true, {0, 0xA5}, 2, 0xA5, BD_ERROR_OK},
-        {ACMD13_SD_STATUS, true, {1, 0x80}, 2, 0x0180,
+        {ACMD13_SD_STATUS, true, {0, 0xA5}, 2, 0, BD_ERROR_OK},
+        {ACMD13_SD_STATUS, true, {1, 0x80}, 2, 0,
          SD_BLOCK_DEVICE_ERROR_NO_INIT},
-        {ACMD13_SD_STATUS, true, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {ACMD13_SD_STATUS, true, {0x04}, 1, 0, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
         {CMD38_ERASE, false, {0}, 1, 0, BD_ERROR_OK},
     };
     const char *outer_case = current_case;
@@ -1147,9 +1147,15 @@ static void test_command_alignment(unsigned shift) {
                 expect_status_block(expected, sizeof(expected), false);
             }
             expect_release();
-            uint32_t response = R1_NO_RESPONSE;
+            sd_command_response_t response;
             int status = _cmd(&config, cases[i].cmd, 0, cases[i].app, &response);
-            CHECK(response == cases[i].response);
+            CHECK(response.valid == (SD_RESP_R1 | (cases[i].app ? SD_RESP_PREFIX : 0) |
+                  (cases[i].length == 2 ? SD_RESP_R2 :
+                   cases[i].length == 5 ? SD_RESP_R3_R7 : 0)));
+            CHECK(response.prefix_r1 == 0);
+            CHECK(response.r1 == cases[i].bytes[0]);
+            CHECK(response.r2 == (cases[i].length == 2 ? cases[i].bytes[1] : 0));
+            CHECK(response.payload == cases[i].payload);
             if (cases[i].cmd == CMD8_SEND_IF_COND) {
                 CHECK(config.card_type ==
                       (cases[i].status == BD_ERROR_OK ? SDCARD_V2 :
@@ -1190,9 +1196,10 @@ static void test_command_stuff(unsigned shift) {
             expect_command_with_stuff(CMD16_SET_BLOCKLEN, 512, stuff[i]);
             expect_response_bits(&cases[j].r1, 8, shift, false);
             expect_release();
-            uint32_t response = R1_NO_RESPONSE;
+            sd_command_response_t response;
             finish(_cmd(&config, CMD16_SET_BLOCKLEN, 512, false, &response), cases[j].status);
-            CHECK(response == cases[j].r1);
+            CHECK(response.valid == SD_RESP_R1);
+            CHECK(response.r1 == cases[j].r1);
         }
     }
 }
@@ -1203,7 +1210,7 @@ static void test_command_retry(unsigned shift) {
         bool app;
         uint8_t bytes[5];
         size_t length;
-        uint32_t response;
+        uint32_t payload;
     } cases[] = {
         {CMD8_SEND_IF_COND, false, {1, 0x81, 0xA5, 0x5A, 0xC3}, 5, 0x81A55AC3},
         {CMD58_READ_OCR, false, {0, 0xC0, 0xFF, 0x80, 0}, 5, 0xC0FF8000},
@@ -1228,15 +1235,18 @@ static void test_command_retry(unsigned shift) {
             }
         }
         expect_release();
-        uint32_t response = R1_NO_RESPONSE;
+        sd_command_response_t response;
         finish(_cmd(&config, cases[i].cmd, 0, cases[i].app, &response), BD_ERROR_OK);
-        CHECK(response == cases[i].response);
+        CHECK(response.valid == (SD_RESP_R1 | (cases[i].app ? SD_RESP_PREFIX : SD_RESP_R3_R7)));
+        CHECK(response.prefix_r1 == 0);
+        CHECK(response.r1 == cases[i].bytes[0]);
+        CHECK(response.payload == cases[i].payload);
     }
 }
 
 // R1b busy is optional (SD v9.10, section 7.3.2.2, p.302); shifted R1
 // tolerance and preserving specific errors over timeout are driver policy.
-static void test_busy_alignment(unsigned shift) {
+static void test_busy_alignment(unsigned shift, bool discard) {
     for (unsigned error = 0; error < 2; ++error) {
         for (unsigned busy = 0; busy < 3; ++busy) {
             bool timeout = busy == 2;
@@ -1255,9 +1265,13 @@ static void test_busy_alignment(unsigned shift) {
             expect_release();
             int expected = error ? SD_BLOCK_DEVICE_ERROR_PARAMETER :
                            timeout ? SD_BLOCK_DEVICE_ERROR_NO_RESPONSE : BD_ERROR_OK;
-            uint32_t response = R1_NO_RESPONSE;
-            finish(_cmd(&config, CMD38_ERASE, 0, false, &response), expected);
-            CHECK(response == r1);
+            sd_command_response_t response;
+            finish(_cmd(&config, CMD38_ERASE, 0, false, discard ? NULL : &response), expected);
+            if (!discard) {
+                CHECK(response.valid == SD_RESP_R1);
+                CHECK(response.r1 == r1);
+                CHECK(response.prefix_r1 == 0 && response.r2 == 0 && response.payload == 0);
+            }
         }
     }
 }
@@ -1291,7 +1305,7 @@ static void test_read_command_alignment(unsigned shift) {
 
 // A valid CMD55 prefix is required before every application command. Fail
 // closed when the prefix is unanswered or reports an R1 error.
-static void test_app_prefix_failure(unsigned shift) {
+static void test_app_prefix_failure(unsigned shift, bool discard) {
     static const struct {
         uint8_t response;
         int status;
@@ -1326,9 +1340,17 @@ static void test_app_prefix_failure(unsigned shift) {
                 }
             }
             expect_release();
-            uint32_t response = 0x12345678;
-            finish(_cmd(&config, commands[cmd], 0, true, &response), cases[i].status);
-            CHECK(response == cases[i].response);
+            sd_command_response_t response;
+            memset(&response, 0xA5, sizeof(response));
+            finish(_cmd(&config, commands[cmd], 0, true, discard ? NULL : &response), cases[i].status);
+            if (!discard) {
+                CHECK(response.valid == (cases[i].response == R1_NO_RESPONSE ? 0 : SD_RESP_PREFIX));
+                CHECK(response.prefix_r1 ==
+                      (cases[i].response == R1_NO_RESPONSE ? 0 : cases[i].response));
+                CHECK(response.r1 == 0);
+                CHECK(response.r2 == 0);
+                CHECK(response.payload == 0);
+            }
         }
     }
     current_case = outer_case;
@@ -1413,10 +1435,11 @@ static void test_acmd13_data(void) {
                 }
                 expect_release();
 
-                uint32_t response = R1_NO_RESPONSE;
+                sd_command_response_t response;
                 mutex_enter_blocking(&config._mutex);
                 CHECK(_cmd(&config, ACMD13_SD_STATUS, 0, true, &response) == BD_ERROR_OK);
-                CHECK(response == 0xA5);
+                CHECK(response.valid == (SD_RESP_PREFIX | SD_RESP_R1 | SD_RESP_R2));
+                CHECK(response.prefix_r1 == 0 && response.r1 == 0 && response.r2 == 0xA5);
                 CHECK(!cs_high);
                 int status = _read_bytes(&config, actual + 1, 64, false);
                 int expected_status = cases[i].corrupt_crc && !crc ?
@@ -1448,10 +1471,11 @@ static void test_cmd13_release(void) {
     expect_spi(0xFF, 0xA5, false, 1);
     expect_release();
 
-    uint32_t response = R1_NO_RESPONSE;
+    sd_command_response_t response;
     mutex_enter_blocking(&config._mutex);
     int status = _cmd(&config, CMD13_SEND_STATUS, 0, false, &response);
-    CHECK(response == 0xA5);
+    CHECK(response.valid == (SD_RESP_R1 | SD_RESP_R2));
+    CHECK(response.r1 == 0 && response.r2 == 0xA5);
     finish_r2_and_read(status, BD_ERROR_OK);
 }
 
@@ -1462,7 +1486,7 @@ static void test_cmd13_release(void) {
 // FreeBSD corroborates preserving them as status:
 // https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L1677-L1765
 //
-// Check existing R1 error precedence, diagnostic packing, mutex-held CS cleanup,
+// Check existing R1 error precedence, response fields, mutex-held CS cleanup,
 // and follow-on public I/O without resetting the mock state.
 // CRC/illegal-command errors have only R1 (p.302). Other responses retain both
 // bytes, and ACMD13 reads its data block whenever R1 succeeds.
@@ -1511,8 +1535,6 @@ static void test_r2_status(void) {
                 uint8_t r1 = r1_cases[r].r1;
                 bool reads_second = !(r1 & (0x04 | 0x08));
                 int expected_status = r1_cases[r].status;
-                uint32_t expected_response = reads_second ?
-                    ((uint32_t)r1 << 8) | second_cases[s] : r1;
                 bool read_status_block = app && expected_status == BD_ERROR_OK;
                 uint8_t expected[64];
                 uint8_t actual[64] = {0};
@@ -1533,11 +1555,16 @@ static void test_r2_status(void) {
                     expect_status_block(expected, sizeof(expected), false);
                 }
                 expect_release();
-                uint32_t response = R1_NO_RESPONSE;
+                sd_command_response_t response;
                 mutex_enter_blocking(&config._mutex);
                 int status = _cmd(&config, CMD13_SEND_STATUS, 0, app, &response);
                 CHECK(status == expected_status);
-                CHECK(response == expected_response);
+                CHECK(response.valid == (SD_RESP_R1 | (app ? SD_RESP_PREFIX : 0) |
+                      (reads_second ? SD_RESP_R2 : 0)));
+                CHECK(response.prefix_r1 == 0);
+                CHECK(response.r1 == r1);
+                CHECK(response.r2 == (reads_second ? second_cases[s] : 0));
+                CHECK(response.payload == 0);
                 if (read_status_block) {
                     CHECK(!cs_high);
                     status = _read_bytes(&config, actual, sizeof(actual), false);
@@ -1566,9 +1593,10 @@ static void test_app_prefix_retry(unsigned shift) {
     expect_response_bits(&response, 8, (shift + 3) % 8, false);
     expect_release();
 
-    uint32_t result = R1_NO_RESPONSE;
+    sd_command_response_t result;
     finish(_cmd(&config, ACMD41_SD_SEND_OP_COND, 0, true, &result), BD_ERROR_OK);
-    CHECK(result == 0);
+    CHECK(result.valid == (SD_RESP_PREFIX | SD_RESP_R1));
+    CHECK(result.prefix_r1 == 0 && result.r1 == 0);
 }
 
 // Exercise a full token wait across the 32-bit millisecond rollover, including
@@ -1599,8 +1627,8 @@ static void test_wide_busy_timeout(void) {
 
 // Commands are rejected during busy (SD v9.10, section 7.2.8, p.292).
 // Check that readiness timeout sends no ordinary/application command and
-// leaves the response sentinel, with exactly one release and no extra bytes.
-static void test_command_busy(bool app_command) {
+// leaves command R1 absent, with exactly one release and no extra bytes.
+static void test_command_busy(bool app_command, bool discard) {
     reset_card();
     expect_select();
     if (app_command) {
@@ -1610,9 +1638,14 @@ static void test_command_busy(bool app_command) {
     }
     expect_spi(0xFF, 0, false, CONF_SD_CMD_TIMEOUT);
     expect_release();
-    uint32_t response = 0x12345678;
-    int status = _cmd(&config, app_command ? 41 : 16, 0, app_command, &response);
-    CHECK(response == R1_NO_RESPONSE);
+    sd_command_response_t response;
+    memset(&response, 0xA5, sizeof(response));
+    int status = _cmd(&config, app_command ? 41 : 16, 0, app_command, discard ? NULL : &response);
+    if (!discard) {
+        CHECK(response.valid == (app_command ? SD_RESP_PREFIX : 0));
+        CHECK(response.prefix_r1 == 0 && response.r1 == 0);
+        CHECK(response.r2 == 0 && response.payload == 0);
+    }
     finish(status, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
 
     if (!app_command) {
@@ -1889,9 +1922,13 @@ static void test_idle_command(int cmd, bool is_acmd, uint8_t r1, int expected) {
         expect_spi(0xFF, 0, false, 4);
     }
     expect_release();
-    uint32_t response = R1_NO_RESPONSE;
+    sd_command_response_t response;
     finish(_cmd(&config, cmd, 0, is_acmd, &response), expected);
-    CHECK(response == (expected == BD_ERROR_OK && (cmd == 8 || cmd == 58) ? 0 : r1));
+    CHECK(response.valid == (SD_RESP_R1 | (is_acmd ? SD_RESP_PREFIX : 0) |
+          (expected == BD_ERROR_OK && (cmd == 8 || cmd == 58) ? SD_RESP_R3_R7 : 0)));
+    CHECK(response.prefix_r1 == (is_acmd ? R1_IDLE_STATE : 0));
+    CHECK(response.r1 == r1);
+    CHECK(response.payload == 0);
 }
 
 // R1b permits optional busy bytes; zero means busy and nonzero means ready
@@ -1924,9 +1961,10 @@ static void test_erase_busy_timeout(void) {
     expect_spi(0xFF, 0, false, 1);
     expect_spi(0xFF, 0, false, CONF_SD_CMD_TIMEOUT);
     expect_release();
-    uint32_t response = R1_NO_RESPONSE;
+    sd_command_response_t response;
     finish(_cmd(&config, 38, 0, false, &response), SD_BLOCK_DEVICE_ERROR_NO_RESPONSE);
-    CHECK(response == 0);
+    CHECK(response.valid == SD_RESP_R1);
+    CHECK(response.r1 == 0);
 }
 
 // Power-up needs at least 74 clocks with CS/DI high (SD v3.01, section 6.4.1, p.111).
@@ -2602,9 +2640,102 @@ static void test_response_arithmetic(void) {
         }
         expect_release();
 
-        uint32_t response = R1_NO_RESPONSE;
+        sd_command_response_t response;
         finish(_cmd(&config, cases[i].cmd, 0, false, &response), BD_ERROR_OK);
-        CHECK(response == cases[i].expected);
+        CHECK(response.valid == (SD_RESP_R1 | SD_RESP_R3_R7));
+        CHECK(response.r1 == cases[i].r1);
+        CHECK(response.payload == cases[i].expected);
+    }
+}
+
+static void test_response_errors(unsigned shift) {
+    static const int commands[] = {
+        CMD16_SET_BLOCKLEN, CMD13_SEND_STATUS, CMD8_SEND_IF_COND, CMD58_READ_OCR,
+    };
+    static const struct {
+        uint8_t r1;
+        int status;
+    } errors[] = {
+        {R1_IDLE_STATE, SD_BLOCK_DEVICE_ERROR_NO_INIT},
+        {R1_COM_CRC_ERROR, SD_BLOCK_DEVICE_ERROR_CRC},
+        {R1_ILLEGAL_COMMAND, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {R1_ERASE_RESET, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {R1_ERASE_SEQUENCE_ERROR, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {R1_ADDRESS_ERROR, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {R1_PARAMETER_ERROR, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+    };
+    const char *outer_case = current_case;
+    for (size_t c = 0; c < sizeof(commands) / sizeof(commands[0]); ++c) {
+        for (size_t e = 0; e < sizeof(errors) / sizeof(errors[0]); ++e) {
+            for (unsigned discard = 0; discard < 2; ++discard) {
+                char name[128];
+                snprintf(name, sizeof(name), "%s/cmd-%d/r1-%02x/null-%u",
+                         outer_case, commands[c], errors[e].r1, discard);
+                current_case = name;
+                reset_card();
+                int cmd = commands[c];
+                uint8_t r1 = errors[e].r1;
+                bool payload = cmd == CMD8_SEND_IF_COND || cmd == CMD58_READ_OCR;
+                bool rejected = (r1 & (R1_COM_CRC_ERROR | R1_ILLEGAL_COMMAND)) ||
+                                (r1 == R1_IDLE_STATE && cmd == CMD16_SET_BLOCKLEN);
+                uint8_t bytes[] = {r1, 0x81, 0xA5, 0x5A, 0xC3};
+                size_t length = rejected ? 1 : payload ? 5 : cmd == CMD13_SEND_STATUS ? 2 : 1;
+                int expected = r1 == R1_IDLE_STATE && payload ? BD_ERROR_OK : errors[e].status;
+                expect_select();
+                expect_spi(0xFF, 0xFF, false, 1);
+                expect_command(cmd, 0);
+                expect_response_bits(bytes, length * 8, shift, false);
+                expect_release();
+
+                sd_command_response_t response;
+                memset(&response, 0xA5, sizeof(response));
+                finish(_cmd(&config, cmd, 0, false, discard ? NULL : &response), expected);
+                if (!discard) {
+                    CHECK(response.valid == (SD_RESP_R1 |
+                          (length == 2 ? SD_RESP_R2 : length == 5 ? SD_RESP_R3_R7 : 0)));
+                    CHECK(response.prefix_r1 == 0);
+                    CHECK(response.r1 == r1);
+                    CHECK(response.r2 == (length == 2 ? 0x81 : 0));
+                    CHECK(response.payload == (length == 5 ? 0x81A55AC3 : 0));
+                }
+            }
+        }
+    }
+    current_case = outer_case;
+}
+
+// Only the final attempt contributes evidence. In particular, a successful
+// prefix from an earlier attempt must not survive an unanswered final prefix.
+static void test_response_no_reply(bool app, bool lose_prefix) {
+    for (unsigned discard = 0; discard < 2; ++discard) {
+        reset_card();
+        observing_ready_io = true;
+        expect_select();
+        expect_spi(0xFF, 0xFF, false, 1);
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            if (app) {
+                expect_command(CMD55_APP_CMD, 0);
+                if (lose_prefix && attempt != 0) {
+                    expect_spi(0xFF, 0xFF, false, 16);
+                    continue;
+                }
+                expect_spi(0xFF, R1_IDLE_STATE, false, 1);
+                expect_spi(0xFF, 0xFF, false, 1);
+            }
+            expect_command(app ? ACMD13_SD_STATUS : CMD13_SEND_STATUS, 0);
+            expect_spi(0xFF, 0xFF, false, 16);
+        }
+        expect_release();
+        sd_command_response_t response;
+        memset(&response, 0xA5, sizeof(response));
+        mutex_enter_blocking(&config._mutex);
+        int status = _cmd(&config, CMD13_SEND_STATUS, 0, app, discard ? NULL : &response);
+        if (!discard) {
+            CHECK(response.valid == (app && !lose_prefix ? SD_RESP_PREFIX : 0));
+            CHECK(response.prefix_r1 == (app && !lose_prefix ? R1_IDLE_STATE : 0));
+            CHECK(response.r1 == 0 && response.r2 == 0 && response.payload == 0);
+        }
+        finish_r2_and_read(status, SD_BLOCK_DEVICE_ERROR_NO_DEVICE);
     }
 }
 
@@ -2865,6 +2996,41 @@ static void test_idle_retries(bool exhausted) {
     CHECK(now_us == (exhausted ? SD_CMD0_GO_IDLE_STATE_RETRIES : 1u) * 1000);
 }
 
+static void test_idle_no_response(bool busy) {
+    reset_card();
+    config.is_initialized = device.is_initialized = false;
+    if (!busy) {
+        time_step_us = 0;
+    }
+    // An earlier error-bearing R1 must not replace the absent final R1.
+    expect_init_command(CMD0_GO_IDLE_STATE, 0, R1_IDLE_STATE | R1_COM_CRC_ERROR, 0);
+    for (unsigned i = 1; i < SD_CMD0_GO_IDLE_STATE_RETRIES; ++i) {
+        expect_select();
+        expect_spi(0xFF, busy ? 0 : 0xFF, false, busy ? SD_COMMAND_TIMEOUT : 1);
+        if (!busy) {
+            for (unsigned retry = 0; retry < 3; ++retry) {
+                expect_command(CMD0_GO_IDLE_STATE, 0);
+                expect_spi(0xFF, 0xFF, false, 16);
+            }
+        }
+        expect_release();
+    }
+    mutex_enter_blocking(&config._mutex);
+    uint8_t r1 = _go_idle_state(&config);
+    CHECK(config._mutex.locked);
+    CHECK(cs_high);
+    mutex_exit(&config._mutex);
+    finish(r1, R1_NO_RESPONSE);
+    if (!busy) {
+        CHECK(now_us == SD_CMD0_GO_IDLE_STATE_RETRIES * 1000);
+    }
+
+    // CMD0 may reset the card, so recover through public init before public I/O.
+    expect_top_init_setup(0, false);
+    finish_lifecycle(init, BD_ERROR_OK);
+    exercise_initialized_io(2048);
+}
+
 // Default-speed TRAN_SPEED is 25 MHz; 50 MHz needs High-Speed mode
 // (SD v9.10, section 5.3.2, p.227). Clamp/error behavior is driver policy.
 static void test_frequency(void) {
@@ -2887,6 +3053,9 @@ int main(void) {
     RUN_CASE("sd-status-token-rejection", test_register_token_rejection(true));
     RUN_CASE("multiblock-token-rejection", test_multiblock_token_rejection());
     RUN_CASE("response-arithmetic", test_response_arithmetic());
+    RUN_CASE("response-no-reply", test_response_no_reply(false, false));
+    RUN_CASE("response-app-no-reply", test_response_no_reply(true, false));
+    RUN_CASE("response-final-prefix-no-reply", test_response_no_reply(true, true));
     RUN_CASE("create-spi1-miso24", test_create_spi1_miso(24, false));
     RUN_CASE("create-spi1-miso28", test_create_spi1_miso(28, false));
     RUN_CASE("create-spi1-miso24-sdhc", test_create_spi1_miso(24, true));
@@ -2946,11 +3115,17 @@ int main(void) {
         snprintf(name, sizeof(name), "command-retry-%u", shift);
         RUN_CASE(name, test_command_retry(shift));
         snprintf(name, sizeof(name), "app-prefix-failure-%u", shift);
-        RUN_CASE(name, test_app_prefix_failure(shift));
+        RUN_CASE(name, test_app_prefix_failure(shift, false));
+        snprintf(name, sizeof(name), "app-prefix-failure-null-%u", shift);
+        RUN_CASE(name, test_app_prefix_failure(shift, true));
+        snprintf(name, sizeof(name), "response-errors-%u", shift);
+        RUN_CASE(name, test_response_errors(shift));
         snprintf(name, sizeof(name), "app-prefix-retry-%u", shift);
         RUN_CASE(name, test_app_prefix_retry(shift));
         snprintf(name, sizeof(name), "busy-alignment-%u", shift);
-        RUN_CASE(name, test_busy_alignment(shift));
+        RUN_CASE(name, test_busy_alignment(shift, false));
+        snprintf(name, sizeof(name), "busy-alignment-null-%u", shift);
+        RUN_CASE(name, test_busy_alignment(shift, true));
         snprintf(name, sizeof(name), "read-command-alignment-%u", shift);
         RUN_CASE(name, test_read_command_alignment(shift));
         snprintf(name, sizeof(name), "write-alignment-%u", shift);
@@ -2974,8 +3149,10 @@ int main(void) {
     RUN_CASE("multiblock-response-failure", test_program_response_failure(true));
     RUN_CASE("stop-first-response", test_stop_status(0, BD_ERROR_OK, 0));
     RUN_CASE("stop-illegal", test_stop_status(0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED, 2));
-    RUN_CASE("command-busy-timeout", test_command_busy(false));
-    RUN_CASE("app-command-busy-timeout", test_command_busy(true));
+    RUN_CASE("command-busy-timeout", test_command_busy(false, false));
+    RUN_CASE("app-command-busy-timeout", test_command_busy(true, false));
+    RUN_CASE("command-busy-timeout-null", test_command_busy(false, true));
+    RUN_CASE("app-command-busy-timeout-null", test_command_busy(true, true));
     RUN_CASE("multiblock-sdsc", test_multiblock(false, true));
     RUN_CASE("multiblock-sdhc", test_multiblock(true, true));
     RUN_CASE("multiblock-token-timeout", test_multiblock_data_failure(false, 0, false));
@@ -3037,6 +3214,8 @@ int main(void) {
     RUN_CASE("init-inputs", test_init_inputs());
     RUN_CASE("idle-retries", test_idle_retries(false));
     RUN_CASE("idle-exhausted", test_idle_retries(true));
+    RUN_CASE("idle-no-response", test_idle_no_response(false));
+    RUN_CASE("idle-readiness-timeout", test_idle_no_response(true));
     RUN_CASE("frequency", test_frequency());
     RUN_CASE("patterned-read", test_patterned_io(false, true));
     RUN_CASE("patterned-read-crc-disabled", test_patterned_io(false, false));
