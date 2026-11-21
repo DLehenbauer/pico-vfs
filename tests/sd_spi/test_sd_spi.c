@@ -1102,10 +1102,17 @@ static void test_command_alignment(unsigned shift) {
          0xC0FF8000, BD_ERROR_OK},
         {CMD58_READ_OCR, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
         {CMD58_READ_OCR, false, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
-        {CMD13_SEND_STATUS, false, {0, 0x5A}, 2, 0x5A, BD_ERROR_OK},
+        {CMD13_SEND_STATUS, false, {0, 0x5A}, 2, 0x5A,
+         SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED},
+        {CMD13_SEND_STATUS, false, {1, 0x80}, 2, 0x0180,
+         SD_BLOCK_DEVICE_ERROR_NO_INIT},
         {CMD13_SEND_STATUS, false, {2, 0x5A}, 2, 0x025A, SD_BLOCK_DEVICE_ERROR_ERASE},
         {CMD13_SEND_STATUS, false, {0x08}, 1, 0x08, SD_BLOCK_DEVICE_ERROR_CRC},
-        {ACMD13_SD_STATUS, true, {0, 0xA5}, 2, 0xA5, BD_ERROR_OK},
+        {ACMD13_SD_STATUS, true, {0, 0}, 2, 0, BD_ERROR_OK},
+        {ACMD13_SD_STATUS, true, {0, 0xA5}, 2, 0xA5,
+         SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED},
+        {ACMD13_SD_STATUS, true, {1, 0x80}, 2, 0x0180,
+         SD_BLOCK_DEVICE_ERROR_NO_INIT},
         {ACMD13_SD_STATUS, true, {0x04}, 1, 0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
         {CMD38_ERASE, false, {0}, 1, 0, BD_ERROR_OK},
     };
@@ -1337,7 +1344,7 @@ static void expect_acmd13_preamble(void) {
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(ACMD13_SD_STATUS, 0);
     expect_spi(0xFF, 0, false, 1);
-    expect_spi(0xFF, 0xA5, false, 1);
+    expect_spi(0xFF, 0, false, 1);
 }
 
 static void test_acmd13_data(bool corrupt_crc) {
@@ -1352,7 +1359,7 @@ static void test_acmd13_data(bool corrupt_crc) {
     uint32_t response = R1_NO_RESPONSE;
     int status = _cmd(&config, ACMD13_SD_STATUS, 0, true, &response);
     CHECK(status == BD_ERROR_OK);
-    CHECK(response == 0xA5);
+    CHECK(response == 0);
     CHECK(!cs_high);
     status = _read_bytes(&config, actual, sizeof(actual), false);
     if (corrupt_crc) {
@@ -1374,68 +1381,98 @@ static void test_cmd13_release(void) {
     expect_release();
 
     uint32_t response = R1_NO_RESPONSE;
-    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response), BD_ERROR_OK);
+    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response),
+           SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED);
     CHECK(response == 0xA5);
 }
 
-// CMD13 and ACMD13 share opcode 13 and return R2: R1 followed by a second
-// status byte. Preserve nonzero R1 status while returning the complete value.
+// Both commands return R2 (SD v9.10, Table 7-4, p.300 and section 7.3.2.3,
+// p.303). Error mapping is host policy: R1 takes precedence, then protection,
+// erase parameters, range/CSD overwrite, and generic device errors. Preserve
+// both bytes, except CRC/illegal-command errors which have only R1 (p.302).
 static void test_r2_status(void) {
     static const struct {
-        int cmd;
-        bool app;
-        uint8_t r1;
         uint8_t second;
-        bool reads_second;
-        uint32_t response;
         int status;
-    } cases[] = {
-        {CMD13_SEND_STATUS, false, 0x00, 0x5A, true, 0x005A, BD_ERROR_OK},
-        {CMD13_SEND_STATUS, false, 0x02, 0xA5, true, 0x02A5,
-         SD_BLOCK_DEVICE_ERROR_ERASE},
-        {CMD13_SEND_STATUS, false, R1_COM_CRC_ERROR, 0, false, R1_COM_CRC_ERROR,
-         SD_BLOCK_DEVICE_ERROR_CRC},
-        {ACMD13_SD_STATUS, true, 0x00, 0xA5, true, 0x00A5, BD_ERROR_OK},
-        {ACMD13_SD_STATUS, true, R1_ILLEGAL_COMMAND, 0, false, R1_ILLEGAL_COMMAND,
-         SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+    } second_cases[] = {
+        {0x00, BD_ERROR_OK},
+        {0x01, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED}, // Locked
+        {0x02, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED}, // WP skip / lock failure
+        {0x04, BD_ERROR_DEVICE_ERROR}, // General error
+        {0x08, BD_ERROR_DEVICE_ERROR}, // Card controller error
+        {0x10, BD_ERROR_DEVICE_ERROR}, // Card ECC failure, not wire CRC
+        {0x20, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED}, // WP violation
+        {0x40, SD_BLOCK_DEVICE_ERROR_ERASE}, // Erase parameters
+        {0x80, SD_BLOCK_DEVICE_ERROR_PARAMETER}, // Range / CSD overwrite
+        {0x1C, BD_ERROR_DEVICE_ERROR},
+        {0x9C, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0xDC, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0xFF, SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED},
+    };
+    static const struct {
+        uint8_t r1;
+        int status;
+    } r1_cases[] = {
+        {0x00, BD_ERROR_OK},
+        {0x01, SD_BLOCK_DEVICE_ERROR_NO_INIT},
+        {0x02, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0x10, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0x20, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0x61, SD_BLOCK_DEVICE_ERROR_PARAMETER},
+        {0x72, SD_BLOCK_DEVICE_ERROR_ERASE},
+        {0x08, SD_BLOCK_DEVICE_ERROR_CRC},
+        {0x04, SD_BLOCK_DEVICE_ERROR_UNSUPPORTED},
+        {0x7F, SD_BLOCK_DEVICE_ERROR_CRC},
     };
     const char *outer_case = current_case;
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-        char name[64];
-        snprintf(name, sizeof(name), "%s/case-%zu", outer_case, i);
-        current_case = name;
-        reset_card();
-        bool read_status_block = cases[i].app && cases[i].status == BD_ERROR_OK;
-        uint8_t expected[64];
-        uint8_t actual[64] = {0};
-        expect_select();
-        expect_spi(0xFF, 0xFF, false, 1);
-        if (cases[i].app) {
-            expect_command(CMD55_APP_CMD, 0);
-            expect_spi(0xFF, 0, false, 1);
-            expect_spi(0xFF, 0xFF, false, 1);
+    for (unsigned app = 0; app < 2; ++app) {
+        for (size_t r = 0; r < sizeof(r1_cases) / sizeof(r1_cases[0]); ++r) {
+            for (size_t s = 0; s < sizeof(second_cases) / sizeof(second_cases[0]); ++s) {
+                char name[96];
+                snprintf(name, sizeof(name), "%s/app-%u/r1-%zu/second-%zu",
+                         outer_case, app, r, s);
+                current_case = name;
+                reset_card();
+                uint8_t r1 = r1_cases[r].r1;
+                bool reads_second = !(r1 & (0x04 | 0x08));
+                int expected_status = r1_cases[r].status == BD_ERROR_OK ?
+                                      second_cases[s].status : r1_cases[r].status;
+                uint32_t expected_response = reads_second ?
+                    ((uint32_t)r1 << 8) | second_cases[s].second : r1;
+                bool read_status_block = app && expected_status == BD_ERROR_OK;
+                uint8_t expected[64];
+                uint8_t actual[64] = {0};
+                expect_select();
+                expect_spi(0xFF, 0xFF, false, 1);
+                if (app) {
+                    expect_command(CMD55_APP_CMD, 0);
+                    expect_spi(0xFF, 0, false, 1);
+                    expect_spi(0xFF, 0xFF, false, 1);
+                }
+                expect_command(CMD13_SEND_STATUS, 0);
+                expect_spi(0xFF, r1, false, 1);
+                if (reads_second) {
+                    expect_spi(0xFF, second_cases[s].second, false, 1);
+                }
+                if (read_status_block) {
+                    fill_pattern(expected, sizeof(expected));
+                    expect_status_block(expected, sizeof(expected), false);
+                }
+                expect_release();
+                uint32_t response = R1_NO_RESPONSE;
+                int status = _cmd(&config, CMD13_SEND_STATUS, 0, app, &response);
+                CHECK(status == expected_status);
+                CHECK(response == expected_response);
+                if (read_status_block) {
+                    CHECK(!cs_high);
+                    status = _read_bytes(&config, actual, sizeof(actual), false);
+                    CHECK(status == BD_ERROR_OK);
+                    CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+                }
+                finish(status, expected_status);
+            }
         }
-        expect_command(cases[i].cmd, 0);
-        expect_spi(0xFF, cases[i].r1, false, 1);
-        if (cases[i].reads_second) {
-            expect_spi(0xFF, cases[i].second, false, 1);
-        }
-        if (read_status_block) {
-            fill_pattern(expected, sizeof(expected));
-            expect_status_block(expected, sizeof(expected), false);
-        }
-        expect_release();
-        uint32_t response = R1_NO_RESPONSE;
-        int status = _cmd(&config, cases[i].cmd, 0, cases[i].app, &response);
-        CHECK(status == cases[i].status);
-        CHECK(response == cases[i].response);
-        if (read_status_block) {
-            CHECK(!cs_high);
-            status = _read_bytes(&config, actual, sizeof(actual), false);
-            CHECK(status == BD_ERROR_OK);
-            CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
-        }
-        finish(status, cases[i].status);
     }
     current_case = outer_case;
 }

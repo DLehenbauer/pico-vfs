@@ -73,6 +73,16 @@ typedef struct {
 #define R1_ADDRESS_ERROR        (1 << 5)
 #define R1_PARAMETER_ERROR      (1 << 6)
 
+/* R2 second-byte status (SD v9.10, section 7.3.2.3, p.303). */
+#define R2_CARD_LOCKED          (1 << 0)
+#define R2_WP_ERASE_SKIP_OR_LOCK_FAILED (1 << 1)
+#define R2_ERROR                (1 << 2)
+#define R2_CC_ERROR             (1 << 3)
+#define R2_CARD_ECC_FAILED      (1 << 4)
+#define R2_WP_VIOLATION         (1 << 5)
+#define R2_ERASE_PARAMETER      (1 << 6)
+#define R2_OUT_OF_RANGE_OR_CSD_OVERWRITE (1 << 7)
+
 /* R3 Response : OCR Register */
 #define OCR_HCS_CCS             (0x1 << 30)
 #define OCR_LOW_VOLTAGE         (0x01 << 24)
@@ -435,6 +445,11 @@ static uint8_t _cmd_spi(void *_config, int cmd, uint32_t arg,
     return R1_NO_RESPONSE;
 }
 
+// Command helpers do not lock. A production ACMD13 caller must hold _mutex
+// across _cmd() and _read_bytes(config, buffer, 64, false), then unlock on every
+// exit. _cmd() releases CS on error; successful ACMD13 leaves CS low and
+// _read_bytes() releases it on success, token timeout, or CRC failure. If the
+// caller aborts between these helpers, it must release CS itself exactly once.
 static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_acmd,
                                   uint32_t *resp, uint64_t busy_timeout) {
     blockdevice_sd_config_t *config = _config;
@@ -553,8 +568,11 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
                         cmd == CMD59_CRC_ON_OFF || cmd == CMD55_APP_CMD ||
                         (is_acmd && cmd == ACMD41_SD_SEND_OP_COND);
     if (BD_ERROR_OK == status && (response & R1_IDLE_STATE) && !accepts_idle) {
-        _postclock_then_deselect(config);
-        return SD_BLOCK_DEVICE_ERROR_NO_INIT;
+        status = SD_BLOCK_DEVICE_ERROR_NO_INIT;
+        if (CMD13_SEND_STATUS != cmd) {
+            _postclock_then_deselect(config);
+            return status;
+        }
     }
 
     // R2 adds one status byte. R3/R7 add four bytes after R1
@@ -588,12 +606,30 @@ static int _cmd_with_busy_timeout(void *_config, int cmd, uint32_t arg, bool is_
             }
             break;
 
-        // CMD13 and ACMD13 both use opcode 13 and return SPI R2. Preserve R1
-        // while appending the second status byte.
-        case ACMD13_SD_STATUS:             // Response R2
-            response = (response << 8) | _read_response_byte(config, &alignment);
+        // CMD13 and ACMD13 both return R2 (SD v9.10, Table 7-4, p.300 and
+        // section 7.3.2.3, p.303); only ACMD13 adds a data block.
+        case CMD13_SEND_STATUS: {          // Response R2
+            uint8_t second = _read_response_byte(config, &alignment);
+            response = (response << 8) | second;
+            // Host policy: retain any R1 error (including idle), otherwise
+            // prefer protection, erase, parameter, then generic device errors.
+            // ECC failure is internal to the card, not a transport CRC error.
+            // Overloaded bits cannot be disambiguated without command history.
+            if (BD_ERROR_OK == status) {
+                if (second & (R2_CARD_LOCKED | R2_WP_ERASE_SKIP_OR_LOCK_FAILED |
+                              R2_WP_VIOLATION)) {
+                    status = SD_BLOCK_DEVICE_ERROR_WRITE_PROTECTED;
+                } else if (second & R2_ERASE_PARAMETER) {
+                    status = SD_BLOCK_DEVICE_ERROR_ERASE;
+                } else if (second & R2_OUT_OF_RANGE_OR_CSD_OVERWRITE) {
+                    status = SD_BLOCK_DEVICE_ERROR_PARAMETER;
+                } else if (second & (R2_ERROR | R2_CC_ERROR | R2_CARD_ECC_FAILED)) {
+                    status = BD_ERROR_DEVICE_ERROR;
+                }
+            }
             debug_if(SD_DBG, "R2: 0x%" PRIx32 "\n", response);
             break;
+        }
 
         default:                            // Response R1
             break;
