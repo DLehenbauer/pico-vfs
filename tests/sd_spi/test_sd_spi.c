@@ -1345,40 +1345,102 @@ static void expect_acmd13_preamble(uint8_t second) {
     expect_spi(0xFF, second, false, 1);
 }
 
+static void finish_r2_and_read(int status, int expected) {
+    CHECK(config._mutex.locked);
+    CHECK(mutex_entries == 1 && mutex_exits == 0);
+    CHECK(cs_high);
+    mutex_exit(&config._mutex);
+    finish(status, expected);
+
+    // Do not reset the card, bus, time, or mutex before the next public operation.
+    // The next scripted response is ready. This tests host cleanup, not whether
+    // a physical card has independently left idle or recovered from an error.
+    uint8_t buffer[514];
+    memset(buffer, 0xA5, sizeof(buffer));
+    expect_start(1, config.card_type == SDCARD_V2HC ? 1 : 512, 0);
+    expect_block(0x42);
+    expect_release();
+    finish(device.read(&device, buffer + 1, 512, 512), BD_ERROR_OK);
+    CHECK(mutex_entries == 2 && mutex_exits == 2);
+    CHECK(buffer[0] == 0xA5 && buffer[513] == 0xA5);
+    for (size_t i = 1; i <= 512; ++i) {
+        CHECK(buffer[i] == 0x42);
+    }
+}
+
 // Nonzero R2 status must not skip the full 64-byte data phase or its CRC check.
 // FreeBSD likewise completes attached data before translating status:
 // https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L2005-L2198
 //
-// These private-helper tests do not establish a public caller's mutex contract.
-// Public-entry tests must cover the full block, token timeout, CRC failure,
-// CS/mutex release on every exit, and subsequent I/O.
-static void test_acmd13_data(bool corrupt_crc) {
-    reset_card();
-    uint8_t expected[64];
-    uint8_t actual[64] = {0};
-    fill_pattern(expected, sizeof(expected));
-    expect_acmd13_preamble(0xA5);
-    expect_status_block(expected, sizeof(expected), corrupt_crc);
-    expect_release();
+// Act as the caller: hold the mutex through command, data, and CS cleanup,
+// then release it before follow-on public I/O. A future public SD Status API
+// still needs equivalent tests through its own entry point.
+static void test_acmd13_data(void) {
+    static const struct {
+        uint8_t token;
+        bool corrupt_crc;
+        int status;
+    } cases[] = {
+        {0xFE, false, BD_ERROR_OK},
+        {0xFE, true, SD_BLOCK_DEVICE_ERROR_CRC},
+        {0xFF, false, SD_BLOCK_DEVICE_ERROR_NO_RESPONSE},
+        {0x00, false, BD_ERROR_DEVICE_ERROR},
+        {0x04, false, BD_ERROR_DEVICE_ERROR},
+        {0x80, false, BD_ERROR_DEVICE_ERROR},
+    };
+    const char *outer_case = current_case;
+    for (unsigned hc = 0; hc < 2; ++hc) {
+        for (unsigned crc = 0; crc < 2; ++crc) {
+            for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+                char name[96];
+                snprintf(name, sizeof(name), "%s/hc-%u/crc-%u/case-%zu",
+                         outer_case, hc, crc, i);
+                current_case = name;
+                reset_card();
+                config.card_type = hc ? SDCARD_V2HC : SDCARD_V1;
+                config.enable_crc = crc;
+                observing_ready_io = true;
+                uint8_t expected[64];
+                uint8_t actual[66];
+                memset(actual, 0xA5, sizeof(actual));
+                fill_pattern(expected, sizeof(expected));
+                expect_acmd13_preamble(0xA5);
+                if (cases[i].token == 0xFE) {
+                    expect_status_block(expected, sizeof(expected), cases[i].corrupt_crc);
+                } else {
+                    expect_spi(0xFF, cases[i].token, false,
+                               cases[i].token == 0xFF ? 300 : 1);
+                }
+                expect_release();
 
-    uint32_t response = R1_NO_RESPONSE;
-    int status = _cmd(&config, ACMD13_SD_STATUS, 0, true, &response);
-    CHECK(status == BD_ERROR_OK);
-    CHECK(response == 0xA5);
-    CHECK(!cs_high);
-    status = _read_bytes(&config, actual, sizeof(actual), false);
-    if (corrupt_crc) {
-        CHECK(status == SD_BLOCK_DEVICE_ERROR_CRC);
-    } else {
-        CHECK(status == BD_ERROR_OK);
-        CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
+                uint32_t response = R1_NO_RESPONSE;
+                mutex_enter_blocking(&config._mutex);
+                CHECK(_cmd(&config, ACMD13_SD_STATUS, 0, true, &response) == BD_ERROR_OK);
+                CHECK(response == 0xA5);
+                CHECK(!cs_high);
+                int status = _read_bytes(&config, actual + 1, 64, false);
+                int expected_status = cases[i].corrupt_crc && !crc ?
+                    BD_ERROR_OK : cases[i].status;
+                CHECK(status == expected_status);
+                CHECK(actual[0] == 0xA5 && actual[65] == 0xA5);
+                if (cases[i].token == 0xFE) {
+                    CHECK(memcmp(actual + 1, expected, sizeof(expected)) == 0);
+                } else {
+                    for (size_t j = 0; j < sizeof(actual); ++j) {
+                        CHECK(actual[j] == 0xA5);
+                    }
+                }
+                finish_r2_and_read(status, expected_status);
+            }
+        }
     }
-    finish(status, corrupt_crc ? SD_BLOCK_DEVICE_ERROR_CRC : BD_ERROR_OK);
+    current_case = outer_case;
 }
 
 // Bare CMD13 releases CS after R2, including when second-byte flags are set.
 static void test_cmd13_release(void) {
     reset_card();
+    observing_ready_io = true;
     expect_select();
     expect_spi(0xFF, 0xFF, false, 1);
     expect_command(CMD13_SEND_STATUS, 0);
@@ -1387,8 +1449,10 @@ static void test_cmd13_release(void) {
     expect_release();
 
     uint32_t response = R1_NO_RESPONSE;
-    finish(_cmd(&config, CMD13_SEND_STATUS, 0, false, &response), BD_ERROR_OK);
+    mutex_enter_blocking(&config._mutex);
+    int status = _cmd(&config, CMD13_SEND_STATUS, 0, false, &response);
     CHECK(response == 0xA5);
+    finish_r2_and_read(status, BD_ERROR_OK);
 }
 
 // Both commands return R2 (SD v9.10, Table 7-4, p.300 and section 7.3.2.3,
@@ -1398,7 +1462,8 @@ static void test_cmd13_release(void) {
 // FreeBSD corroborates preserving them as status:
 // https://github.com/freebsd/freebsd-src/blob/6dc19a71f70c99b36e4384aff75b3d71033e71c5/sys/dev/mmc/mmcspi.c#L1677-L1765
 //
-// Check existing R1 error precedence, diagnostic packing, and CS cleanup.
+// Check existing R1 error precedence, diagnostic packing, mutex-held CS cleanup,
+// and follow-on public I/O without resetting the mock state.
 // CRC/illegal-command errors have only R1 (p.302). Other responses retain both
 // bytes, and ACMD13 reads its data block whenever R1 succeeds.
 static void test_r2_status(void) {
@@ -1442,6 +1507,7 @@ static void test_r2_status(void) {
                          outer_case, app, r, s);
                 current_case = name;
                 reset_card();
+                observing_ready_io = true;
                 uint8_t r1 = r1_cases[r].r1;
                 bool reads_second = !(r1 & (0x04 | 0x08));
                 int expected_status = r1_cases[r].status;
@@ -1468,6 +1534,7 @@ static void test_r2_status(void) {
                 }
                 expect_release();
                 uint32_t response = R1_NO_RESPONSE;
+                mutex_enter_blocking(&config._mutex);
                 int status = _cmd(&config, CMD13_SEND_STATUS, 0, app, &response);
                 CHECK(status == expected_status);
                 CHECK(response == expected_response);
@@ -1477,7 +1544,7 @@ static void test_r2_status(void) {
                     CHECK(status == BD_ERROR_OK);
                     CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
                 }
-                finish(status, expected_status);
+                finish_r2_and_read(status, expected_status);
             }
         }
     }
@@ -2838,8 +2905,7 @@ int main(void) {
     RUN_CASE("top-init-frequency-error", test_top_init(3));
     RUN_CASE("top-init-card-error", test_top_init(4));
     RUN_CASE("deinit-reinit", test_deinit_reinit());
-    RUN_CASE("acmd13-status-data", test_acmd13_data(false));
-    RUN_CASE("acmd13-status-crc", test_acmd13_data(true));
+    RUN_CASE("acmd13-status-data-recovery", test_acmd13_data());
     RUN_CASE("cmd13-release", test_cmd13_release());
     RUN_CASE("r2-status", test_r2_status());
     RUN_CASE("init-crc-enabled", test_init_crc(true, false));
