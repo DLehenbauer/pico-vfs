@@ -414,6 +414,7 @@ int _open(const char *path, int oflags, ...) {
         return _error_remap(-ENOENT);
     }
     const char *entity_path = remove_prefix(path, mp->dir);
+    if (entity_path[0] == '\0') entity_path = "/";
     // find file descriptor
     int fd = _assign_file_descriptor();
     if (fd == -1) {

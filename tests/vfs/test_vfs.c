@@ -66,6 +66,7 @@ void stdio_flush(void) { fflush(stdout); }
 static void test_exclusive_create(const char *prefix) {
     static const char payload[] = "preserved";
     static const int variants[] = {0, O_TRUNC, O_APPEND, O_TRUNC | O_APPEND};
+    const char *mountpoint = prefix[0] == '\0' ? "/" : prefix;
     char path[64] = {0}, recovery[64] = {0}, directory[64] = {0};
     CHECK(snprintf(path, sizeof(path), "%s/exclusive.bin", prefix) > 0);
     CHECK(snprintf(recovery, sizeof(recovery), "%s/recovery.bin", prefix) > 0);
@@ -78,6 +79,9 @@ static void test_exclusive_create(const char *prefix) {
     for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); ++i) {
         errno = 0;
         CHECK(open(path, flags | variants[i], 0644) == -1);
+        CHECK(errno == EEXIST);
+        errno = 0;
+        CHECK(open(mountpoint, flags | variants[i], 0644) == -1);
         CHECK(errno == EEXIST);
         int next = open(recovery, flags, 0644);
         CHECK(next == original + 1);
@@ -125,6 +129,8 @@ static void test_heap_backend(bool fat) {
     CHECK(heap != NULL && fs != NULL);
     CHECK(fs_format(fs, heap) == 0);
     CHECK(fs_mount("/", fs, heap) == 0);
+    fs_file_t empty = {0};
+    CHECK(fs->file_open(fs, &empty, "", O_CREAT | O_EXCL | O_RDWR) == -EINVAL);
     test_exclusive_create("");
     CHECK(fs_unmount("/") == 0);
     errno = 0;
