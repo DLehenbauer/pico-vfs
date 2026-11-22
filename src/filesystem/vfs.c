@@ -5,6 +5,7 @@
  */
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <sys/errno.h>
 #include <sys/dirent.h>
 #include <sys/unistd.h>
@@ -45,13 +46,15 @@ static size_t max_dir_descriptor = 0;                      // Dir descriptor cur
 static dir_descriptor_t *dir_descriptor = NULL;            // Dir descriptor and file system map
 static recursive_mutex_t __attribute__((unused)) _mutex;   // Recursive mutexes are used because recursive calls occur, e.g. on loopback devices
 
-static int _error_remap(int err) {
+/** Map negative errno results without narrowing successful offsets or byte counts. */
+static intmax_t _error_remap(intmax_t err) {
     if (err >= 0) {
         errno = 0;
         return err;
     }
 
-    errno = -err;
+    // Only error codes use int. Successful off_t/ssize_t results retain their width.
+    errno = (int)-err;
     return -1;
 }
 

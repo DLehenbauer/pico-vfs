@@ -1,5 +1,9 @@
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
+#include <stdint.h>
+
+#undef PATH_MAX
 #include "blockdevice/heap.h"
 #include "blockdevice/loopback.h"
 #include "filesystem/fat.h"
@@ -18,6 +22,25 @@
 
 static unsigned max_recursive_depth;
 static unsigned active_recursive_depth;
+static ssize_t injected_io_result;
+
+/** Return a configured read result without accessing an oversized test buffer. */
+static ssize_t injected_read(filesystem_t *fs, fs_file_t *file, void *buffer, size_t size) {
+    (void)fs;
+    (void)file;
+    (void)buffer;
+    (void)size;
+    return injected_io_result;
+}
+
+/** Return a configured write result without accessing an oversized test buffer. */
+static ssize_t injected_write(filesystem_t *fs, fs_file_t *file, const void *buffer, size_t size) {
+    (void)fs;
+    (void)file;
+    (void)buffer;
+    (void)size;
+    return injected_io_result;
+}
 
 int _open(const char *path, int flags, ...);
 int _close(int fd);
@@ -123,12 +146,63 @@ static void test_exclusive_create(const char *prefix) {
     CHECK(active_recursive_depth == 0);
 }
 
+/** Verify wide offsets and byte counts through public VFS entry points. */
+static void test_wide_results(filesystem_t *fs) {
+    int fd = open("/wide.bin", O_CREAT | O_RDWR, 0644);
+    CHECK(fd >= 3);
+    if (sizeof(off_t) > sizeof(int)) {
+        const off_t offsets[] = {
+            (off_t)(UINT64_C(1) << 32), (off_t)((uintmax_t)INT_MAX + 1),
+        };
+        for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+            CHECK(lseek(fd, offsets[i], SEEK_SET) == offsets[i]);
+            CHECK(errno == 0);
+            CHECK(lseek(fd, 0, SEEK_CUR) == offsets[i]);
+        }
+        // The wide seek must remain logical: returning to zero permits ordinary I/O.
+        CHECK(lseek(fd, (off_t)(UINT64_C(1) << 32), SEEK_SET) ==
+              (off_t)(UINT64_C(1) << 32));
+        CHECK(write(fd, "X", 1) == -1);
+        CHECK(errno == EFBIG);
+        CHECK(lseek(fd, 0, SEEK_SET) == 0);
+        CHECK(write(fd, "X", 1) == 1);
+    }
+
+    if (sizeof(ssize_t) > sizeof(int)) {
+        // Replace only transfer callbacks to test large counts without allocating
+        // gigabytes; descriptor lookup and errno mapping still use production VFS.
+        ssize_t (*saved_read)(filesystem_t *, fs_file_t *, void *, size_t) = fs->file_read;
+        ssize_t (*saved_write)(filesystem_t *, fs_file_t *, const void *, size_t) = fs->file_write;
+        fs->file_read = injected_read;
+        fs->file_write = injected_write;
+        injected_io_result = (ssize_t)((uintmax_t)INT_MAX + 1);
+        // Use Newlib's syscall hooks for synthetic counts, since host libc
+        // fortifies read buffers before the linker wrapper can intercept them.
+        char byte = 0;
+        CHECK(_read(fd, &byte, (size_t)injected_io_result) == injected_io_result);
+        CHECK(errno == 0);
+        CHECK(_write(fd, &byte, (size_t)injected_io_result) == injected_io_result);
+        CHECK(errno == 0);
+        injected_io_result = -EIO;
+        CHECK(_read(fd, &byte, 1) == -1);
+        CHECK(errno == EIO);
+        CHECK(_write(fd, &byte, 1) == -1);
+        CHECK(errno == EIO);
+        fs->file_read = saved_read;
+        fs->file_write = saved_write;
+    }
+    CHECK(close(fd) == 0);
+    CHECK(unlink("/wide.bin") == 0);
+}
+
+/** Run public VFS regressions on a freshly mounted FAT or littlefs heap volume. */
 static void test_heap_backend(bool fat) {
     blockdevice_t *heap = blockdevice_heap_create(128u * 1024u);
     filesystem_t *fs = fat ? filesystem_fat_create() : filesystem_littlefs_create(500, 16);
     CHECK(heap != NULL && fs != NULL);
     CHECK(fs_format(fs, heap) == 0);
     CHECK(fs_mount("/", fs, heap) == 0);
+    if (fat) test_wide_results(fs);
     fs_file_t empty = {0};
     CHECK(fs->file_open(fs, &empty, "", O_CREAT | O_EXCL | O_RDWR) == -EINVAL);
     test_exclusive_create("");

@@ -632,7 +632,7 @@ static int file_close(filesystem_t *fs, fs_file_t *file) {
     return fat_error_remap(res);
 }
 
-/** Write at the logical cursor or append EOF, syncing before publishing the cursor. */
+/** Write at the logical cursor or append EOF, retaining partial transfers and syncing metadata. */
 static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer, size_t size) {
     (void)fs;
     filesystem_fat_context_t *context = fs->context;
@@ -701,21 +701,21 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
         }
     }
 
-    // Split requests at FatFs's UINT limit and accumulate short writes. A
-    // hard error remains an error rather than becoming a successful byte count.
+    // Split requests at FatFs's UINT limit and retain completed transfers.
     size_t total_written = 0;
     while (total_written < to_write) {
         UINT chunk = fat_chunk_size(to_write - total_written);
         UINT n = 0;
         res = f_write(&fat_file->file, (const uint8_t *)buffer + total_written, chunk, &n);
         total_written += n;
+        // Completed bytes consume the cursor even if this transfer or a later sync fails.
+        if (n != 0) {
+            fat_file->pos = f_tell(&fat_file->file);
+        }
         if (res != FR_OK) {
-            if (total_written == 0) {
-                mutex_exit(&context->_mutex);
-                debug_if(FFS_DBG, "f_write() failed: %d", res);
-                return fat_error_remap(res);
-            }
-            break;
+            mutex_exit(&context->_mutex);
+            debug_if(FFS_DBG, "f_write() failed: %d", res);
+            return total_written > 0 ? (ssize_t)total_written : fat_error_remap(res);
         }
         if (n == 0) {
             if (total_written == 0) {
@@ -731,19 +731,9 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
         }
     }
 
-    if (res != FR_OK) {
-        mutex_exit(&context->_mutex);
-        debug_if(FFS_DBG, "f_write() failed: %d", res);
-        return fat_error_remap(res);
-    }
-
-    // Sync directory metadata before publishing the new logical position.
-    // On failure, return the sync error without claiming the cursor advanced.
-    const FSIZE_t new_pos = f_tell(&fat_file->file);
+    // Publish directory metadata independently of the already-consumed cursor.
+    // A sync error is still reported, but it cannot undo the preceding transfer.
     res = f_sync(&fat_file->file);
-    if (res == FR_OK) {
-        fat_file->pos = new_pos;
-    }
     mutex_exit(&context->_mutex);
 
     if (res != FR_OK) {

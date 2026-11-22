@@ -37,6 +37,22 @@
 
 static FRESULT stat_failure, opendir_failure, closedir_failure;
 static unsigned stat_probes, opendir_probes, closedir_probes;
+static int (*saved_program)(blockdevice_t *, const void *, bd_size_t, bd_size_t);
+static unsigned program_calls, fail_program_at;
+static bd_size_t fail_program_address;
+static bool fail_at_address, program_failed;
+
+/** Fail one selected physical write, forwarding every other write to heap storage. */
+static int failing_program(blockdevice_t *device, const void *buffer,
+                           bd_size_t address, bd_size_t size) {
+    ++program_calls;
+    if (!program_failed && (fail_at_address ? address == fail_program_address
+                                            : program_calls == fail_program_at)) {
+        program_failed = true;
+        return BD_ERROR_DEVICE_ERROR;
+    }
+    return saved_program(device, buffer, address, size);
+}
 
 FRESULT __real_f_stat(const TCHAR *path, FILINFO *info);
 FRESULT __real_f_opendir(FATFS_DIR *dir, const TCHAR *path);
@@ -438,6 +454,96 @@ static void check_stat_size(filesystem_t *fs, const char *path, off_t expected) 
     CHECK(info.st_size == expected);
 }
 
+/** Verify failed writes report completed bytes and preserve the FatFs error latch. */
+static void test_partial_write_errors(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    FATFS *volume = NULL;
+    DWORD count = 0;
+    CHECK(f_getfree("0:", &count, &volume) == FR_OK);
+    const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
+    const size_t size = 3 * cluster_bytes;
+    char *payload = malloc(size);
+    char *actual = malloc(size);
+    CHECK(payload != NULL && actual != NULL);
+
+    for (unsigned fail_at = 1; fail_at <= 2; ++fail_at) {
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/partial.bin", O_CREAT | O_TRUNC | O_RDWR) == 0);
+        memset(payload, '.', size);
+        CHECK(fs->file_write(fs, &file, payload, size) == (ssize_t)size);
+        CHECK(fs->file_close(fs, &file) == 0);
+        CHECK(fs->file_open(fs, &file, "/partial.bin", O_RDWR) == 0);
+
+        // Preallocate and sync first, so each cluster transfer reaches program
+        // without unrelated allocation or directory writes affecting the fault.
+        saved_program = heap->program;
+        heap->program = failing_program;
+        program_calls = 0;
+        fail_program_at = fail_at;
+        fail_at_address = false;
+        program_failed = false;
+        memset(payload, 'A', size);
+        const ssize_t completed = fail_at == 1 ? 0 : (ssize_t)cluster_bytes;
+        CHECK(fs->file_write(fs, &file, payload, size) == (completed ? completed : -EIO));
+        CHECK(program_failed);
+
+        // A partial success must not clear FatFs's hard-error latch. Closing
+        // and reopening permits verification of the completed prefix and untouched
+        // suffix. The failed cluster was erased before program, so its bytes are unspecified.
+        heap->program = saved_program;
+        CHECK(fs->file_write(fs, &file, "X", 1) == -EIO);
+        CHECK(fs->file_close(fs, &file) == 0);
+        CHECK(fs->file_open(fs, &file, "/partial.bin", O_RDONLY) == 0);
+        CHECK(fs->file_read(fs, &file, actual, size) == (ssize_t)size);
+        check_bytes(actual, 0, (size_t)completed, 'A');
+        check_bytes(actual, (size_t)completed + cluster_bytes, size, '.');
+        CHECK(fs->file_close(fs, &file) == 0);
+    }
+    free(actual);
+    free(payload);
+    destroy_heap_filesystem(fs, heap);
+}
+
+/** Verify a directory-sync failure does not let the next write overwrite prior data. */
+static void test_write_cursor_after_sync_error(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/sync.bin", O_CREAT | O_RDWR) == 0);
+    CHECK(fs->file_write(fs, &file, "seed", 4) == 4);
+    CHECK(fs->file_close(fs, &file) == 0);
+    CHECK(fs->file_open(fs, &file, "/sync.bin", O_RDWR) == 0);
+
+    // Select the actual directory sector, not CTRL_SYNC (which does not invoke
+    // the block device's sync callback). Data-sector writes remain successful.
+    const FIL *physical = file.context;
+    fail_program_address = physical->dir_sect * physical->obj.fs->ssize;
+    saved_program = heap->program;
+    heap->program = failing_program;
+    program_calls = 0;
+    fail_at_address = true;
+    program_failed = false;
+    CHECK(fs->file_write(fs, &file, "AAAAAAAAAAAAAAAA", 16) == -EIO);
+    CHECK(program_failed);
+    CHECK(fs->file_tell(fs, &file) == 16);
+
+    // Retry metadata synchronization before the next payload; neither operation
+    // may rewind the cursor already consumed by the failed write.
+    heap->program = saved_program;
+    CHECK(fs->file_sync(fs, &file) == 0);
+    CHECK(fs->file_write(fs, &file, "BBBB", 4) == 4);
+    CHECK(fs->file_tell(fs, &file) == 20);
+    CHECK(fs->file_close(fs, &file) == 0);
+    check_stat_size(fs, "/sync.bin", 20);
+    CHECK(fs->file_open(fs, &file, "/sync.bin", O_RDONLY) == 0);
+    char actual[20];
+    CHECK(fs->file_read(fs, &file, actual, sizeof(actual)) == (ssize_t)sizeof(actual));
+    CHECK(memcmp(actual, "AAAAAAAAAAAAAAAABBBB", sizeof(actual)) == 0);
+    CHECK(fs->file_close(fs, &file) == 0);
+    destroy_heap_filesystem(fs, heap);
+}
+
 /** Verify immediate truncation metadata and cursor preservation, including beyond EOF. */
 static void test_truncate_metadata_and_cursor(void) {
     blockdevice_t *heap;
@@ -786,6 +892,8 @@ void mutex_exit(mutex_t *mutex) {
 /** Run real-volume lifecycle regressions and storage-free sector-range tests. */
 int main(void) {
     test_failed_open_cleanup();
+    test_partial_write_errors();
+    test_write_cursor_after_sync_error();
     test_truncate_metadata_and_cursor();
     test_cursor_and_access_modes();
     test_append_after_truncate();
