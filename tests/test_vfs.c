@@ -241,6 +241,7 @@ static void test_api_file_tell() {
     printf(COLOR_GREEN("ok\n"));
 }
 
+/** Verify public ftruncate preserves position and immediately updates stat/fstat size. */
 static void test_api_file_truncate() {
     test_printf("ftruncate");
 
@@ -251,11 +252,13 @@ static void test_api_file_truncate() {
     ssize_t write_length = write(fd, write_buffer, strlen(write_buffer));
     assert((size_t)write_length == strlen(write_buffer));
 
+    // Shrink at old EOF without moving the descriptor's now-overhanging cursor.
     int err = ftruncate(fd, 9);
     assert(err == 0);
     off_t offset = lseek(fd, 0, SEEK_CUR);
     assert(offset == (off_t)strlen(write_buffer));
 
+    // Both descriptor and pathname metadata must observe the open-file truncation.
     struct stat finfo;
     err = fstat(fd, &finfo);
     assert(err == 0);
@@ -264,6 +267,7 @@ static void test_api_file_truncate() {
     assert(err == 0);
     assert(finfo.st_size == 9);
 
+    // EOF reads preserve the cursor; an explicit seek exposes the surviving prefix.
     char read_buffer[512] = {0};
     ssize_t read_length = read(fd, read_buffer, sizeof(read_buffer));
     assert(read_length == 0);
@@ -275,6 +279,7 @@ static void test_api_file_truncate() {
     assert(read_length == 9);
     assert(strcmp(read_buffer, "123456789") == 0);
 
+    // Growing also preserves position and publishes size; new bytes are unspecified.
     err = ftruncate(fd, 24);
     assert(err == 0);
     assert(lseek(fd, 0, SEEK_CUR) == 9);
