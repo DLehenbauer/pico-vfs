@@ -1,6 +1,6 @@
 # Tests
 
-The project has six test suites:
+The project has seven test suites:
 
 1. unit tests `unittests` using heap memory
 2. integration tests `integrate` using Raspberry Pi Pico hardware
@@ -8,6 +8,7 @@ The project has six test suites:
 4. unit tests `host` on the host
 5. SD SPI protocol tests `sd_spi_tests` on the host with hardware mocks
 6. FatFs disk adapter tests `fat_disk_tests` on the host with a storage-free fake device
+7. VFS tests `vfs_tests` on the host with heap and loopback devices
 
 ```bash
 cd build
@@ -19,7 +20,7 @@ make run_multicore
 
 ```bash
 cmake -S . -B build/host -DPICO_PLATFORM=host -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/host --target host sd_spi_tests fat_disk_tests
+cmake --build build/host --target host sd_spi_tests fat_disk_tests vfs_tests
 ctest --test-dir build/host --output-on-failure
 ```
 
@@ -32,3 +33,9 @@ mocks; see the [suite README](sd_spi/README.md) for details.
 
 These SDK-free host tests exercise the FatFs adapter with a storage-free fake
 device; see the [suite README](fat_disk/README.md) for details.
+
+## VFS regression tests
+
+These SDK-free host tests execute exclusive creation, errno propagation, descriptor
+recovery, and loopback I/O through the production VFS on FAT and littlefs. See the
+[suite README](vfs/README.md) for details.

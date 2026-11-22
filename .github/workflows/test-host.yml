@@ -53,14 +53,14 @@ jobs:
     - name: Build
       working-directory: ${{github.workspace}}/pico-vfs/build
       shell: bash
-      run: cmake --build . --target host sd_spi_tests fat_disk_tests --config $BUILD_TYPE
+      run: cmake --build . --target host sd_spi_tests fat_disk_tests vfs_tests --config $BUILD_TYPE
 
     - name: Test
       working-directory: ${{github.workspace}}/pico-vfs/build
       shell: bash
       run: ctest -C $BUILD_TYPE --output-on-failure
 
-    - name: Test SD SPI and FatFs adapter with AddressSanitizer and UndefinedBehaviorSanitizer
+    - name: Test SD SPI, FatFs adapter, and VFS with AddressSanitizer and UndefinedBehaviorSanitizer
       if: matrix.build_type == 'Debug'
       working-directory: ${{github.workspace}}/pico-vfs
       shell: bash
@@ -77,3 +77,8 @@ jobs:
           -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
         cmake --build build/fat-disk-sanitized --target fat_disk_tests
         ctest --test-dir build/fat-disk-sanitized --output-on-failure
+        cmake -S tests/vfs -B build/vfs-sanitized \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+        cmake --build build/vfs-sanitized --target vfs_tests
+        ctest --test-dir build/vfs-sanitized --output-on-failure
