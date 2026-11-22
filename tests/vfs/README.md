@@ -3,6 +3,9 @@
 These SDK-free host tests compile the production VFS, FAT, littlefs, heap, and
 loopback implementations. Checks remain active in Release.
 
+Public FAT regressions verify that truncate growth and gaps before beyond-EOF
+writes read back as zeros while preserving existing data and logical positions.
+
 Run from the repository root:
 
 ```bash

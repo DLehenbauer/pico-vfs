@@ -195,6 +195,29 @@ static void test_wide_results(filesystem_t *fs) {
     CHECK(unlink("/wide.bin") == 0);
 }
 
+/** Verify public truncate and beyond-EOF writes expose zeros, not discarded file data. */
+static void test_zero_fill(void) {
+    int fd = open("/zeros.bin", O_CREAT | O_RDWR, 0644);
+    CHECK(fd >= 3);
+    char data[2049];
+    memset(data, 'Q', sizeof(data));
+    CHECK(write(fd, data, sizeof(data)) == (ssize_t)sizeof(data));
+    CHECK(ftruncate(fd, 37) == 0);
+    CHECK(ftruncate(fd, 1025) == 0);
+    CHECK(lseek(fd, 0, SEEK_CUR) == (off_t)sizeof(data));
+    CHECK(write(fd, "X", 1) == 1);
+    CHECK(lseek(fd, 0, SEEK_SET) == 0);
+    CHECK(read(fd, data, sizeof(data)) == (ssize_t)sizeof(data));
+    // Both truncate extension and the subsequent write gap are initialized.
+    for (size_t i = 0; i < sizeof(data); ++i) {
+        CHECK(data[i] == (i < 37 ? 'Q' : 0));
+    }
+    CHECK(read(fd, data, 1) == 1);
+    CHECK(data[0] == 'X');
+    CHECK(close(fd) == 0);
+    CHECK(unlink("/zeros.bin") == 0);
+}
+
 /** Run public VFS regressions on a freshly mounted FAT or littlefs heap volume. */
 static void test_heap_backend(bool fat) {
     blockdevice_t *heap = blockdevice_heap_create(128u * 1024u);
@@ -202,7 +225,10 @@ static void test_heap_backend(bool fat) {
     CHECK(heap != NULL && fs != NULL);
     CHECK(fs_format(fs, heap) == 0);
     CHECK(fs_mount("/", fs, heap) == 0);
-    if (fat) test_wide_results(fs);
+    if (fat) {
+        test_wide_results(fs);
+        test_zero_fill();
+    }
     fs_file_t empty = {0};
     CHECK(fs->file_open(fs, &empty, "", O_CREAT | O_EXCL | O_RDWR) == -EINVAL);
     test_exclusive_create("");

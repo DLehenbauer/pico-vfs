@@ -543,17 +543,40 @@ static int fat_ensure_capacity(const filesystem_fat_context_t *context,
 }
 
 /**
- * Best-effort cleanup after a capacity precheck still permits partial growth.
- * Write/truncate callers preserve their original error; hard-error latches remain.
+ * Zero-fill growth for truncate and gap writes while the caller holds the mutex.
+ * Completed growth is not rolled back; the logical cursor is never changed.
  */
-static void fat_rollback_size(FIL *fp, FSIZE_t old_size) {
-    // Use only the visible size and normal FatFs APIs. Never invent an extra
-    // byte or clear fp->err to force cleanup of an unconfirmed allocation.
-    if (f_size(fp) > old_size &&
-        f_lseek(fp, old_size) == FR_OK &&
-        f_truncate(fp) == FR_OK) {
-        (void)f_sync(fp);
+static int fat_zero_extend(FIL *fp, FSIZE_t target_size) {
+    static const uint8_t zeros[512] = {0};
+
+    // Seek only to existing EOF, then write every newly exposed byte. Seeking
+    // directly to the target would allocate space without initializing its contents.
+    FRESULT res = f_lseek(fp, f_size(fp));
+    if (res != FR_OK) {
+        return fat_error_remap(res);
     }
+    while (f_tell(fp) < target_size) {
+        const FSIZE_t remaining = target_size - f_tell(fp);
+        UINT chunk = remaining < sizeof(zeros) ? (UINT)remaining : sizeof(zeros);
+        // End at sector boundaries so a later flush cannot abort a call after
+        // growing the file but before FatFs marks its metadata modified.
+        const UINT sector_size = disk_get_sector_size(fp->obj.fs->pdrv);
+        const UINT sector_remaining = sector_size - (UINT)(f_tell(fp) % sector_size);
+        if (chunk > sector_remaining) {
+            chunk = sector_remaining;
+        }
+        UINT written = 0;
+        res = f_write(fp, zeros, chunk, &written);
+        if (res != FR_OK) {
+            return fat_error_remap(res);
+        }
+        if (written < chunk) {
+            // A capacity precheck can be stale. Keep only the bytes FatFs accepted;
+            // never fabricate sizes or clear a hard-error latch to force rollback.
+            return -ENOSPC;
+        }
+    }
+    return 0;
 }
 
 /** Open a VFS file and initialize its independent cursor and append policy. */
@@ -671,25 +694,18 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
     }
 
     if (write_pos > old_size) {
-        // Check reported capacity for the gap and at least one byte
-        // of payload, so a failed write need not leave a gap-only extension.
+        // Check reported capacity for the gap and at least one byte of payload.
+        // This avoids predictable gap-only growth, but is not an atomic guarantee.
         int err = fat_ensure_capacity(context, &fat_file->file, old_size, write_pos + 1);
         if (err != 0) {
             mutex_exit(&context->_mutex);
             return err;
         }
-        // FatFs allocates the gap here; it does not initialize the gap's bytes.
-        res = f_lseek(&fat_file->file, write_pos);
-        if (res != FR_OK) {
+        // Internal zero writes do not count as payload or consume the logical cursor.
+        err = fat_zero_extend(&fat_file->file, write_pos);
+        if (err != 0) {
             mutex_exit(&context->_mutex);
-            debug_if(FFS_DBG, "f_write() failed: %d", res);
-            return fat_error_remap(res);
-        }
-        if (f_tell(&fat_file->file) != write_pos) {
-            // FatFs can report success after clipping growth to available space.
-            fat_rollback_size(&fat_file->file, old_size);
-            mutex_exit(&context->_mutex);
-            return -ENOSPC;
+            return err;
         }
     } else if (f_tell(&fat_file->file) != write_pos) {
         // Align the physical cursor only when an actual transfer needs it.
@@ -719,8 +735,8 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
         }
         if (n == 0) {
             if (total_written == 0) {
-                // Zero bytes with FR_OK means no space; undo any visible gap growth.
-                fat_rollback_size(&fat_file->file, old_size);
+                // No payload fits. Retain any completed zero-filled gap rather
+                // than inferring allocation ownership from size for rollback.
                 mutex_exit(&context->_mutex);
                 return -ENOSPC;
             }
@@ -953,23 +969,17 @@ static int file_truncate(filesystem_t *fs, fs_file_t *file, off_t length) {
             return fat_error_remap(res);
         }
     } else if (target_size > old_size) {
-        // Precheck before FatFs allocates. Growth exposes unspecified bytes;
-        // this adapter does not promise zero-filled extension.
+        // Precheck before writing zeros; preserve the logical cursor even if
+        // initialization fails after extending part of the file.
         int err = fat_ensure_capacity(context, &fat_file->file, old_size, target_size);
         if (err != 0) {
             mutex_exit(&context->_mutex);
             return err;
         }
-        res = f_lseek(&fat_file->file, target_size);
-        if (res != FR_OK) {
+        err = fat_zero_extend(&fat_file->file, target_size);
+        if (err != 0) {
             mutex_exit(&context->_mutex);
-            return fat_error_remap(res);
-        }
-        if (f_tell(&fat_file->file) != target_size) {
-            // A stale free-space count can allow a short, nominally successful seek.
-            fat_rollback_size(&fat_file->file, old_size);
-            mutex_exit(&context->_mutex);
-            return -ENOSPC;
+            return err;
         }
     }
 

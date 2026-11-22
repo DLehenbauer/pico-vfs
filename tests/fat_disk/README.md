@@ -10,6 +10,11 @@ Open regressions cover injected existence-probe failures, a full FAT12 root,
 and FAT32 mounted alongside a second volume. Linker wrappers inject probe errors
 without modifying vendored FatFs; a GNU-compatible linker with `--wrap` is required.
 
+Zero-fill regressions use dirty, previously written data on FAT and exFAT with
+512- and 4096-byte sectors. They cover truncate growth, write gaps, preserved
+cursors, zero-length writes, remount persistence, and injected failures at every
+physical write in the growth operation, followed by recovery operations.
+
 Scenario rationale and boundary calculations are documented beside the
 relevant expectations and assertions in [`test_fat_disk.c`](test_fat_disk.c).
 
