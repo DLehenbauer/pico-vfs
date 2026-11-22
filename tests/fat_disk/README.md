@@ -3,7 +3,9 @@
 These host tests compile the production `src/filesystem/fat.c` and bundled
 FatFs against a recording block device and mutex mock, without requiring the
 Pico SDK or storage hardware. The fake device records callback ranges and
-results without allocating backing storage.
+results without allocating backing storage. Heap-backed volumes also exercise
+file lifecycle, truncation, logical cursor, append, and directory-metadata
+behavior.
 
 Scenario rationale and boundary calculations are documented beside the
 relevant expectations and assertions in [`test_fat_disk.c`](test_fat_disk.c).
@@ -40,6 +42,6 @@ The bundled FatFs documentation describes the adapter contracts for
 
 ## Limitations
 
-The fake device does not model filesystem contents, card protocols, or physical
-media behavior. Mutex checks do not simulate contention or real multicore
-scheduling.
+The storage-free fake device does not model card protocols or physical media
+behavior; the heap-backed cases cover filesystem contents and metadata.
+Mutex checks do not simulate contention or real multicore scheduling.

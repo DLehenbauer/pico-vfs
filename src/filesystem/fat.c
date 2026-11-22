@@ -3,13 +3,18 @@
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <pico/mutex.h>
+#undef PATH_MAX
 #include "blockdevice/blockdevice.h"
 #include "filesystem/fat.h"
 #include "ff.h"
@@ -18,8 +23,17 @@
 _Static_assert(sizeof(LBA_t) >= sizeof(bd_size_t),
                "FatFs adapter requires 64-bit LBA_t (FF_LBA64=1)");
 
+#define FAT_OFF_MAX   ((FSIZE_t)(((uintmax_t)1 << (sizeof(off_t) * CHAR_BIT - 1)) - 1))
+#define FAT_SSIZE_MAX ((size_t)(((uintmax_t)1 << (sizeof(ssize_t) * CHAR_BIT - 1)) - 1))
+
+_Static_assert((off_t)-1 < 0, "off_t must be signed");
+_Static_assert(sizeof(off_t) <= sizeof(FSIZE_t),
+               "FatFs FSIZE_t must hold all non-negative off_t values");
+
 typedef struct {
     FIL file;
+    FSIZE_t pos;
+    bool append;
 } fat_file_t;
 
 typedef struct {
@@ -447,13 +461,79 @@ static int file_stat(filesystem_t *fs, const char *path, struct stat *st) {
     if (res != FR_OK) {
         return fat_error_remap(res);
     }
-    st->st_size = f.fsize;
+    if (f.fsize > FAT_OFF_MAX) {
+        return -EOVERFLOW;
+    }
+    st->st_size = (off_t)f.fsize;
     st->st_mode = 0;
     st->st_mode |= (f.fattrib & AM_DIR) ? S_IFDIR : S_IFREG;
     st->st_mode |= (f.fattrib & AM_RDO) ?
                    (S_IRUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH) :
                    (S_IRWXU | S_IRWXG | S_IRWXO);
     return 0;
+}
+
+static FRESULT fat_validate_file(const FIL *fp) {
+    if (fp == NULL || fp->obj.fs == NULL || fp->obj.fs->fs_type == 0 ||
+        fp->obj.fs->id != fp->obj.id) {
+        return FR_INVALID_OBJECT;
+    }
+    return (FRESULT)fp->err;
+}
+
+static FSIZE_t fat_max_file_size(const FIL *fp) {
+    if (fp->obj.fs != NULL && fp->obj.fs->fs_type != FS_EXFAT) {
+        return UINT32_MAX;
+    }
+    return (FSIZE_t)-1;
+}
+
+static UINT fat_chunk_size(size_t remaining) {
+#if SIZE_MAX > UINT_MAX
+    if (remaining > (size_t)UINT_MAX) {
+        return UINT_MAX;
+    }
+#endif
+    return (UINT)remaining;
+}
+
+/* Reject insufficient space before f_lseek allocates clusters. */
+static int fat_ensure_capacity(const filesystem_fat_context_t *context,
+                               const FIL *fp,
+                               FSIZE_t old_size,
+                               FSIZE_t target_size) {
+    const FATFS *fatfs = fp->obj.fs;
+    const FSIZE_t cluster_bytes =
+        (FSIZE_t)fatfs->csize * disk_get_sector_size(fatfs->pdrv);
+    const FSIZE_t old_clusters =
+        old_size == 0 ? 0 : (old_size - 1) / cluster_bytes + 1;
+    const FSIZE_t new_clusters =
+        target_size == 0 ? 0 : (target_size - 1) / cluster_bytes + 1;
+    if (new_clusters <= old_clusters) {
+        return 0;
+    }
+
+    char drive[3] = "0:";
+    drive[0] = (char)('0' + context->id);
+    DWORD free_clusters = 0;
+    FATFS *unused_fs = NULL;
+    FRESULT res = f_getfree(drive, &free_clusters, &unused_fs);
+    if (res != FR_OK) {
+        return fat_error_remap(res);
+    }
+    if (new_clusters - old_clusters > (FSIZE_t)free_clusters) {
+        return -ENOSPC;
+    }
+    return 0;
+}
+
+/* Fallback if a stale FAT32 FSInfo free-cluster count allowed partial growth. */
+static void fat_rollback_size(FIL *fp, FSIZE_t old_size) {
+    if (f_size(fp) > old_size &&
+        f_lseek(fp, old_size) == FR_OK &&
+        f_truncate(fp) == FR_OK) {
+        (void)f_sync(fp);
+    }
 }
 
 static int file_open(filesystem_t *fs, fs_file_t *file, const char *path, int flags) {
@@ -470,8 +550,6 @@ static int file_open(filesystem_t *fs, fs_file_t *file, const char *path, int fl
         else
             open_mode |= FA_OPEN_ALWAYS;
     }
-    if (flags & O_APPEND)
-        open_mode |= FA_OPEN_APPEND;
 
     char fpath[PATH_MAX];
     filesystem_fat_context_t *context = fs->context;
@@ -484,6 +562,10 @@ static int file_open(filesystem_t *fs, fs_file_t *file, const char *path, int fl
 
     mutex_enter_blocking(&context->_mutex);
     FRESULT res = f_open(&fat_file->file, fpath, open_mode);
+    if (res == FR_OK) {
+        fat_file->append = (flags & O_APPEND) != 0;
+        fat_file->pos = fat_file->append ? f_size(&fat_file->file) : f_tell(&fat_file->file);
+    }
     mutex_exit(&context->_mutex);
 
     if (res != FR_OK) {
@@ -514,23 +596,106 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
     filesystem_fat_context_t *context = fs->context;
     fat_file_t *fat_file = file->context;
 
-    UINT n;
-
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = f_write(&(fat_file->file), buffer, size, &n);
+    FRESULT res = fat_validate_file(&fat_file->file);
+    if (res != FR_OK) {
+        mutex_exit(&context->_mutex);
+        return fat_error_remap(res);
+    }
+    if (!(fat_file->file.flag & FA_WRITE)) {
+        mutex_exit(&context->_mutex);
+        return fat_error_remap(FR_DENIED);
+    }
+    if (size == 0) {
+        mutex_exit(&context->_mutex);
+        return 0;
+    }
+
+    const FSIZE_t old_size = f_size(&fat_file->file);
+    const FSIZE_t write_pos = fat_file->append ? old_size : fat_file->pos;
+    const FSIZE_t max_size = fat_max_file_size(&fat_file->file);
+    if (write_pos >= max_size) {
+        mutex_exit(&context->_mutex);
+        return -EFBIG;
+    }
+
+    size_t to_write = size > FAT_SSIZE_MAX ? FAT_SSIZE_MAX : size;
+    const FSIZE_t max_avail = max_size - write_pos;
+    if ((FSIZE_t)to_write > max_avail) {
+        to_write = (size_t)max_avail;
+    }
+
+    if (write_pos > old_size) {
+        int err = fat_ensure_capacity(context, &fat_file->file, old_size, write_pos + 1);
+        if (err != 0) {
+            mutex_exit(&context->_mutex);
+            return err;
+        }
+        res = f_lseek(&fat_file->file, write_pos);
+        if (res != FR_OK) {
+            mutex_exit(&context->_mutex);
+            debug_if(FFS_DBG, "f_write() failed: %d", res);
+            return fat_error_remap(res);
+        }
+        if (f_tell(&fat_file->file) != write_pos) {
+            fat_rollback_size(&fat_file->file, old_size);
+            mutex_exit(&context->_mutex);
+            return -ENOSPC;
+        }
+    } else if (f_tell(&fat_file->file) != write_pos) {
+        res = f_lseek(&fat_file->file, write_pos);
+        if (res != FR_OK) {
+            mutex_exit(&context->_mutex);
+            debug_if(FFS_DBG, "f_write() failed: %d", res);
+            return fat_error_remap(res);
+        }
+    }
+
+    size_t total_written = 0;
+    while (total_written < to_write) {
+        UINT chunk = fat_chunk_size(to_write - total_written);
+        UINT n = 0;
+        res = f_write(&fat_file->file, (const uint8_t *)buffer + total_written, chunk, &n);
+        total_written += n;
+        if (res != FR_OK) {
+            if (total_written == 0) {
+                mutex_exit(&context->_mutex);
+                debug_if(FFS_DBG, "f_write() failed: %d", res);
+                return fat_error_remap(res);
+            }
+            break;
+        }
+        if (n == 0) {
+            if (total_written == 0) {
+                fat_rollback_size(&fat_file->file, old_size);
+                mutex_exit(&context->_mutex);
+                return -ENOSPC;
+            }
+            break;
+        }
+        if (n < chunk) {
+            break;
+        }
+    }
+
     if (res != FR_OK) {
         mutex_exit(&context->_mutex);
         debug_if(FFS_DBG, "f_write() failed: %d", res);
         return fat_error_remap(res);
     }
+
+    const FSIZE_t new_pos = f_tell(&fat_file->file);
     res = f_sync(&fat_file->file);
+    if (res == FR_OK) {
+        fat_file->pos = new_pos;
+    }
     mutex_exit(&context->_mutex);
 
     if (res != FR_OK) {
         debug_if(FFS_DBG, "f_write() failed: %d", res);
         return fat_error_remap(res);
     }
-    return n;
+    return (ssize_t)total_written;
 }
 
 static ssize_t file_read(filesystem_t *fs, fs_file_t *file, void *buffer, size_t size) {
@@ -538,17 +703,55 @@ static ssize_t file_read(filesystem_t *fs, fs_file_t *file, void *buffer, size_t
     filesystem_fat_context_t *context = fs->context;
     fat_file_t *fat_file = file->context;
 
-    UINT n;
-
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = f_read(&fat_file->file, buffer, size, &n);
-    mutex_exit(&context->_mutex);
-
+    FRESULT res = fat_validate_file(&fat_file->file);
     if (res != FR_OK) {
-        debug_if(FFS_DBG, "f_read() failed: %d\n", res);
+        mutex_exit(&context->_mutex);
         return fat_error_remap(res);
     }
-    return n;
+    if (!(fat_file->file.flag & FA_READ)) {
+        mutex_exit(&context->_mutex);
+        return fat_error_remap(FR_DENIED);
+    }
+
+    const FSIZE_t cur_size = f_size(&fat_file->file);
+    if (size == 0 || fat_file->pos >= cur_size) {
+        mutex_exit(&context->_mutex);
+        return 0;
+    }
+
+    size_t to_read = size > FAT_SSIZE_MAX ? FAT_SSIZE_MAX : size;
+    const FSIZE_t avail = cur_size - fat_file->pos;
+    if ((FSIZE_t)to_read > avail) {
+        to_read = (size_t)avail;
+    }
+    if (f_tell(&fat_file->file) != fat_file->pos) {
+        res = f_lseek(&fat_file->file, fat_file->pos);
+        if (res != FR_OK) {
+            mutex_exit(&context->_mutex);
+            debug_if(FFS_DBG, "f_read() failed: %d\n", res);
+            return fat_error_remap(res);
+        }
+    }
+
+    size_t total_read = 0;
+    while (total_read < to_read) {
+        UINT chunk = fat_chunk_size(to_read - total_read);
+        UINT n = 0;
+        res = f_read(&fat_file->file, (uint8_t *)buffer + total_read, chunk, &n);
+        total_read += n;
+        fat_file->pos = f_tell(&fat_file->file);
+        if (res != FR_OK) {
+            mutex_exit(&context->_mutex);
+            debug_if(FFS_DBG, "f_read() failed: %d\n", res);
+            return total_read > 0 ? (ssize_t)total_read : fat_error_remap(res);
+        }
+        if (n < chunk) {
+            break;
+        }
+    }
+    mutex_exit(&context->_mutex);
+    return (ssize_t)total_read;
 }
 
 static int file_sync(filesystem_t *fs, fs_file_t *file) {
@@ -572,19 +775,48 @@ static off_t file_seek(filesystem_t *fs, fs_file_t *file, off_t offset, int when
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    if (whence == SEEK_END)
-        offset += f_size(&fat_file->file);
-    else if (whence == SEEK_CUR)
-        offset += f_tell(&fat_file->file);
-
-    FRESULT res = res = f_lseek(&fat_file->file, offset);
-    mutex_exit(&context->_mutex);
-
+    FRESULT res = fat_validate_file(&fat_file->file);
     if (res != FR_OK) {
-        debug_if(FFS_DBG, "lseek failed: %d\n", res);
+        mutex_exit(&context->_mutex);
         return fat_error_remap(res);
     }
-    return (off_t)fat_file->file.fptr;
+
+    FSIZE_t base;
+    if (whence == SEEK_SET) {
+        base = 0;
+    } else if (whence == SEEK_CUR) {
+        base = fat_file->pos;
+    } else if (whence == SEEK_END) {
+        base = f_size(&fat_file->file);
+    } else {
+        mutex_exit(&context->_mutex);
+        return -EINVAL;
+    }
+
+    FSIZE_t target;
+    if (offset < 0) {
+        FSIZE_t delta = (FSIZE_t)0 - (FSIZE_t)offset;
+        if (delta > base) {
+            mutex_exit(&context->_mutex);
+            return -EINVAL;
+        }
+        target = base - delta;
+    } else {
+        FSIZE_t delta = (FSIZE_t)offset;
+        if (base > FAT_OFF_MAX || delta > FAT_OFF_MAX - base) {
+            mutex_exit(&context->_mutex);
+            return -EOVERFLOW;
+        }
+        target = base + delta;
+    }
+    if (target > FAT_OFF_MAX) {
+        mutex_exit(&context->_mutex);
+        return -EOVERFLOW;
+    }
+
+    fat_file->pos = target;
+    mutex_exit(&context->_mutex);
+    return (off_t)target;
 }
 
 static off_t file_tell(filesystem_t *fs, fs_file_t *file) {
@@ -593,10 +825,14 @@ static off_t file_tell(filesystem_t *fs, fs_file_t *file) {
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    off_t res = f_tell(&fat_file->file);
+    FRESULT res = fat_validate_file(&fat_file->file);
+    FSIZE_t value = fat_file->pos;
     mutex_exit(&context->_mutex);
 
-    return res;
+    if (res != FR_OK) {
+        return fat_error_remap(res);
+    }
+    return value > FAT_OFF_MAX ? -EOVERFLOW : (off_t)value;
 }
 
 static off_t file_size(filesystem_t *fs, fs_file_t *file) {
@@ -605,36 +841,78 @@ static off_t file_size(filesystem_t *fs, fs_file_t *file) {
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    off_t res = f_size(&fat_file->file);
+    FRESULT res = fat_validate_file(&fat_file->file);
+    FSIZE_t value = f_size(&fat_file->file);
     mutex_exit(&context->_mutex);
 
-    return res;
+    if (res != FR_OK) {
+        return fat_error_remap(res);
+    }
+    return value > FAT_OFF_MAX ? -EOVERFLOW : (off_t)value;
 }
 
 static int file_truncate(filesystem_t *fs, fs_file_t *file, off_t length) {
     (void)fs;
+    if (length < 0) {
+        return -EINVAL;
+    }
+
     filesystem_fat_context_t *context = fs->context;
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    FSIZE_t old_offset = f_tell(&fat_file->file);
-    FRESULT res = f_lseek(&fat_file->file, length);
-    if (res) {
+    FRESULT res = fat_validate_file(&fat_file->file);
+    if (res != FR_OK) {
         mutex_exit(&context->_mutex);
         return fat_error_remap(res);
     }
-    res = f_truncate(&fat_file->file);
-    if (res) {
+    if (!(fat_file->file.flag & FA_WRITE)) {
         mutex_exit(&context->_mutex);
-        return fat_error_remap(res);
+        return -EINVAL;
     }
-    res = f_lseek(&fat_file->file, old_offset);
-    mutex_exit(&context->_mutex);
 
-    if (res) {
-        return fat_error_remap(res);
+    const FSIZE_t target_size = (FSIZE_t)length;
+    if (target_size > fat_max_file_size(&fat_file->file)) {
+        mutex_exit(&context->_mutex);
+        return -EFBIG;
     }
-    return 0;
+
+    const FSIZE_t old_size = f_size(&fat_file->file);
+    if (target_size < old_size) {
+        if (f_tell(&fat_file->file) != target_size) {
+            res = f_lseek(&fat_file->file, target_size);
+            if (res != FR_OK) {
+                mutex_exit(&context->_mutex);
+                return fat_error_remap(res);
+            }
+        }
+        res = f_truncate(&fat_file->file);
+        if (res != FR_OK) {
+            mutex_exit(&context->_mutex);
+            return fat_error_remap(res);
+        }
+    } else if (target_size > old_size) {
+        int err = fat_ensure_capacity(context, &fat_file->file, old_size, target_size);
+        if (err != 0) {
+            mutex_exit(&context->_mutex);
+            return err;
+        }
+        res = f_lseek(&fat_file->file, target_size);
+        if (res != FR_OK) {
+            mutex_exit(&context->_mutex);
+            return fat_error_remap(res);
+        }
+        if (f_tell(&fat_file->file) != target_size) {
+            fat_rollback_size(&fat_file->file, old_size);
+            mutex_exit(&context->_mutex);
+            return -ENOSPC;
+        }
+    }
+
+    /* VFS fstat reads directory metadata, so publish the new size before returning. */
+    res = f_sync(&fat_file->file);
+    mutex_exit(&context->_mutex);
+    return fat_error_remap(res);
 }
 
 static int dir_open(filesystem_t *fs, fs_dir_t *dir, const char *path) {

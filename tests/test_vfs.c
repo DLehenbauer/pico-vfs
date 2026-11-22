@@ -251,16 +251,39 @@ static void test_api_file_truncate() {
     ssize_t write_length = write(fd, write_buffer, strlen(write_buffer));
     assert((size_t)write_length == strlen(write_buffer));
 
-    off_t offset = lseek(fd, 0, SEEK_SET);
-    assert(offset == 0);
-
     int err = ftruncate(fd, 9);
     assert(err == 0);
+    off_t offset = lseek(fd, 0, SEEK_CUR);
+    assert(offset == (off_t)strlen(write_buffer));
+
+    struct stat finfo;
+    err = fstat(fd, &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 9);
+    err = stat("/file", &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 9);
 
     char read_buffer[512] = {0};
     ssize_t read_length = read(fd, read_buffer, sizeof(read_buffer));
+    assert(read_length == 0);
+    assert(lseek(fd, 0, SEEK_CUR) == (off_t)strlen(write_buffer));
+
+    offset = lseek(fd, 0, SEEK_SET);
+    assert(offset == 0);
+    read_length = read(fd, read_buffer, sizeof(read_buffer));
     assert(read_length == 9);
     assert(strcmp(read_buffer, "123456789") == 0);
+
+    err = ftruncate(fd, 24);
+    assert(err == 0);
+    assert(lseek(fd, 0, SEEK_CUR) == 9);
+    err = fstat(fd, &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 24);
+    err = stat("/file", &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 24);
 
     err = close(fd);
     assert(err == 0);

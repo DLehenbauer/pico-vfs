@@ -1,6 +1,11 @@
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#undef PATH_MAX
 #include "blockdevice/heap.h"
 #include "filesystem/fat.h"
 #include "pico/mutex.h"
@@ -14,6 +19,10 @@
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \
     } while (0)
+
+#define TEST_OFF_MAX ((off_t)(((uintmax_t)1 <<                    \
+                               (sizeof(off_t) * CHAR_BIT - 1)) - \
+                              1))
 
 // Record byte ranges without accessing buffers, so huge logical devices and
 // transfers need no backing allocation. Counters detect I/O on rejected ranges.
@@ -196,6 +205,254 @@ static void test_failed_open_cleanup(void) {
     blockdevice_heap_free(heap);
 }
 
+static filesystem_t *create_heap_filesystem(blockdevice_t **out_heap) {
+    blockdevice_t *heap = blockdevice_heap_create(128u * 1024u);
+    filesystem_t *fs = filesystem_fat_create();
+    CHECK(heap != NULL && fs != NULL && out_heap != NULL);
+    CHECK(fs->format(fs, heap) == 0);
+    CHECK(fs->mount(fs, heap, false) == 0);
+    *out_heap = heap;
+    return fs;
+}
+
+static void destroy_heap_filesystem(filesystem_t *fs, blockdevice_t *heap) {
+    CHECK(fs->unmount(fs) == 0);
+    filesystem_fat_free(fs);
+    blockdevice_heap_free(heap);
+}
+
+static DWORD free_clusters(void) {
+    FATFS *fat = NULL;
+    DWORD count = 0;
+    CHECK(f_getfree("0:", &count, &fat) == FR_OK);
+    return count;
+}
+
+static void check_bytes(const char *buffer, size_t start, size_t end, char value) {
+    for (size_t i = start; i < end; ++i) {
+        CHECK(buffer[i] == value);
+    }
+}
+
+static void check_stat_size(filesystem_t *fs, const char *path, off_t expected) {
+    struct stat info = {0};
+    CHECK(fs->stat(fs, path, &info) == 0);
+    CHECK(info.st_size == expected);
+}
+
+/* Path stat (used by VFS fstat) must observe truncation immediately without
+ * re-extending the file when the logical cursor sits beyond the new length. */
+static void test_truncate_metadata_and_cursor(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/truncate.bin", O_CREAT | O_RDWR) == 0);
+    char payload[4099];
+    memset(payload, 0x5a, sizeof(payload));
+    CHECK(fs->file_write(fs, &file, payload, sizeof(payload)) ==
+          (ssize_t)sizeof(payload));
+
+    /* Shrink while cursor remains at old EOF (4099 > 513). */
+    CHECK(fs->file_truncate(fs, &file, 513) == 0);
+    CHECK(fs->file_tell(fs, &file) == (off_t)sizeof(payload));
+    CHECK(fs->file_size(fs, &file) == 513);
+    check_stat_size(fs, "/truncate.bin", 513);
+    char read_buffer[sizeof(payload)];
+    CHECK(fs->file_read(fs, &file, read_buffer, sizeof(read_buffer)) == 0);
+    CHECK(fs->file_tell(fs, &file) == (off_t)sizeof(payload));
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    /* Closing with an overhanging cursor must preserve the truncated size. */
+    check_stat_size(fs, "/truncate.bin", 513);
+    CHECK(fs->file_open(fs, &file, "/truncate.bin", O_RDONLY) == 0);
+    CHECK(fs->file_read(fs, &file, read_buffer, sizeof(read_buffer)) == 513);
+    check_bytes(read_buffer, 0, 513, 0x5a);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    /* Extend and truncate to zero with a nonzero cursor while open. */
+    CHECK(fs->file_open(fs, &file, "/truncate.bin", O_RDWR) == 0);
+    CHECK(fs->file_seek(fs, &file, 200, SEEK_SET) == 200);
+    CHECK(fs->file_truncate(fs, &file, 2053) == 0);
+    CHECK(fs->file_tell(fs, &file) == 200);
+    CHECK(fs->file_size(fs, &file) == 2053);
+    check_stat_size(fs, "/truncate.bin", 2053);
+
+    CHECK(fs->file_truncate(fs, &file, 0) == 0);
+    CHECK(fs->file_tell(fs, &file) == 200);
+    CHECK(fs->file_size(fs, &file) == 0);
+    check_stat_size(fs, "/truncate.bin", 0);
+    CHECK(fs->file_read(fs, &file, read_buffer, 1) == 0);
+    CHECK(fs->file_close(fs, &file) == 0);
+    check_stat_size(fs, "/truncate.bin", 0);
+    destroy_heap_filesystem(fs, heap);
+}
+
+static void test_cursor_and_access_modes(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/cursor.bin", O_CREAT | O_RDWR) == 0);
+    char initial[513];
+    memset(initial, 0x5a, sizeof(initial));
+    CHECK(fs->file_write(fs, &file, initial, sizeof(initial)) ==
+          (ssize_t)sizeof(initial));
+
+    CHECK(fs->file_seek(fs, &file, 8192, SEEK_SET) == 8192);
+    CHECK(fs->file_tell(fs, &file) == 8192);
+    CHECK(fs->file_size(fs, &file) == (off_t)sizeof(initial));
+    check_stat_size(fs, "/cursor.bin", (off_t)sizeof(initial));
+    CHECK(fs->file_seek(fs, &file, -100, SEEK_CUR) == 8092);
+    CHECK(fs->file_seek(fs, &file, 100, SEEK_CUR) == 8192);
+    CHECK(fs->file_seek(fs, &file, 100, SEEK_END) == 613);
+    CHECK(fs->file_seek(fs, &file, -513, SEEK_END) == 0);
+    CHECK(fs->file_seek(fs, &file, 8192, SEEK_SET) == 8192);
+    CHECK(fs->file_read(fs, &file, initial, 1) == 0);
+    CHECK(fs->file_write(fs, &file, initial, 0) == 0);
+    CHECK(fs->file_tell(fs, &file) == 8192);
+    CHECK(fs->file_size(fs, &file) == (off_t)sizeof(initial));
+    check_stat_size(fs, "/cursor.bin", (off_t)sizeof(initial));
+    CHECK(fs->file_close(fs, &file) == 0);
+    check_stat_size(fs, "/cursor.bin", (off_t)sizeof(initial));
+
+    CHECK(fs->file_open(fs, &file, "/cursor.bin", O_RDWR) == 0);
+    CHECK(fs->file_seek(fs, &file, 3000, SEEK_SET) == 3000);
+    CHECK(fs->file_truncate(fs, &file, 1200) == 0);
+    CHECK(fs->file_tell(fs, &file) == 3000);
+    CHECK(fs->file_size(fs, &file) == 1200);
+    check_stat_size(fs, "/cursor.bin", 1200);
+    CHECK(fs->file_write(fs, &file, "TAIL", 4) == 4);
+    CHECK(fs->file_tell(fs, &file) == 3004);
+    CHECK(fs->file_size(fs, &file) == 3004);
+    check_stat_size(fs, "/cursor.bin", 3004);
+    CHECK(fs->file_seek(fs, &file, 0, SEEK_SET) == 0);
+    char grown[3004];
+    CHECK(fs->file_read(fs, &file, grown, sizeof(grown)) ==
+          (ssize_t)sizeof(grown));
+    check_bytes(grown, 0, 513, 0x5a);
+    CHECK(memcmp(grown + 3000, "TAIL", 4) == 0);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    CHECK(fs->file_open(fs, &file, "/cursor.bin", O_RDONLY) == 0);
+    CHECK(fs->file_seek(fs, &file, 5000, SEEK_SET) == 5000);
+    CHECK(fs->file_tell(fs, &file) == 5000);
+    CHECK(fs->file_read(fs, &file, grown, 1) == 0);
+    CHECK(fs->file_write(fs, &file, "x", 1) == -EACCES);
+    CHECK(fs->file_write(fs, &file, "x", 0) == -EACCES);
+    CHECK(fs->file_truncate(fs, &file, 10) == -EINVAL);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    CHECK(fs->file_open(fs, &file, "/cursor.bin", O_WRONLY) == 0);
+    CHECK(fs->file_read(fs, &file, grown, 1) == -EACCES);
+    CHECK(fs->file_seek(fs, &file, 3004, SEEK_SET) == 3004);
+    CHECK(fs->file_read(fs, &file, grown, 1) == -EACCES);
+    CHECK(fs->file_close(fs, &file) == 0);
+    destroy_heap_filesystem(fs, heap);
+}
+
+static void test_append_after_truncate(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/append.bin",
+                        O_CREAT | O_RDWR | O_APPEND) == 0);
+    CHECK(fs->file_tell(fs, &file) == 0);
+    CHECK(fs->file_write(fs, &file, "0123456789", 10) == 10);
+    CHECK(fs->file_truncate(fs, &file, 4) == 0);
+    CHECK(fs->file_tell(fs, &file) == 10);
+    CHECK(fs->file_write(fs, &file, "AB", 2) == 2);
+    CHECK(fs->file_tell(fs, &file) == 6);
+    CHECK(fs->file_size(fs, &file) == 6);
+    check_stat_size(fs, "/append.bin", 6);
+
+    CHECK(fs->file_seek(fs, &file, 0, SEEK_SET) == 0);
+    CHECK(fs->file_write(fs, &file, "CD", 2) == 2);
+    CHECK(fs->file_tell(fs, &file) == 8);
+    CHECK(fs->file_size(fs, &file) == 8);
+    check_stat_size(fs, "/append.bin", 8);
+    CHECK(fs->file_seek(fs, &file, 0, SEEK_SET) == 0);
+    char result[8];
+    CHECK(fs->file_read(fs, &file, result, sizeof(result)) ==
+          (ssize_t)sizeof(result));
+    CHECK(memcmp(result, "0123ABCD", sizeof(result)) == 0);
+    CHECK(fs->file_close(fs, &file) == 0);
+    destroy_heap_filesystem(fs, heap);
+}
+
+static void test_bounds_and_capacity_precheck(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/nospc.bin", O_CREAT | O_RDWR) == 0);
+    char original[513];
+    memset(original, 0x7e, sizeof(original));
+    CHECK(fs->file_write(fs, &file, original, sizeof(original)) ==
+          (ssize_t)sizeof(original));
+    CHECK(fs->file_seek(fs, &file, 200, SEEK_SET) == 200);
+
+    const off_t off_min = -TEST_OFF_MAX - 1;
+    CHECK(fs->file_truncate(fs, &file, -1) == -EINVAL);
+    CHECK(fs->file_truncate(fs, &file, off_min) == -EINVAL);
+    CHECK(fs->file_tell(fs, &file) == 200);
+    CHECK(fs->file_size(fs, &file) == (off_t)sizeof(original));
+    check_stat_size(fs, "/nospc.bin", (off_t)sizeof(original));
+
+    CHECK(fs->file_seek(fs, &file, -1, SEEK_SET) == -EINVAL);
+    CHECK(fs->file_seek(fs, &file, off_min, SEEK_SET) == -EINVAL);
+    CHECK(fs->file_seek(fs, &file, -201, SEEK_CUR) == -EINVAL);
+    CHECK(fs->file_seek(fs, &file, off_min, SEEK_CUR) == -EINVAL);
+    CHECK(fs->file_seek(fs, &file, -514, SEEK_END) == -EINVAL);
+    CHECK(fs->file_seek(fs, &file, 0, 99) == -EINVAL);
+    CHECK(fs->file_tell(fs, &file) == 200);
+    CHECK(fs->file_seek(fs, &file, TEST_OFF_MAX, SEEK_SET) == TEST_OFF_MAX);
+    CHECK(fs->file_seek(fs, &file, 1, SEEK_CUR) == -EOVERFLOW);
+    CHECK(fs->file_tell(fs, &file) == TEST_OFF_MAX);
+
+    if (sizeof(off_t) > sizeof(uint32_t)) {
+        const off_t too_large = (off_t)((uintmax_t)UINT32_MAX + 1);
+        CHECK(fs->file_seek(fs, &file, 200, SEEK_SET) == 200);
+        CHECK(fs->file_truncate(fs, &file, too_large) == -EFBIG);
+        CHECK(fs->file_size(fs, &file) == (off_t)sizeof(original));
+        CHECK(fs->file_seek(fs, &file, too_large, SEEK_SET) == too_large);
+        CHECK(fs->file_write(fs, &file, "X", 1) == -EFBIG);
+        CHECK(fs->file_size(fs, &file) == (off_t)sizeof(original));
+    }
+
+    const DWORD before = free_clusters();
+    CHECK(fs->file_seek(fs, &file, 200, SEEK_SET) == 200);
+    CHECK(fs->file_truncate(fs, &file, 256u * 1024u) == -ENOSPC);
+    CHECK(fs->file_tell(fs, &file) == 200);
+    CHECK(fs->file_size(fs, &file) == (off_t)sizeof(original));
+    check_stat_size(fs, "/nospc.bin", (off_t)sizeof(original));
+    CHECK(free_clusters() == before);
+
+    CHECK(fs->file_seek(fs, &file, 256u * 1024u, SEEK_SET) == 256u * 1024u);
+    CHECK(fs->file_write(fs, &file, "Z", 1) == -ENOSPC);
+    CHECK(fs->file_tell(fs, &file) == 256u * 1024u);
+    CHECK(fs->file_size(fs, &file) == (off_t)sizeof(original));
+    check_stat_size(fs, "/nospc.bin", (off_t)sizeof(original));
+    CHECK(free_clusters() == before);
+
+    CHECK(fs->file_truncate(fs, &file, 2048) == 0);
+    CHECK(fs->file_seek(fs, &file, 2048, SEEK_SET) == 2048);
+    CHECK(fs->file_write(fs, &file, "OK", 2) == 2);
+    CHECK(fs->file_size(fs, &file) == 2050);
+    check_stat_size(fs, "/nospc.bin", 2050);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    CHECK(fs->file_open(fs, &file, "/fill.bin", O_CREAT | O_RDWR) == 0);
+    char block[1024];
+    memset(block, 0xa5, sizeof(block));
+    ssize_t written;
+    do {
+        written = fs->file_write(fs, &file, block, sizeof(block));
+        CHECK(written != 0);
+        CHECK(written > 0 || written == -ENOSPC);
+    } while (written >= 0);
+    CHECK(written == -ENOSPC);
+    CHECK(fs->file_close(fs, &file) == 0);
+    destroy_heap_filesystem(fs, heap);
+}
+
 void mutex_init(mutex_t *mutex) {
     mutex->locked = false;
 }
@@ -212,6 +469,10 @@ void mutex_exit(mutex_t *mutex) {
 
 int main(void) {
     test_failed_open_cleanup();
+    test_truncate_metadata_and_cursor();
+    test_cursor_and_access_modes();
+    test_append_after_truncate();
+    test_bounds_and_capacity_precheck();
     const size_t sector_sizes[] = {512, 4096};
     for (size_t i = 0; i < sizeof(sector_sizes) / sizeof(sector_sizes[0]); ++i) {
         test_fat_disk(sector_sizes[i]);
