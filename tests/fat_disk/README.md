@@ -18,6 +18,11 @@ wrappers, exercising the production adapter's signed-offset limits, EOF behavior
 and append policy without allocating gigabytes of backing storage. Imported
 oversized files remain readable within the representable cursor range.
 
+Zero-fill regressions use dirty, previously written data on FAT and exFAT with
+512- and 4096-byte sectors. They cover truncate growth, write gaps, preserved
+cursors, zero-length writes, remount persistence, and injected failures at every
+physical write in the growth operation, followed by recovery operations.
+
 Scenario rationale and boundary calculations are documented beside the
 relevant expectations and assertions in [`test_fat_disk.c`](test_fat_disk.c).
 

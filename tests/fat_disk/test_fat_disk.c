@@ -512,6 +512,193 @@ static void check_stat_size(filesystem_t *fs, const char *path, off_t expected) 
     CHECK(info.st_size == expected);
 }
 
+/** Mount an explicitly formatted FAT/exFAT volume with the requested sector size. */
+static filesystem_t *create_zero_fill_filesystem(blockdevice_t **out_heap,
+                                                bool exfat, size_t sector_size) {
+    blockdevice_t *heap = blockdevice_heap_create(32u * 1024u * 1024u);
+    filesystem_t *fs = filesystem_fat_create();
+    CHECK(heap != NULL && fs != NULL);
+    heap->read_size = heap->program_size = heap->erase_size = sector_size;
+    CHECK(fs->mount(fs, heap, true) == 0);
+    const MKFS_PARM options = {
+        .fmt = (exfat ? FM_EXFAT : FM_FAT) | FM_SFD, .au_size = sector_size,
+    };
+    uint8_t work[FF_MAX_SS];
+    CHECK(f_mkfs("0:", &options, work, sizeof(work)) == FR_OK);
+    CHECK(fs->unmount(fs) == 0);
+    CHECK(fs->mount(fs, heap, false) == 0);
+    *out_heap = heap;
+    return fs;
+}
+
+/** Verify zero-filled growth and gaps on real FAT/exFAT volumes at both sector sizes. */
+static void test_zero_fill(bool exfat, size_t sector_size) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_zero_fill_filesystem(&heap, exfat, sector_size);
+
+    // Reuse dirty file contents so zeros cannot come from pristine heap storage.
+    const size_t final_size = 4 * sector_size + 11;
+    char *data = malloc(final_size);
+    CHECK(data != NULL);
+    memset(data, 'Q', final_size);
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/zero.bin", O_CREAT | O_RDWR) == 0);
+    CHECK(fs->file_write(fs, &file, data, final_size) == (ssize_t)final_size);
+    CHECK(fs->file_truncate(fs, &file, 37) == 0);
+    const off_t extension = (off_t)(2 * sector_size + 11);
+    CHECK(fs->file_truncate(fs, &file, extension) == 0);
+    CHECK(fs->file_tell(fs, &file) == (off_t)final_size);
+    check_stat_size(fs, "/zero.bin", extension);
+    CHECK(fs->file_seek(fs, &file, 0, SEEK_SET) == 0);
+    CHECK(fs->file_read(fs, &file, data, (size_t)extension) == extension);
+    check_bytes(data, 0, 37, 'Q');
+    check_bytes(data, 37, (size_t)extension, 0);
+
+    // Growing an empty file and an unaligned gap must initialize every byte.
+    CHECK(fs->file_truncate(fs, &file, 0) == 0);
+    CHECK(fs->file_truncate(fs, &file, 31) == 0);
+    CHECK(fs->file_tell(fs, &file) == extension);
+    const off_t gap_end = (off_t)(final_size - 4);
+    CHECK(fs->file_seek(fs, &file, gap_end, SEEK_SET) == gap_end);
+    const DWORD before = free_clusters();
+    CHECK(fs->file_write(fs, &file, "TAIL", 0) == 0);
+    CHECK(fs->file_size(fs, &file) == 31);
+    CHECK(free_clusters() == before);
+    CHECK(fs->file_write(fs, &file, "TAIL", 4) == 4);
+    CHECK(fs->file_tell(fs, &file) == (off_t)final_size);
+    check_stat_size(fs, "/zero.bin", (off_t)final_size);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    // Remount to verify initialized contents and size survive metadata publication.
+    CHECK(fs->unmount(fs) == 0);
+    CHECK(fs->mount(fs, heap, false) == 0);
+    CHECK(fs->file_open(fs, &file, "/zero.bin", O_RDONLY) == 0);
+    CHECK(fs->file_read(fs, &file, data, final_size) == (ssize_t)final_size);
+    check_bytes(data, 0, final_size - 4, 0);
+    CHECK(memcmp(data + final_size - 4, "TAIL", 4) == 0);
+    CHECK(fs->file_close(fs, &file) == 0);
+    free(data);
+    destroy_heap_filesystem(fs, heap);
+}
+
+/** Check retained zero-filled progress and recovery after physical growth-write failures. */
+static void test_zero_fill_errors(bool gap_write, bool exfat, size_t sector_size) {
+    // First record a successful operation's writes, then fail each physical write
+    // in turn, covering allocation, zero data, payload, and metadata publication.
+    unsigned total_programs = 0;
+    for (unsigned failure = 0; failure <= total_programs; ++failure) {
+        blockdevice_t *heap;
+        filesystem_t *fs = create_zero_fill_filesystem(&heap, exfat, sector_size);
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/failure.bin", O_CREAT | O_RDWR) == 0);
+        CHECK(fs->file_write(fs, &file, "seed", 4) == 4);
+        const off_t target = (off_t)(3 * sector_size + 17);
+        CHECK(fs->file_seek(fs, &file, target, SEEK_SET) == target);
+        saved_program = heap->program;
+        heap->program = failing_program;
+        program_calls = 0;
+        fail_program_at = failure;
+        fail_at_address = false;
+        program_failed = false;
+        const ssize_t result = gap_write ? fs->file_write(fs, &file, "TAIL", 4)
+                                        : fs->file_truncate(fs, &file, target);
+        heap->program = saved_program;
+        if (failure == 0) {
+            CHECK(result == (gap_write ? 4 : 0));
+            CHECK(!program_failed);
+            total_programs = program_calls;
+            CHECK(total_programs > 0);
+            CHECK(fs->file_close(fs, &file) == 0);
+            destroy_heap_filesystem(fs, heap);
+            continue;
+        }
+        CHECK(program_failed);
+        CHECK(result == -EIO);
+        const FIL *physical = file.context;
+        const size_t retained_size = (size_t)f_size(physical);
+        CHECK(retained_size >= 4 && retained_size <= (size_t)target + (gap_write ? 4 : 0));
+
+        // Internal zeros never consume the logical cursor or clear an abort.
+        // Sync and reopen after removing the fault to inspect retained growth.
+        if (physical->err) {
+            CHECK(fs->file_write(fs, &file, "X", 1) == -EIO);
+        } else {
+            CHECK(fs->file_tell(fs, &file) ==
+                  (retained_size > (size_t)target ? (off_t)retained_size : target));
+        }
+        CHECK(fs->file_sync(fs, &file) == 0);
+        CHECK(fs->file_close(fs, &file) == 0);
+        // A failed directory write can leave the volume window dirty even after
+        // FatFs clears the file's modified flag. A new entry flushes that window.
+        CHECK(fs->file_open(fs, &file, "/recovery.bin", O_CREAT | O_RDWR) == 0);
+        CHECK(fs->file_close(fs, &file) == 0);
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+        CHECK(fs->file_open(fs, &file, "/failure.bin", O_RDONLY) == 0);
+        char data[3 * FF_MAX_SS + 21];
+        CHECK(fs->file_size(fs, &file) == (off_t)retained_size);
+        CHECK(fs->file_read(fs, &file, data, sizeof(data)) == (ssize_t)retained_size);
+        CHECK(memcmp(data, "seed", 4) == 0);
+        const size_t zero_end = retained_size < (size_t)target ? retained_size : (size_t)target;
+        check_bytes(data, 4, zero_end, 0);
+        if (retained_size > (size_t)target) {
+            CHECK(memcmp(data + target, "TAIL", retained_size - (size_t)target) == 0);
+        }
+        CHECK(fs->file_close(fs, &file) == 0);
+        destroy_heap_filesystem(fs, heap);
+    }
+}
+
+/** Verify stale capacity counts cannot turn disk exhaustion into uninitialized growth. */
+static void test_zero_fill_no_space(void) {
+    for (unsigned gap_write = 0; gap_write < 2; ++gap_write) {
+        blockdevice_t *heap;
+        filesystem_t *fs = create_heap_filesystem(&heap);
+        fs_file_t file = {0}, filler = {0};
+        CHECK(fs->file_open(fs, &file, "/full.bin", O_CREAT | O_RDWR) == 0);
+        CHECK(fs->file_write(fs, &file, "Q", 1) == 1);
+        CHECK(fs->file_open(fs, &filler, "/filler.bin", O_CREAT | O_RDWR) == 0);
+        char data[4096];
+        memset(data, 'F', sizeof(data));
+        ssize_t written;
+        do {
+            written = fs->file_write(fs, &filler, data, sizeof(data));
+            CHECK(written > 0 || written == -ENOSPC);
+        } while (written > 0);
+        CHECK(fs->file_close(fs, &filler) == 0);
+        CHECK(free_clusters() == 0);
+
+        FIL *physical = file.context;
+        FATFS *volume = physical->obj.fs;
+        const off_t cluster_bytes = (off_t)volume->csize * volume->ssize;
+        CHECK((size_t)cluster_bytes <= sizeof(data));
+        CHECK(fs->file_seek(fs, &file, cluster_bytes, SEEK_SET) == cluster_bytes);
+        // Model a stale free-space cache: the precheck admits growth, but actual
+        // allocation must discover that every cluster belongs to a live file.
+        volume->free_clst = 1;
+        if (gap_write) {
+            CHECK(fs->file_write(fs, &file, "TAIL", 4) == -ENOSPC);
+        } else {
+            CHECK(fs->file_truncate(fs, &file, 2 * cluster_bytes) == -ENOSPC);
+        }
+        volume->free_clst = 0;
+        CHECK(fs->file_size(fs, &file) == cluster_bytes);
+        CHECK(fs->file_tell(fs, &file) == cluster_bytes);
+        CHECK(free_clusters() == 0);
+        CHECK(fs->file_close(fs, &file) == 0);
+        check_stat_size(fs, "/full.bin", cluster_bytes);
+
+        // Reopen after exhaustion: only the original byte and initialized suffix
+        // are visible, and the rejected payload must not appear in the file.
+        CHECK(fs->file_open(fs, &file, "/full.bin", O_RDONLY) == 0);
+        CHECK(fs->file_read(fs, &file, data, sizeof(data)) == cluster_bytes);
+        CHECK(data[0] == 'Q');
+        check_bytes(data, 1, (size_t)cluster_bytes, 0);
+        CHECK(fs->file_close(fs, &file) == 0);
+        destroy_heap_filesystem(fs, heap);
+    }
+}
+
 /** Verify failed writes report completed bytes and preserve the FatFs error latch. */
 static void test_partial_write_errors(void) {
     blockdevice_t *heap;
@@ -884,7 +1071,7 @@ static void test_cursor_and_access_modes(void) {
     check_stat_size(fs, "/cursor.bin", (off_t)sizeof(initial));
 
     // Only the later payload write grows the file to the overhanging cursor.
-    // Check preserved data and payload, not the unspecified contents of the gap.
+    // Check the preserved prefix, zero-filled extension/gap, and final payload.
     CHECK(fs->file_open(fs, &file, "/cursor.bin", O_RDWR) == 0);
     CHECK(fs->file_seek(fs, &file, 3000, SEEK_SET) == 3000);
     CHECK(fs->file_truncate(fs, &file, 1200) == 0);
@@ -900,6 +1087,7 @@ static void test_cursor_and_access_modes(void) {
     CHECK(fs->file_read(fs, &file, grown, sizeof(grown)) ==
           (ssize_t)sizeof(grown));
     check_bytes(grown, 0, 513, 0x5a);
+    check_bytes(grown, 513, 3000, 0);
     CHECK(memcmp(grown + 3000, "TAIL", 4) == 0);
     CHECK(fs->file_close(fs, &file) == 0);
 
@@ -1161,6 +1349,7 @@ int main(void) {
     test_write_size_ceiling();
     test_read_offset_ceiling();
     test_write_cursor_after_sync_error();
+    test_zero_fill_no_space();
     test_truncate_metadata_and_cursor();
     test_cursor_and_access_modes();
     test_append_after_truncate();
@@ -1171,6 +1360,12 @@ int main(void) {
     // Keep adapter arithmetic coverage independent of the heap volume's geometry.
     const size_t sector_sizes[] = {512, 4096};
     for (size_t i = 0; i < sizeof(sector_sizes) / sizeof(sector_sizes[0]); ++i) {
+        test_zero_fill(false, sector_sizes[i]);
+        test_zero_fill(true, sector_sizes[i]);
+        for (unsigned exfat = 0; exfat < 2; ++exfat) {
+            test_zero_fill_errors(false, exfat, sector_sizes[i]);
+            test_zero_fill_errors(true, exfat, sector_sizes[i]);
+        }
         test_fat_disk(sector_sizes[i]);
         printf("fat-disk-%zu-byte-sectors: passed\n", sector_sizes[i]);
     }
