@@ -196,6 +196,44 @@ static void test_failed_open_cleanup(void) {
     blockdevice_heap_free(heap);
 }
 
+/* Exclusive creation must reject existing files even with truncate or append. */
+static void test_exclusive_create(void) {
+    blockdevice_t *heap = blockdevice_heap_create(128u * 1024u);
+    filesystem_t *fs = filesystem_fat_create();
+    CHECK(heap != NULL && fs != NULL);
+    CHECK(fs->format(fs, heap) == 0);
+    CHECK(fs->mount(fs, heap, false) == 0);
+    const int flags[] = {
+        O_CREAT | O_EXCL | O_RDWR,
+        O_CREAT | O_EXCL | O_RDWR | O_TRUNC,
+        O_CREAT | O_EXCL | O_RDWR | O_APPEND,
+    };
+    const char payload[] = "exclusive creation preserves existing data";
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/exclusive.bin", flags[i]) == 0);
+        CHECK(fs->file_write(fs, &file, payload, sizeof(payload)) == sizeof(payload));
+        fs_file_t duplicate = {0};
+        int err = fs->file_open(fs, &duplicate, "/exclusive.bin", flags[i]);
+        if (err == 0) {
+            CHECK(fs->file_close(fs, &duplicate) == 0);
+        }
+        CHECK(err == -EEXIST);
+        CHECK(duplicate.context == NULL);
+        CHECK(fs->file_close(fs, &file) == 0);
+        CHECK(fs->file_open(fs, &file, "/exclusive.bin", O_RDONLY) == 0);
+        CHECK(fs->file_size(fs, &file) == sizeof(payload));
+        char actual[sizeof(payload)] = {0};
+        CHECK(fs->file_read(fs, &file, actual, sizeof(actual)) == sizeof(actual));
+        CHECK(memcmp(actual, payload, sizeof(payload)) == 0);
+        CHECK(fs->file_close(fs, &file) == 0);
+        CHECK(fs->remove(fs, "/exclusive.bin") == 0);
+    }
+    CHECK(fs->unmount(fs) == 0);
+    filesystem_fat_free(fs);
+    blockdevice_heap_free(heap);
+}
+
 void mutex_init(mutex_t *mutex) {
     mutex->locked = false;
 }
@@ -212,6 +250,7 @@ void mutex_exit(mutex_t *mutex) {
 
 int main(void) {
     test_failed_open_cleanup();
+    test_exclusive_create();
     const size_t sector_sizes[] = {512, 4096};
     for (size_t i = 0; i < sizeof(sector_sizes) / sizeof(sector_sizes[0]); ++i) {
         test_fat_disk(sector_sizes[i]);
