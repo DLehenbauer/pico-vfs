@@ -101,6 +101,44 @@ static void test_api_file_open_close() {
     int err = close(fd);
     assert(err == 0);
 
+    fd = open("/excl", O_CREAT|O_EXCL|O_RDWR);
+    assert(fd >= MIN_FILENO);
+    ssize_t write_length = write(fd, "excl", 4);
+    assert(write_length == 4);
+    err = close(fd);
+    assert(err == 0);
+
+    errno = 0;
+    fd = open("/excl", O_CREAT|O_EXCL|O_RDWR|O_TRUNC);
+    assert(fd == -1);
+    assert(errno == EEXIST);
+    errno = 0;
+    fd = open("/excl", O_CREAT|O_EXCL|O_RDWR|O_APPEND);
+    assert(fd == -1);
+    assert(errno == EEXIST);
+
+    fd = open("/excl", O_RDONLY);
+    assert(fd >= MIN_FILENO);
+    char buffer[5] = {0};
+    ssize_t read_length = read(fd, buffer, sizeof(buffer));
+    assert(read_length == 4);
+    assert(strcmp(buffer, "excl") == 0);
+    err = close(fd);
+    assert(err == 0);
+    err = unlink("/excl");
+    assert(err == 0);
+
+    err = mkdir("/excl_dir", 0777);
+    assert(err == 0);
+    errno = 0;
+    fd = open("/excl_dir", O_CREAT|O_EXCL|O_RDWR);
+    assert(fd == -1);
+    assert(errno == EEXIST);
+    err = rmdir("/excl_dir");
+    assert(err == 0);
+
+    (void)write_length;
+    (void)read_length;
     printf(COLOR_GREEN("ok\n"));
 }
 

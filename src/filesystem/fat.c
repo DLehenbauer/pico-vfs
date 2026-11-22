@@ -457,6 +457,7 @@ static int file_stat(filesystem_t *fs, const char *path, struct stat *st) {
 }
 
 static int file_open(filesystem_t *fs, fs_file_t *file, const char *path, int flags) {
+    const bool exclusive_create = (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL);
     BYTE open_mode;
     if (flags & O_RDWR)
         open_mode = FA_READ | FA_WRITE;
@@ -465,12 +466,14 @@ static int file_open(filesystem_t *fs, fs_file_t *file, const char *path, int fl
     else
         open_mode = FA_READ;
     if (flags & O_CREAT) {
-        if (flags & O_TRUNC)
+        if (exclusive_create)
+            open_mode |= FA_CREATE_NEW;
+        else if (flags & O_TRUNC)
             open_mode |= FA_CREATE_ALWAYS;
         else
             open_mode |= FA_OPEN_ALWAYS;
     }
-    if (flags & O_APPEND)
+    if ((flags & O_APPEND) && !exclusive_create)
         open_mode |= FA_OPEN_APPEND;
 
     char fpath[PATH_MAX];
@@ -484,6 +487,19 @@ static int file_open(filesystem_t *fs, fs_file_t *file, const char *path, int fl
 
     mutex_enter_blocking(&context->_mutex);
     FRESULT res = f_open(&fat_file->file, fpath, open_mode);
+    if (exclusive_create) {
+        // FatFs rejects read-only/directory targets before checking FA_CREATE_NEW.
+        // Origin directories also fail f_stat, so recognize them with f_opendir.
+        if (res == FR_DENIED && f_stat(fpath, NULL) == FR_OK) {
+            res = FR_EXIST;
+        } else if (res == FR_INVALID_NAME && path[0] != '\0') {
+            FATFS_DIR dir = {0};
+            if (f_opendir(&dir, fpath) == FR_OK) {
+                (void)f_closedir(&dir);
+                res = FR_EXIST;
+            }
+        }
+    }
     mutex_exit(&context->_mutex);
 
     if (res != FR_OK) {

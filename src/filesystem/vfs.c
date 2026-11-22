@@ -11,6 +11,7 @@
 #include <pico/mutex.h>
 #include "filesystem/vfs.h"
 
+struct _reent;
 
 typedef struct {
     const char *dir;
@@ -69,6 +70,7 @@ static mountpoint_t *find_mountpoint(const char *path) {
     size_t longest_length = 0;
 
     for (size_t i = 0; i < FS_MAX_MOUNTPOINT; i++) {
+        if (mountpoints[i].filesystem == NULL) continue;
         size_t prefix_length = strlen(mountpoints[i].dir);
         if (prefix_length > longest_length && strncmp(path, mountpoints[i].dir, prefix_length) == 0) {
             longest_match = &mountpoints[i];
@@ -412,6 +414,7 @@ int _open(const char *path, int oflags, ...) {
         return _error_remap(-ENOENT);
     }
     const char *entity_path = remove_prefix(path, mp->dir);
+    if (entity_path[0] == '\0') entity_path = "/";
     // find file descriptor
     int fd = _assign_file_descriptor();
     if (fd == -1) {
@@ -564,7 +567,7 @@ off_t _lseek(int fildes, off_t offset, int whence) {
 
 off_t _ftello_r(struct _reent *ptr, register FILE *fp) {
     (void)ptr;
-    int fildes = fp->_file;
+    int fildes = fileno(fp);
     auto_init_recursive_mutex(_mutex);
     recursive_mutex_enter_blocking(&_mutex);
 

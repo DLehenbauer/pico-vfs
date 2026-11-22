@@ -74,6 +74,46 @@ static void test_api_file_open_close(filesystem_t *fs) {
     err = fs->file_close(fs, &file);
     assert(err == 0);
 
+    err = fs->file_open(fs, &file, "/excl", O_CREAT | O_EXCL | O_RDWR);
+    assert(err == 0);
+    ssize_t write_length = fs->file_write(fs, &file, "excl", 4);
+    assert(write_length == 4);
+    err = fs->file_close(fs, &file);
+    assert(err == 0);
+
+    err = fs->file_open(fs, &file, "/excl", O_CREAT | O_EXCL | O_RDWR);
+    assert(err == -EEXIST);
+    err = fs->file_open(fs, &file, "/excl",
+                        O_CREAT | O_EXCL | O_RDWR | O_TRUNC);
+    assert(err == -EEXIST);
+    err = fs->file_open(fs, &file, "/excl",
+                        O_CREAT | O_EXCL | O_RDWR | O_APPEND);
+    assert(err == -EEXIST);
+
+    err = fs->file_open(fs, &file, "/excl", O_RDONLY);
+    assert(err == 0);
+    char buffer[5] = {0};
+    ssize_t read_length = fs->file_read(fs, &file, buffer, sizeof(buffer));
+    assert(read_length == 4);
+    assert(strcmp(buffer, "excl") == 0);
+    err = fs->file_close(fs, &file);
+    assert(err == 0);
+    err = fs->remove(fs, "/excl");
+    assert(err == 0);
+
+    err = fs->mkdir(fs, "/excl_dir", 0777);
+    assert(err == 0);
+    err = fs->file_open(fs, &file, "/excl_dir", O_CREAT | O_EXCL | O_RDWR);
+    assert(err == -EEXIST);
+    err = fs->file_open(fs, &file, "/", O_CREAT | O_EXCL | O_RDWR);
+    assert(err == -EEXIST);
+    err = fs->file_open(fs, &file, "", O_CREAT | O_EXCL | O_RDWR);
+    assert(err == -EINVAL);
+    err = fs->rmdir(fs, "/excl_dir");
+    assert(err == 0);
+
+    (void)write_length;
+    (void)read_length;
     printf(COLOR_GREEN("ok\n"));
 }
 
