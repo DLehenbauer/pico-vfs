@@ -4011,6 +4011,7 @@ FRESULT f_read (
 /* Write File                                                            */
 /*-----------------------------------------------------------------------*/
 
+/** Write file data, retaining completed-transfer metadata even if a later transfer aborts. */
 FRESULT f_write (
 	FIL* fp,			/* Open file to be written */
 	const void* buff,	/* Data to be written */
@@ -4036,7 +4037,11 @@ FRESULT f_write (
 		btw = (UINT)(0xFFFFFFFF - (DWORD)fp->fptr);
 	}
 
-	for ( ; btw > 0; btw -= wcnt, *bw += wcnt, wbuff += wcnt, fp->fptr += wcnt, fp->obj.objsize = (fp->fptr > fp->obj.objsize) ? fp->fptr : fp->obj.objsize) {	/* Repeat until all data written */
+	// Commit size, cursor, and modified state together before the next iteration can abort.
+	for ( ; btw > 0;
+		btw -= wcnt, *bw += wcnt, wbuff += wcnt, fp->fptr += wcnt,
+		fp->obj.objsize = (fp->fptr > fp->obj.objsize) ? fp->fptr : fp->obj.objsize,
+		fp->flag |= FA_MODIFIED) {
 		if (fp->fptr % SS(fs) == 0) {		/* On the sector boundary? */
 			csect = (UINT)(fp->fptr / SS(fs)) & (fs->csize - 1);	/* Sector offset in the cluster */
 			if (csect == 0) {				/* On the cluster boundary? */
@@ -4132,6 +4137,7 @@ FRESULT f_write (
 /* Synchronize the File                                                  */
 /*-----------------------------------------------------------------------*/
 
+/** Flush file data and directory metadata, retaining pending updates after a failure. */
 FRESULT f_sync (
 	FIL* fp		/* Open file to be synced */
 )
@@ -4177,7 +4183,8 @@ FRESULT f_sync (
 						res = store_xdir(&dj);	/* Restore it to the directory */
 						if (res == FR_OK) {
 							res = sync_fs(fs);
-							fp->flag &= (BYTE)~FA_MODIFIED;
+							/* A failed metadata flush must remain retryable, including on aborted files. */
+							if (res == FR_OK) fp->flag &= (BYTE)~FA_MODIFIED;
 						}
 					}
 					FREE_NAMBUF();
@@ -4195,7 +4202,8 @@ FRESULT f_sync (
 					st_word(dir + DIR_LstAccDate, 0);
 					fs->wflag = 1;
 					res = sync_fs(fs);					/* Restore it to the directory */
-					fp->flag &= (BYTE)~FA_MODIFIED;
+					/* Do not let a subsequent sync or close skip an unsuccessful metadata flush. */
+					if (res == FR_OK) fp->flag &= (BYTE)~FA_MODIFIED;
 				}
 			}
 		}
