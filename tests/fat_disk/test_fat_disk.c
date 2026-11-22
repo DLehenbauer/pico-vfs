@@ -16,6 +16,7 @@
 #define FAT_SHORT_NAME_SIZE              11
 #define FAT_ATTRIBUTE_OFFSET             11
 #define FAT_LONG_NAME_ATTRIBUTE          0x0f
+#define FAT12_ROOT_ENTRIES               512
 
 #define CHECK(condition)                                                        \
     do {                                                                        \
@@ -24,6 +25,28 @@
             exit(EXIT_FAILURE);                                                 \
         }                                                                       \
     } while (0)
+
+static FRESULT stat_failure, opendir_failure, closedir_failure;
+static unsigned stat_probes, opendir_probes, closedir_probes;
+
+FRESULT __real_f_stat(const TCHAR *path, FILINFO *info);
+FRESULT __real_f_opendir(FATFS_DIR *dir, const TCHAR *path);
+FRESULT __real_f_closedir(FATFS_DIR *dir);
+
+FRESULT __wrap_f_stat(const TCHAR *path, FILINFO *info) {
+    ++stat_probes;
+    return stat_failure != FR_OK ? stat_failure : __real_f_stat(path, info);
+}
+
+FRESULT __wrap_f_opendir(FATFS_DIR *dir, const TCHAR *path) {
+    ++opendir_probes;
+    return opendir_failure != FR_OK ? opendir_failure : __real_f_opendir(dir, path);
+}
+
+FRESULT __wrap_f_closedir(FATFS_DIR *dir) {
+    ++closedir_probes;
+    return closedir_failure != FR_OK ? closedir_failure : __real_f_closedir(dir);
+}
 
 // Record byte ranges without accessing buffers, so huge logical devices and
 // transfers need no backing allocation. Counters detect I/O on rejected ranges.
@@ -351,47 +374,122 @@ static void test_exclusive_create(void) {
 
     CHECK(fs->unmount(fs) == 0);
     format_and_mount(fs, heap);
-    char first_long_name[220] = {0};
-    bool full = false;
-    for (unsigned i = 0; i < 40; ++i) {
-        char long_name[220] = {0};
-        int length = snprintf(long_name, sizeof(long_name), "/root-fill-%03u-", i);
-        CHECK(length > 0 && (size_t)length < sizeof(long_name));
-        for (size_t offset = (size_t)length; offset < sizeof(long_name) - 1; ++offset) {
-            long_name[offset] = (char)('a' + i % 26);
-        }
-        const int err = fs->file_open(fs, &file, long_name, O_CREAT | O_EXCL | O_RDWR);
-        if (err == -EACCES) {
-            CHECK(file.context == NULL);
-            full = true;
-            break;
-        }
-        CHECK(err == 0);
-        CHECK(fs->file_close(fs, &file) == 0);
-        if (i == 0) {
-            memcpy(first_long_name, long_name, sizeof(first_long_name));
-        }
-    }
-    full = false;
-    for (unsigned i = 0; i < FAT_DIRECTORY_ENTRIES_PER_SECTOR * 32; ++i) {
+    // Uppercase 8.3 names occupy exactly one entry in the default fixed root.
+    for (unsigned i = 0; i < FAT12_ROOT_ENTRIES; ++i) {
         char short_name[16] = {0};
-        CHECK(snprintf(short_name, sizeof(short_name), "/s%05u.bin", i) > 0);
-        const int err = fs->file_open(fs, &file, short_name, O_CREAT | O_EXCL | O_RDWR);
-        if (err == -EACCES) {
-            CHECK(file.context == NULL);
-            full = true;
-            break;
-        }
-        CHECK(err == 0);
+        CHECK(snprintf(short_name, sizeof(short_name), "/S%05u.BIN", i) > 0);
+        CHECK(fs->file_open(fs, &file, short_name, O_CREAT | O_EXCL | O_RDWR) == 0);
         CHECK(fs->file_close(fs, &file) == 0);
     }
-    CHECK(full);
-    expect_open_error(fs, "/new-exclusive.bin", O_CREAT | O_EXCL | O_RDWR, -EACCES);
-    expect_open_error(fs, first_long_name, O_CREAT | O_EXCL | O_RDWR, -EEXIST);
+    expect_open_error(fs, "/NEWEXCL.BIN", O_CREAT | O_EXCL | O_RDWR, -EACCES);
+    expect_open_error(fs, "/S00000.BIN", O_CREAT | O_EXCL | O_RDWR, -EEXIST);
 
     CHECK(fs->unmount(fs) == 0);
     filesystem_fat_free(fs);
     blockdevice_heap_free(heap);
+}
+
+static void verify_recovery(filesystem_t *fs) {
+    fs_file_t file = {0};
+    const char payload[] = "after probe failure";
+    CHECK(fs->file_open(fs, &file, "/recovery.bin", O_CREAT | O_EXCL | O_RDWR) == 0);
+    CHECK(fs->file_write(fs, &file, payload, sizeof(payload)) == (ssize_t)sizeof(payload));
+    CHECK(fs->file_close(fs, &file) == 0);
+    verify_file(fs, "/recovery.bin", payload, sizeof(payload));
+    CHECK(fs->remove(fs, "/recovery.bin") == 0);
+}
+
+static void test_exclusive_probe_failures(void) {
+    blockdevice_t *heap = blockdevice_heap_create(128u * 1024u);
+    filesystem_t *fs = filesystem_fat_create();
+    CHECK(heap != NULL && fs != NULL);
+    format_and_mount(fs, heap);
+    CHECK(fs->mkdir(fs, "/dir", 0777) == 0);
+    const int flags = O_CREAT | O_EXCL | O_RDWR;
+
+    unsigned probes = stat_probes;
+    stat_failure = FR_DISK_ERR;
+    expect_open_error(fs, "/dir", flags, -EACCES);
+    CHECK(stat_probes == probes + 1);
+    stat_failure = FR_OK;
+    expect_open_error(fs, "/dir", flags, -EEXIST);
+    verify_recovery(fs);
+
+    probes = opendir_probes;
+    opendir_failure = FR_NOT_ENOUGH_CORE;
+    expect_open_error(fs, "/", flags, -EINVAL);
+    CHECK(opendir_probes == probes + 1);
+    opendir_failure = FR_OK;
+    expect_open_error(fs, "/", flags, -EEXIST);
+    verify_recovery(fs);
+
+    probes = closedir_probes;
+    closedir_failure = FR_DISK_ERR;
+    expect_open_error(fs, "/", flags, -EEXIST);
+    CHECK(closedir_probes == probes + 1);
+    closedir_failure = FR_OK;
+    expect_open_error(fs, "/", flags, -EEXIST);
+    verify_recovery(fs);
+
+    CHECK(fs->rmdir(fs, "/dir") == 0);
+    CHECK(fs->unmount(fs) == 0);
+    filesystem_fat_free(fs);
+    blockdevice_heap_free(heap);
+}
+
+static void test_fat32_second_volume(void) {
+    blockdevice_t *heaps[] = {
+        blockdevice_heap_create(128u * 1024u),
+        blockdevice_heap_create(64u * 1024u * 1024u),
+    };
+    filesystem_t *filesystems[] = {filesystem_fat_create(), filesystem_fat_create()};
+    CHECK(heaps[0] != NULL && heaps[1] != NULL);
+    CHECK(filesystems[0] != NULL && filesystems[1] != NULL);
+    format_and_mount(filesystems[0], heaps[0]);
+    DWORD free_clusters = 0;
+    FATFS *volume = NULL;
+    CHECK(f_getfree("0:", &free_clusters, &volume) == FR_OK);
+    CHECK(volume->fs_type == FS_FAT12);
+
+    // Force a real FAT32 image on drive 1 while drive 0 remains mounted.
+    CHECK(filesystems[1]->mount(filesystems[1], heaps[1], true) == 0);
+    const MKFS_PARM options = {.fmt = FM_FAT32 | FM_SFD, .au_size = 512};
+    uint8_t work[FF_MAX_SS] = {0};
+    CHECK(f_mkfs("1:", &options, work, sizeof(work)) == FR_OK);
+    CHECK(filesystems[1]->unmount(filesystems[1]) == 0);
+    CHECK(filesystems[1]->mount(filesystems[1], heaps[1], false) == 0);
+    CHECK(f_getfree("1:", &free_clusters, &volume) == FR_OK);
+    CHECK(volume->fs_type == FS_FAT32);
+
+    const char *const payloads[] = {"drive zero", "drive one"};
+    const int flags = O_CREAT | O_EXCL | O_RDWR | O_TRUNC | O_APPEND;
+    for (size_t i = 0; i < 2; ++i) {
+        filesystem_t *fs = filesystems[i];
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/same.bin", flags) == 0);
+        CHECK(fs->file_tell(fs, &file) == 0);
+        CHECK(fs->file_write(fs, &file, payloads[i], strlen(payloads[i]))
+              == (ssize_t)strlen(payloads[i]));
+        expect_open_error(fs, "/same.bin", flags, -EEXIST);
+        CHECK(fs->file_close(fs, &file) == 0);
+        expect_open_error(fs, "/same.bin", flags, -EEXIST);
+        CHECK(fs->mkdir(fs, "/dir", 0777) == 0);
+        expect_open_error(fs, "/dir", flags, -EEXIST);
+        expect_open_error(fs, "/", flags, -EEXIST);
+        expect_open_error(fs, "/.", flags, -EEXIST);
+        expect_open_error(fs, "/dir/..", flags, -EEXIST);
+        expect_open_error(fs, "", flags, -EINVAL);
+        verify_recovery(fs);
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        filesystem_t *fs = filesystems[i];
+        verify_file(fs, "/same.bin", payloads[i], strlen(payloads[i]));
+        CHECK(fs->remove(fs, "/same.bin") == 0);
+        CHECK(fs->rmdir(fs, "/dir") == 0);
+        CHECK(fs->unmount(fs) == 0);
+        filesystem_fat_free(fs);
+        blockdevice_heap_free(heaps[i]);
+    }
 }
 
 void mutex_init(mutex_t *mutex) {
@@ -411,6 +509,8 @@ void mutex_exit(mutex_t *mutex) {
 int main(void) {
     test_failed_open_cleanup();
     test_exclusive_create();
+    test_exclusive_probe_failures();
+    test_fat32_second_volume();
     const size_t sector_sizes[] = {512, 4096};
     for (size_t i = 0; i < sizeof(sector_sizes) / sizeof(sector_sizes[0]); ++i) {
         test_fat_disk(sector_sizes[i]);

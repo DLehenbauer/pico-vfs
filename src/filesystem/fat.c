@@ -488,6 +488,8 @@ static int file_open(filesystem_t *fs, fs_file_t *file, const char *path, int fl
     mutex_enter_blocking(&context->_mutex);
     FRESULT res = f_open(&fat_file->file, fpath, open_mode);
     if (exclusive_create) {
+        // FatFs rejects read-only/directory targets before checking FA_CREATE_NEW.
+        // Origin directories also fail f_stat, so recognize them with f_opendir.
         if (res == FR_DENIED && f_stat(fpath, NULL) == FR_OK) {
             res = FR_EXIST;
         } else if (res == FR_INVALID_NAME && path[0] != '\0') {
