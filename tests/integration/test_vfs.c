@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -22,6 +23,7 @@
 #define LITTLEFS_LOOKAHEAD_SIZE  16
 #define MIN_FILENO               3
 #define BLOCKDEVICE_HEAP_SIZE    (64 * 1024)
+#define PRODUCTION_OPEN_ATTEMPTS 64u
 
 #define PICO_SPI1_TX_PIN   15
 #define PICO_SPI1_RX_PIN   12
@@ -588,6 +590,61 @@ static void test_loopback_file(void) {
     printf(COLOR_GREEN("ok\n"));
 }
 
+// Keep required descriptor operations outside elidable assertions.
+#define require_vfs_io(success)                                                  \
+    do {                                                                        \
+        if (!(success)) {                                                       \
+            printf("%s:%d: %s (errno %d)\n", __FILE__, __LINE__, #success, errno); \
+            abort();                                                            \
+        }                                                                       \
+    } while (0)
+
+// Failed opens must retain descriptor capacity, bytes, metadata and clean directory EOF.
+static void test_api_production_open_recovery(void) {
+    test_printf("production descriptor recovery");
+    const char *directory_path = "/production-vfs";
+    const char *path = "/production-vfs/Config Alias.txt";
+    const char payload[] = "independent config reader\n";
+    const size_t length = sizeof(payload) - 1;
+    require_vfs_io(mkdir(directory_path, 0777) == 0);
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR);
+    require_vfs_io(fd >= MIN_FILENO);
+    const int retired = fd;
+    require_vfs_io(write(fd, payload, length) == (ssize_t)length);
+    require_vfs_io(close(fd) == 0);
+
+    for (unsigned attempt = 0; attempt < PRODUCTION_OPEN_ATTEMPTS; ++attempt) {
+        errno = 0;
+        fd = open("/production-vfs/missing.bin", O_RDWR);
+        require_vfs_io(fd == -1 && errno == ENOENT);
+    }
+    fd = open(path, O_RDONLY);
+    require_vfs_io(fd == retired);
+    struct stat info = {0};
+    require_vfs_io(fstat(fd, &info) == 0 && info.st_size == (off_t)length);
+    char actual[sizeof(payload) - 1] = {0};
+    require_vfs_io(read(fd, actual, sizeof(actual)) == (ssize_t)sizeof(actual));
+    require_vfs_io(memcmp(actual, payload, sizeof(actual)) == 0);
+    require_vfs_io(read(fd, actual, 1) == 0);
+
+    // Directory and read-only file descriptors may coexist without losing identities.
+    DIR *directory = opendir(directory_path);
+    require_vfs_io(directory != NULL);
+    errno = EIO;
+    struct dirent *entry = readdir(directory);
+    require_vfs_io(entry != NULL && strcmp(entry->d_name, "Config Alias.txt") == 0 &&
+                   entry->d_type == DT_REG);
+    errno = EIO;
+    require_vfs_io(readdir(directory) == NULL && errno == 0);
+    require_vfs_io(lseek(fd, 0, SEEK_SET) == 0);
+    require_vfs_io(read(fd, actual, sizeof(actual)) == (ssize_t)sizeof(actual) &&
+                   memcmp(actual, payload, sizeof(actual)) == 0);
+    require_vfs_io(closedir(directory) == 0);
+    require_vfs_io(close(fd) == 0);
+    require_vfs_io(unlink(path) == 0 && rmdir(directory_path) == 0);
+    printf(COLOR_GREEN("ok\n"));
+}
+
 void test_vfs(void) {
     printf("VFS FAT:\n");
     blockdevice_t *flash = blockdevice_flash_create(FLASH_START_AT, FLASH_LENGTH_ALL);
@@ -611,6 +668,7 @@ void test_vfs(void) {
     test_api_dir_open();
     test_api_dir_open_many();
     test_api_dir_read();
+    test_api_production_open_recovery();
     test_api_reformat();
     test_api_unmount();
     test_api_mount_unmount_repeat(fat, flash);

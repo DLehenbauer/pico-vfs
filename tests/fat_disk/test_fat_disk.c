@@ -152,6 +152,149 @@ FRESULT __wrap_f_closedir(FATFS_DIR *dir) {
     return closedir_failure != FR_OK ? closedir_failure : __real_f_closedir(dir);
 }
 
+#define TEST_CARD_BYTES (4u * 1024u * 1024u)
+#define TEST_SECTOR_BYTES 512u
+#define TEST_LOADER_BYTES 2048u
+#define TEST_IMAGE_SECTOR_BYTES 256u
+#define TEST_FILE_BYTES (8u * TEST_LOADER_BYTES + 5u)
+#define TEST_OWNER_COUNT 8u
+#define TEST_OPEN_ATTEMPTS 64u
+
+// Generate offset-specific bytes without obtaining expectations from readback.
+static uint8_t file_byte(unsigned file, size_t offset) {
+    return (uint8_t)(file * 37u ^ offset ^ (offset >> 8) ^ (offset >> 16));
+}
+
+// Construct a production-sector FAT volume backed by actual heap storage.
+static filesystem_t *create_volume(blockdevice_t **device) {
+    *device = blockdevice_heap_create(TEST_CARD_BYTES);
+    CHECK(*device != NULL);
+    filesystem_t *fs = filesystem_fat_create();
+    CHECK(fs != NULL);
+    CHECK(fs->format(fs, *device) == 0);
+    CHECK(fs->mount(fs, *device, false) == 0);
+    return fs;
+}
+
+// Write loader-sized chunks with a short tail through the actual FAT adapter.
+static void create_pattern_file(filesystem_t *fs, fs_file_t *file, const char *path,
+                                unsigned identity) {
+    CHECK(fs->file_open(fs, file, path, O_CREAT | O_TRUNC | O_RDWR) == 0);
+    uint8_t buffer[TEST_LOADER_BYTES];
+    for (size_t offset = 0; offset < TEST_FILE_BYTES; offset += sizeof(buffer)) {
+        size_t length = TEST_FILE_BYTES - offset;
+        if (length > sizeof(buffer)) length = sizeof(buffer);
+        for (size_t i = 0; i < length; ++i) buffer[i] = file_byte(identity, offset + i);
+        CHECK(fs->file_write(fs, file, buffer, length) == (ssize_t)length);
+    }
+}
+
+// Encode a genuine FAT read-only attribute without enabling nonproduction chmod support.
+static void make_read_only(filesystem_t *fs, blockdevice_t *device, const char *path) {
+    FIL file;
+    CHECK(f_open(&file, path, FA_READ | FA_WRITE) == FR_OK);
+    LBA_t sector = file.dir_sect;
+    size_t attribute = (size_t)(file.dir_ptr - file.obj.fs->win) + FAT_ATTRIBUTE_OFFSET;
+    CHECK(attribute < TEST_SECTOR_BYTES);
+    CHECK(f_close(&file) == FR_OK);
+    CHECK(fs->unmount(fs) == 0);
+    uint8_t bytes[TEST_SECTOR_BYTES];
+    CHECK(device->read(device, bytes, sector * TEST_SECTOR_BYTES, sizeof(bytes)) == 0);
+    bytes[attribute] |= AM_RDO;
+    CHECK(device->erase(device, sector * TEST_SECTOR_BYTES, sizeof(bytes)) == 0);
+    CHECK(device->program(device, bytes, sector * TEST_SECTOR_BYTES, sizeof(bytes)) == 0);
+    CHECK(fs->mount(fs, device, false) == 0);
+    FILINFO info;
+    CHECK(f_stat(path, &info) == FR_OK && (info.fattrib & AM_RDO));
+}
+
+// Verify owner pressure, cluster-crossing in-place updates, metadata, and clean remounts.
+static void test_production_file_patterns(void) {
+    blockdevice_t *device;
+    filesystem_t *fs = create_volume(&device);
+    fs_file_t files[TEST_OWNER_COUNT + 1] = {0};
+    char paths[TEST_OWNER_COUNT + 1][32];
+    for (unsigned i = 0; i < TEST_OWNER_COUNT + 1; ++i) {
+        snprintf(paths[i], sizeof(paths[i]), "/owner%u.bin", i);
+        create_pattern_file(fs, &files[i], paths[i], i);
+    }
+
+    FATFS *volume;
+    DWORD free_clusters;
+    CHECK(f_getfree("", &free_clusters, &volume) == FR_OK);
+    size_t cluster = volume->csize * TEST_SECTOR_BYTES;
+    CHECK(cluster >= TEST_SECTOR_BYTES && cluster * 2 < TEST_FILE_BYTES);
+    size_t offsets[] = {0, cluster - 137u, 2u * cluster - 3u,
+                        TEST_FILE_BYTES - TEST_IMAGE_SECTOR_BYTES};
+    uint8_t update[TEST_IMAGE_SECTOR_BYTES];
+    for (size_t i = 0; i < sizeof(update); ++i) update[i] = (uint8_t)(i ^ 0xa5u);
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+        CHECK(fs->file_seek(fs, &files[1], offsets[i], SEEK_SET) == (off_t)offsets[i]);
+        CHECK(fs->file_write(fs, &files[1], update, sizeof(update)) == (ssize_t)sizeof(update));
+        struct stat info = {0};
+        CHECK(fs->stat(fs, paths[1], &info) == 0 && info.st_size == TEST_FILE_BYTES);
+        CHECK(fs->file_size(fs, &files[1]) == TEST_FILE_BYTES);
+        CHECK(fs->file_tell(fs, &files[1]) == (off_t)(offsets[i] + sizeof(update)));
+    }
+    for (unsigned i = 0; i < TEST_OWNER_COUNT + 1; ++i) {
+        CHECK(fs->file_close(fs, &files[i]) == 0);
+        CHECK(files[i].context == NULL);
+    }
+    CHECK(fs->unmount(fs) == 0);
+    CHECK(fs->mount(fs, device, false) == 0);
+
+    // Compare all bytes, including every unaffected owner and boundary neighbor.
+    uint8_t actual[TEST_LOADER_BYTES];
+    for (unsigned i = 0; i < TEST_OWNER_COUNT + 1; ++i) {
+        CHECK(fs->file_open(fs, &files[i], paths[i], O_RDONLY) == 0);
+        for (size_t offset = 0; offset < TEST_FILE_BYTES; offset += sizeof(actual)) {
+            size_t length = TEST_FILE_BYTES - offset;
+            if (length > sizeof(actual)) length = sizeof(actual);
+            CHECK(fs->file_read(fs, &files[i], actual, length) == (ssize_t)length);
+            for (size_t byte = 0; byte < length; ++byte) {
+                size_t position = offset + byte;
+                uint8_t expected = file_byte(i, position);
+                if (i == 1) {
+                    for (size_t j = 0; j < sizeof(offsets) / sizeof(offsets[0]); ++j)
+                        if (position >= offsets[j] && position - offsets[j] < sizeof(update))
+                            expected = update[position - offsets[j]];
+                }
+                CHECK(actual[byte] == expected);
+            }
+        }
+        CHECK(fs->file_read(fs, &files[i], actual, 1) == 0);
+        CHECK(fs->file_close(fs, &files[i]) == 0);
+    }
+
+    // Parent/alias-style readers must keep independent positions.
+    CHECK(fs->file_open(fs, &files[0], paths[0], O_RDONLY) == 0);
+    CHECK(fs->file_open(fs, &files[1], paths[0], O_RDONLY) == 0);
+    CHECK(fs->file_seek(fs, &files[0], TEST_LOADER_BYTES - 1, SEEK_SET) == TEST_LOADER_BYTES - 1);
+    CHECK(fs->file_read(fs, &files[1], actual, 3) == 3);
+    CHECK(fs->file_tell(fs, &files[0]) == TEST_LOADER_BYTES - 1);
+    CHECK(fs->file_read(fs, &files[0], actual, 3) == 3);
+    for (size_t i = 0; i < 3; ++i) CHECK(actual[i] == file_byte(0, TEST_LOADER_BYTES - 1 + i));
+    CHECK(fs->file_tell(fs, &files[1]) == 3);
+    CHECK(fs->file_close(fs, &files[0]) == 0);
+    CHECK(fs->file_close(fs, &files[1]) == 0);
+
+    make_read_only(fs, device, paths[0]);
+    for (unsigned attempt = 0; attempt < TEST_OPEN_ATTEMPTS; ++attempt) {
+        fs_file_t failed = {0};
+        CHECK(fs->file_open(fs, &failed, "/missing.bin", O_RDONLY) == -ENOENT);
+        CHECK(failed.context == NULL);
+        CHECK(fs->file_open(fs, &failed, paths[0], O_RDWR) == -EACCES);
+        CHECK(failed.context == NULL);
+        CHECK(fs->file_open(fs, &failed, paths[0], O_RDONLY) == 0);
+        CHECK(fs->file_read(fs, &failed, actual, 3) == 3);
+        for (size_t i = 0; i < 3; ++i) CHECK(actual[i] == file_byte(0, i));
+        CHECK(fs->file_close(fs, &failed) == 0 && failed.context == NULL);
+    }
+    CHECK(fs->unmount(fs) == 0);
+    filesystem_fat_free(fs);
+    blockdevice_heap_free(device);
+}
+
 // Record byte ranges without accessing buffers, so huge logical devices and
 // transfers need no backing allocation. Counters detect I/O on rejected ranges.
 typedef struct {
@@ -1622,6 +1765,8 @@ void mutex_exit(mutex_t *mutex) {
 
 /** Run real-volume lifecycle regressions and storage-free sector-range tests. */
 int main(void) {
+    test_production_file_patterns();
+    printf("fat-production-file-patterns: passed\n");
     test_failed_open_cleanup();
     test_partial_write_errors();
     test_partial_extension_errors();

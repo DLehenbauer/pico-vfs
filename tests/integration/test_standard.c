@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
+#include <sys/stat.h>
 #include "blockdevice/flash.h"
 #include "filesystem/fat.h"
 #include "filesystem/littlefs.h"
@@ -14,6 +15,11 @@
 #define FLASH_LENGTH_ALL         0
 #define LITTLEFS_BLOCK_CYCLE     500
 #define LITTLEFS_LOOKAHEAD_SIZE  16
+#define PRODUCTION_OWNER_COUNT 8u
+#define PRODUCTION_CHUNK_BYTES 2048u
+#define PRODUCTION_FILE_BYTES (2u * PRODUCTION_CHUNK_BYTES + 3u)
+#define PRODUCTION_UPDATE_OFFSET 511u
+#define PRODUCTION_UPDATE_BYTES 256u
 
 static void test_printf(const char *format, ...) {
     va_list args;
@@ -977,6 +983,118 @@ void test_standard_file_api(void) {
     test_vfwscanf();
 }
 
+// Check new patterns without placing required I/O inside an elidable assertion.
+#define require_production_io(success)                                           \
+    do {                                                                        \
+        if (!(success)) {                                                       \
+            printf("%s:%d: %s (errno %d)\n", __FILE__, __LINE__, #success, errno); \
+            abort();                                                            \
+        }                                                                       \
+    } while (0)
+
+// Produce position- and owner-specific expectations independently of file reads.
+static uint8_t production_byte(unsigned owner, size_t offset) {
+    return (uint8_t)(owner * 37u ^ offset ^ (offset >> 8));
+}
+
+// Exercise actual newlib/VFS buffering, live metadata, owner overlap and error-state recovery.
+static void test_production_stdio_patterns(void) {
+    test_printf("production stream patterns");
+    uint8_t *buffer = malloc(PRODUCTION_CHUNK_BYTES);
+    require_production_io(buffer != NULL);
+    FILE *owners[PRODUCTION_OWNER_COUNT + 1] = {0};
+    char paths[PRODUCTION_OWNER_COUNT + 1][32];
+
+    // Create bounded fixtures, then reopen with the modes used by retained image owners.
+    for (unsigned owner = 0; owner < PRODUCTION_OWNER_COUNT + 1; ++owner) {
+        snprintf(paths[owner], sizeof(paths[owner]), "/production%u.bin", owner);
+        FILE *file = fopen(paths[owner], "wb");
+        require_production_io(file != NULL);
+        for (size_t offset = 0; offset < PRODUCTION_FILE_BYTES; offset += PRODUCTION_CHUNK_BYTES) {
+            size_t length = PRODUCTION_FILE_BYTES - offset;
+            if (length > PRODUCTION_CHUNK_BYTES) length = PRODUCTION_CHUNK_BYTES;
+            for (size_t i = 0; i < length; ++i) buffer[i] = production_byte(owner, offset + i);
+            require_production_io(fwrite(buffer, 1, length, file) == length);
+        }
+        require_production_io(fclose(file) == 0);
+    }
+    for (unsigned owner = 0; owner < PRODUCTION_OWNER_COUNT; ++owner) {
+        owners[owner] = fopen(paths[owner], "r+b");
+        require_production_io(owners[owner] != NULL);
+        require_production_io(setvbuf(owners[owner], NULL, _IONBF, 0) == 0);
+    }
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        errno = 0;
+        FILE *missing = fopen("/missing-production.bin", "r+b");
+        require_production_io(missing == NULL && errno == ENOENT);
+    }
+    owners[PRODUCTION_OWNER_COUNT] = fopen(paths[PRODUCTION_OWNER_COUNT], "r+b");
+    require_production_io(owners[PRODUCTION_OWNER_COUNT] != NULL);
+    require_production_io(setvbuf(owners[PRODUCTION_OWNER_COUNT], NULL, _IONBF, 0) == 0);
+
+    // In-place sector updates must publish bytes and unchanged sizes through real descriptors.
+    for (unsigned owner = 0; owner < PRODUCTION_OWNER_COUNT + 1; ++owner) {
+        FILE *file = owners[owner];
+        clearerr(file);
+        require_production_io(fseek(file, PRODUCTION_UPDATE_OFFSET, SEEK_SET) == 0);
+        require_production_io(fread(buffer, 1, PRODUCTION_UPDATE_BYTES, file) == PRODUCTION_UPDATE_BYTES);
+        for (size_t i = 0; i < PRODUCTION_UPDATE_BYTES; ++i)
+            require_production_io(buffer[i] == production_byte(owner, PRODUCTION_UPDATE_OFFSET + i));
+        memset(buffer, (int)(0xa0u + owner), PRODUCTION_UPDATE_BYTES);
+        require_production_io(fseek(file, PRODUCTION_UPDATE_OFFSET, SEEK_SET) == 0);
+        require_production_io(fwrite(buffer, 1, PRODUCTION_UPDATE_BYTES, file) == PRODUCTION_UPDATE_BYTES);
+        require_production_io(fflush(file) == 0);
+        struct stat descriptor = {0}, path = {0};
+        require_production_io(fstat(fileno(file), &descriptor) == 0);
+        require_production_io(stat(paths[owner], &path) == 0);
+        require_production_io(descriptor.st_size == PRODUCTION_FILE_BYTES &&
+                              path.st_size == PRODUCTION_FILE_BYTES);
+        require_production_io(fclose(file) == 0);
+        owners[owner] = NULL;
+    }
+
+    // Read all bytes after reopening, including untouched neighbors and the short tail.
+    for (unsigned owner = 0; owner < PRODUCTION_OWNER_COUNT + 1; ++owner) {
+        FILE *file = fopen(paths[owner], "rb");
+        require_production_io(file != NULL);
+        for (size_t offset = 0; offset < PRODUCTION_FILE_BYTES; offset += PRODUCTION_CHUNK_BYTES) {
+            size_t length = PRODUCTION_FILE_BYTES - offset;
+            if (length > PRODUCTION_CHUNK_BYTES) length = PRODUCTION_CHUNK_BYTES;
+            require_production_io(fread(buffer, 1, length, file) == length);
+            for (size_t i = 0; i < length; ++i) {
+                size_t position = offset + i;
+                uint8_t expected = production_byte(owner, position);
+                if (position >= PRODUCTION_UPDATE_OFFSET &&
+                    position - PRODUCTION_UPDATE_OFFSET < PRODUCTION_UPDATE_BYTES)
+                    expected = (uint8_t)(0xa0u + owner);
+                require_production_io(buffer[i] == expected);
+            }
+        }
+        require_production_io(fgetc(file) == EOF && feof(file) && !ferror(file));
+        clearerr(file);
+        require_production_io(!feof(file) && !ferror(file));
+        require_production_io(fseek(file, 0, SEEK_SET) == 0);
+        require_production_io(fread(buffer, 1, 1, file) == 1 && buffer[0] == production_byte(owner, 0));
+        require_production_io(fclose(file) == 0);
+    }
+
+    // Default-buffered config-style readers keep independent positions.
+    FILE *first = fopen(paths[0], "r");
+    FILE *second = fopen(paths[0], "r");
+    require_production_io(first != NULL && second != NULL);
+    require_production_io(fread(buffer, 1, 137, first) == 137);
+    require_production_io(fread(buffer, 1, PRODUCTION_CHUNK_BYTES, second) == PRODUCTION_CHUNK_BYTES);
+    require_production_io(ftell(first) == 137 && ftell(second) == PRODUCTION_CHUNK_BYTES);
+    require_production_io(fread(buffer, 1, 3, first) == 3);
+    for (size_t i = 0; i < 3; ++i)
+        require_production_io(buffer[i] == production_byte(0, 137 + i));
+    require_production_io(fclose(first) == 0 && fclose(second) == 0);
+    for (unsigned owner = 0; owner < PRODUCTION_OWNER_COUNT + 1; ++owner)
+        require_production_io(remove(paths[owner]) == 0);
+    free(buffer);
+    printf(COLOR_GREEN("ok\n"));
+}
+
 void test_standard(void) {
     printf("POSIX and C standard file API(littlefs):\n");
 
@@ -1000,6 +1118,7 @@ void test_standard(void) {
     setup(fat, flash);
 
     test_standard_file_api();
+    test_production_stdio_patterns();
 
     cleanup(fat, flash);
     filesystem_fat_free(fat);
