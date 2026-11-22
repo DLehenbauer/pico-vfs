@@ -1901,6 +1901,36 @@ static void test_repeated_read(void) {
     CHECK(memcmp(buffer, expected, sizeof(expected)) == 0);
 }
 
+// A production-sized loader request may partially fail without poisoning the next request.
+static void test_production_read_recovery(void) {
+    reset_card();
+    config.spi_inst = spi1;
+    config.cs = 9;
+    config.enable_crc = false;
+    config.hz = 24000000;
+    config.card_type = SDCARD_V2HC;
+    observing_ready_io = true;
+    expect_start(4, 16, 0);
+    expect_block(0x31);
+    expect_spi(0xFF, SPI_READ_ERROR_OFR, false, 1);
+    expect_stop(0, 0, 0, true);
+    uint8_t buffer[2048];
+    memset(buffer, 0xa5, sizeof(buffer));
+    finish(device.read(&device, buffer, 16u * 512u, sizeof(buffer)),
+           BD_ERROR_DEVICE_ERROR);
+    for (size_t i = 0; i < sizeof(buffer); ++i)
+        CHECK(buffer[i] == (i < 512 ? 0x31 : 0xa5));
+    CHECK(config.is_initialized && device.is_initialized);
+
+    // Do not reset the card or flags between the failed and successful operations.
+    expect_start(4, 24, 0);
+    for (unsigned i = 0; i < 4; ++i) expect_block((uint8_t)(0x40 + i));
+    expect_stop(0, 0, 0, true);
+    finish(device.read(&device, buffer, 24u * 512u, sizeof(buffer)), BD_ERROR_OK);
+    for (size_t i = 0; i < sizeof(buffer); ++i)
+        CHECK(buffer[i] == 0x40 + i / 512);
+}
+
 // Idle indicates initialization (SD v3.01, section 7.3.2.1, p.129).
 // Preserve initialization responses, reject operational idle, and distinguish
 // actual ACMD41 from bare CMD41. Specific erase/parameter errors remain specific.
@@ -3165,6 +3195,7 @@ int main(void) {
     RUN_CASE("read-crc-stop-busy", test_multiblock_data_failure(true, 0, true));
     RUN_CASE("crc-disabled", test_multiblock(false, false));
     RUN_CASE("repeated-read", test_repeated_read());
+    RUN_CASE("production-read-recovery", test_production_read_recovery());
     RUN_CASE("stop-crc", test_stop_status(0x08, SD_BLOCK_DEVICE_ERROR_CRC, 2));
     RUN_CASE("stop-parameter", test_stop_status(0x40, SD_BLOCK_DEVICE_ERROR_PARAMETER, 2));
     RUN_CASE("stop-erase", test_stop_status(0x10, SD_BLOCK_DEVICE_ERROR_ERASE, 2));
