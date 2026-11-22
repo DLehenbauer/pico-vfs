@@ -13,6 +13,7 @@ target_link_libraries(fat_disk_tests PRIVATE fat_test_filesystem)
 target_link_options(fat_disk_tests PRIVATE
   -Wl,--wrap=f_stat -Wl,--wrap=f_opendir -Wl,--wrap=f_closedir
   -Wl,--wrap=f_write -Wl,--wrap=f_sync
+  -Wl,--wrap=f_read -Wl,--wrap=f_lseek
 )
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(fat_disk_tests PRIVATE -Wall -Wextra -Werror)

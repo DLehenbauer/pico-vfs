@@ -44,6 +44,7 @@ static bool fail_at_address, program_failed;
 static bool fail_followup_metadata, metadata_failed;
 static FIL *boundary_file;
 static unsigned boundary_writes;
+static unsigned boundary_reads;
 
 /** Fail one selected physical write, forwarding every other write to heap storage. */
 static int failing_program(blockdevice_t *device, const void *buffer,
@@ -67,6 +68,8 @@ FRESULT __real_f_opendir(FATFS_DIR *dir, const TCHAR *path);
 FRESULT __real_f_closedir(FATFS_DIR *dir);
 FRESULT __real_f_write(FIL *file, const void *buffer, UINT size, UINT *written);
 FRESULT __real_f_sync(FIL *file);
+FRESULT __real_f_read(FIL *file, void *buffer, UINT size, UINT *read_bytes);
+FRESULT __real_f_lseek(FIL *file, FSIZE_t offset);
 
 /** Inject stat errors or expose synthetic large-file metadata for boundary tests. */
 FRESULT __wrap_f_stat(const TCHAR *path, FILINFO *info) {
@@ -94,6 +97,27 @@ FRESULT __wrap_f_write(FIL *file, const void *buffer, UINT size, UINT *written) 
 FRESULT __wrap_f_sync(FIL *file) {
     if (boundary_file == NULL) return __real_f_sync(file);
     CHECK(file == boundary_file);
+    return FR_OK;
+}
+
+/** Simulate reads from enormous files without allocating their backing data. */
+FRESULT __wrap_f_read(FIL *file, void *buffer, UINT size, UINT *read_bytes) {
+    if (boundary_file == NULL) return __real_f_read(file, buffer, size, read_bytes);
+    CHECK(file == boundary_file);
+    ++boundary_reads;
+    const FSIZE_t avail = file->fptr >= file->obj.objsize ? 0 : file->obj.objsize - file->fptr;
+    if ((FSIZE_t)size > avail) size = (UINT)avail;
+    memset(buffer, 'R', size);
+    *read_bytes = size;
+    file->fptr += size;
+    return FR_OK;
+}
+
+/** Position synthetic enormous files without traversing unallocated cluster chains. */
+FRESULT __wrap_f_lseek(FIL *file, FSIZE_t offset) {
+    if (boundary_file == NULL) return __real_f_lseek(file, offset);
+    CHECK(file == boundary_file && offset <= file->obj.objsize);
+    file->fptr = offset;
     return FR_OK;
 }
 
@@ -642,7 +666,7 @@ static void test_write_size_ceiling(void) {
                 ? format_limit : (FSIZE_t)TEST_OFF_MAX;
 
             // Simulate valid enormous files without allocating their storage.
-            // Only FatFs transfer/stat/sync are stubbed; real adapter positioning,
+            // Only FatFs storage operations are stubbed; real adapter positioning,
             // append policy, request clipping, and overflow checks remain active.
             boundary_file = physical;
             boundary_writes = 0;
@@ -672,6 +696,75 @@ static void test_write_size_ceiling(void) {
             boundary_file = NULL;
             CHECK(fs->file_close(fs, &file) == 0);
         }
+    }
+    destroy_heap_filesystem(fs, heap);
+}
+
+/** Verify oversized imported files preserve signed read cursors, EOF, and recovery. */
+static void test_read_offset_ceiling(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/import.bin", O_CREAT | O_RDWR) == 0);
+    CHECK(fs->file_close(fs, &file) == 0);
+    const BYTE types[] = {FS_FAT32, FS_EXFAT};
+    const FSIZE_t ceiling = (FSIZE_t)TEST_OFF_MAX;
+    for (size_t format = 0; format < sizeof(types) / sizeof(types[0]); ++format) {
+        const FSIZE_t format_limit = types[format] == FS_EXFAT ? (FSIZE_t)-1 : UINT32_MAX;
+        // FAT32 exceeds off_t only on narrower targets; exFAT can do so on wider hosts.
+        if (ceiling + 2 > format_limit) continue;
+        CHECK(fs->file_open(fs, &file, "/import.bin", O_RDONLY) == 0);
+        FIL *physical = file.context;
+        FIL saved_file = *physical;
+        const BYTE saved_type = physical->obj.fs->fs_type;
+        boundary_file = physical;
+        boundary_reads = 0;
+        physical->obj.fs->fs_type = types[format];
+        physical->obj.objsize = ceiling + 2;
+        physical->fptr = ceiling - 1;
+
+        // An imported file can have an unrepresentable size but still permit
+        // reads of its representable prefix. Clip the two-byte request to one.
+        CHECK(fs->file_size(fs, &file) == -EOVERFLOW);
+        CHECK(fs->file_seek(fs, &file, (off_t)(ceiling - 1), SEEK_SET) ==
+              (off_t)(ceiling - 1));
+        char buffer[2] = {0};
+        CHECK(fs->file_read(fs, &file, buffer, sizeof(buffer)) == 1);
+        CHECK(buffer[0] == 'R' && buffer[1] == 0);
+        CHECK(boundary_reads == 1);
+        CHECK(fs->file_tell(fs, &file) == (off_t)ceiling);
+        CHECK(fs->file_seek(fs, &file, 0, SEEK_CUR) == (off_t)ceiling);
+
+        // Data remains, but consuming it would overflow the cursor. Neither
+        // this error nor a zero-byte read may transfer data or move position.
+        CHECK(fs->file_read(fs, &file, buffer, 0) == 0);
+        CHECK(fs->file_read(fs, &file, buffer, 1) == -EOVERFLOW);
+        CHECK(boundary_reads == 1);
+        CHECK(fs->file_tell(fs, &file) == (off_t)ceiling);
+        CHECK(physical->fptr == ceiling);
+
+        // A relative seek and subsequent read prove overflow did not abort the handle.
+        CHECK(fs->file_seek(fs, &file, -1, SEEK_CUR) == (off_t)(ceiling - 1));
+        CHECK(fs->file_read(fs, &file, buffer, 1) == 1);
+        CHECK(boundary_reads == 2);
+        CHECK(fs->file_tell(fs, &file) == (off_t)ceiling);
+
+        // True EOF and an overhanging cursor must still return zero at the limit.
+        physical->obj.objsize = ceiling;
+        CHECK(fs->file_read(fs, &file, buffer, 1) == 0);
+        physical->obj.objsize = ceiling - 1;
+        CHECK(fs->file_read(fs, &file, buffer, 1) == 0);
+        CHECK(boundary_reads == 2);
+        CHECK(fs->file_tell(fs, &file) == (off_t)ceiling);
+        CHECK(fs->file_seek(fs, &file, 0, SEEK_SET) == 0);
+        CHECK(fs->file_read(fs, &file, buffer, 1) == 1);
+        CHECK(fs->file_tell(fs, &file) == 1);
+
+        // Restore the real empty file and volume before native close/unmount.
+        physical->obj.fs->fs_type = saved_type;
+        *physical = saved_file;
+        boundary_file = NULL;
+        CHECK(fs->file_close(fs, &file) == 0);
     }
     destroy_heap_filesystem(fs, heap);
 }
@@ -1066,6 +1159,7 @@ int main(void) {
     test_partial_write_errors();
     test_partial_extension_errors();
     test_write_size_ceiling();
+    test_read_offset_ceiling();
     test_write_cursor_after_sync_error();
     test_truncate_metadata_and_cursor();
     test_cursor_and_access_modes();

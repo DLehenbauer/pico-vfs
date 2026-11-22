@@ -749,7 +749,7 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
     return (ssize_t)total_written;
 }
 
-/** Read from the logical cursor, preserving beyond-EOF positions and partial reads. */
+/** Read from the logical cursor, preserving signed offset bounds, EOF, and partial reads. */
 static ssize_t file_read(filesystem_t *fs, fs_file_t *file, void *buffer, size_t size) {
     (void)fs;
     filesystem_fat_context_t *context = fs->context;
@@ -774,11 +774,22 @@ static ssize_t file_read(filesystem_t *fs, fs_file_t *file, void *buffer, size_t
         return 0;
     }
 
-    // Bound the request by both EOF and the signed byte-count return type.
+    // Imported files can exceed off_t even though local growth cannot. Refuse
+    // to consume data when advancing the cursor would make it unrepresentable.
+    if (fat_file->pos >= FAT_OFF_MAX) {
+        mutex_exit(&context->_mutex);
+        return -EOVERFLOW;
+    }
+
+    // Bound the request by EOF, the signed byte count, and cursor headroom.
     size_t to_read = size > FAT_SSIZE_MAX ? FAT_SSIZE_MAX : size;
     const FSIZE_t avail = cur_size - fat_file->pos;
     if ((FSIZE_t)to_read > avail) {
         to_read = (size_t)avail;
+    }
+    const FSIZE_t offset_avail = FAT_OFF_MAX - fat_file->pos;
+    if ((FSIZE_t)to_read > offset_avail) {
+        to_read = (size_t)offset_avail;
     }
     if (f_tell(&fat_file->file) != fat_file->pos) {
         res = f_lseek(&fat_file->file, fat_file->pos);
