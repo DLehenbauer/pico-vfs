@@ -488,13 +488,13 @@ static FRESULT fat_validate_file(const FIL *fp) {
     return (FRESULT)fp->err;
 }
 
-/** Return the format's file-size ceiling for a validated FatFs handle. */
+/** Return the file-size ceiling imposed by both the format and signed VFS offsets. */
 static FSIZE_t fat_max_file_size(const FIL *fp) {
-    // FAT12/16/32 store 32-bit sizes; exFAT uses the full FSIZE_t range.
-    if (fp->obj.fs != NULL && fp->obj.fs->fs_type != FS_EXFAT) {
-        return UINT32_MAX;
-    }
-    return (FSIZE_t)-1;
+    // FAT12/16/32 store 32-bit sizes. Even exFAT must leave size and cursor
+    // representable by the public off_t API after a successful extension.
+    const FSIZE_t format_limit =
+        fp->obj.fs != NULL && fp->obj.fs->fs_type != FS_EXFAT ? UINT32_MAX : (FSIZE_t)-1;
+    return format_limit < FAT_OFF_MAX ? format_limit : FAT_OFF_MAX;
 }
 
 /** Bound one FatFs transfer, whose UINT length may be narrower than size_t. */
@@ -654,7 +654,7 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
         return 0;
     }
 
-    // Append ignores a prior seek. Bound payload by the format's size ceiling
+    // Append ignores a prior seek. Bound payload by both file-size ceilings
     // and the signed byte-count return type.
     const FSIZE_t old_size = f_size(&fat_file->file);
     const FSIZE_t write_pos = fat_file->append ? old_size : fat_file->pos;
@@ -713,6 +713,12 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
             fat_file->pos = f_tell(&fat_file->file);
         }
         if (res != FR_OK) {
+            if (total_written > 0) {
+                // Publish the accepted prefix before returning a partial count.
+                // f_sync permits an aborted handle without clearing its error latch;
+                // failed synchronization remains pending for file_sync or close.
+                (void)f_sync(&fat_file->file);
+            }
             mutex_exit(&context->_mutex);
             debug_if(FFS_DBG, "f_write() failed: %d", res);
             return total_written > 0 ? (ssize_t)total_written : fat_error_remap(res);

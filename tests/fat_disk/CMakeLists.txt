@@ -12,6 +12,7 @@ add_executable(fat_disk_tests test_fat_disk.c ../../src/blockdevice/heap.c)
 target_link_libraries(fat_disk_tests PRIVATE fat_test_filesystem)
 target_link_options(fat_disk_tests PRIVATE
   -Wl,--wrap=f_stat -Wl,--wrap=f_opendir -Wl,--wrap=f_closedir
+  -Wl,--wrap=f_write -Wl,--wrap=f_sync
 )
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(fat_disk_tests PRIVATE -Wall -Wextra -Werror)

@@ -41,6 +41,9 @@ static int (*saved_program)(blockdevice_t *, const void *, bd_size_t, bd_size_t)
 static unsigned program_calls, fail_program_at;
 static bd_size_t fail_program_address;
 static bool fail_at_address, program_failed;
+static bool fail_followup_metadata, metadata_failed;
+static FIL *boundary_file;
+static unsigned boundary_writes;
 
 /** Fail one selected physical write, forwarding every other write to heap storage. */
 static int failing_program(blockdevice_t *device, const void *buffer,
@@ -51,16 +54,47 @@ static int failing_program(blockdevice_t *device, const void *buffer,
         program_failed = true;
         return BD_ERROR_DEVICE_ERROR;
     }
+    if (program_failed && fail_followup_metadata && !metadata_failed &&
+        address == fail_program_address) {
+        metadata_failed = true;
+        return BD_ERROR_DEVICE_ERROR;
+    }
     return saved_program(device, buffer, address, size);
 }
 
 FRESULT __real_f_stat(const TCHAR *path, FILINFO *info);
 FRESULT __real_f_opendir(FATFS_DIR *dir, const TCHAR *path);
 FRESULT __real_f_closedir(FATFS_DIR *dir);
+FRESULT __real_f_write(FIL *file, const void *buffer, UINT size, UINT *written);
+FRESULT __real_f_sync(FIL *file);
 
+/** Inject stat errors or expose synthetic large-file metadata for boundary tests. */
 FRESULT __wrap_f_stat(const TCHAR *path, FILINFO *info) {
     ++stat_probes;
+    if (boundary_file != NULL && info != NULL) {
+        memset(info, 0, sizeof(*info));
+        info->fsize = f_size(boundary_file);
+        return FR_OK;
+    }
     return stat_failure != FR_OK ? stat_failure : __real_f_stat(path, info);
+}
+
+/** Simulate enormous-file transfers only during storage-free adapter boundary tests. */
+FRESULT __wrap_f_write(FIL *file, const void *buffer, UINT size, UINT *written) {
+    if (boundary_file == NULL) return __real_f_write(file, buffer, size, written);
+    CHECK(file == boundary_file);
+    ++boundary_writes;
+    *written = size;
+    file->fptr += size;
+    if (file->fptr > file->obj.objsize) file->obj.objsize = file->fptr;
+    return FR_OK;
+}
+
+/** Bypass physical metadata I/O only for synthetic enormous files. */
+FRESULT __wrap_f_sync(FIL *file) {
+    if (boundary_file == NULL) return __real_f_sync(file);
+    CHECK(file == boundary_file);
+    return FR_OK;
 }
 
 FRESULT __wrap_f_opendir(FATFS_DIR *dir, const TCHAR *path) {
@@ -505,6 +539,143 @@ static void test_partial_write_errors(void) {
     destroy_heap_filesystem(fs, heap);
 }
 
+/** Verify completed extensions survive immediate stat, sync retries, close, and remount. */
+static void test_partial_extension_errors(void) {
+    const BYTE types[] = {FS_FAT12, FS_EXFAT};
+    for (size_t format = 0; format < sizeof(types) / sizeof(types[0]); ++format) {
+        for (unsigned sync_failure = 0; sync_failure < 2; ++sync_failure) {
+            blockdevice_t *heap = blockdevice_heap_create(
+                types[format] == FS_EXFAT ? 8u * 1024u * 1024u : 128u * 1024u);
+            filesystem_t *fs = filesystem_fat_create();
+            CHECK(heap != NULL && fs != NULL);
+            CHECK(fs->mount(fs, heap, true) == 0);
+            const MKFS_PARM options = {
+                .fmt = (types[format] == FS_EXFAT ? FM_EXFAT : FM_FAT) | FM_SFD,
+                .au_size = types[format] == FS_EXFAT ? 4096 : 512,
+            };
+            uint8_t work[FF_MAX_SS] = {0};
+            CHECK(f_mkfs("0:", &options, work, sizeof(work)) == FR_OK);
+            CHECK(fs->unmount(fs) == 0);
+            CHECK(fs->mount(fs, heap, false) == 0);
+            FATFS *volume = NULL;
+            DWORD count = 0;
+            CHECK(f_getfree("0:", &count, &volume) == FR_OK);
+            CHECK(volume->fs_type == types[format]);
+            const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
+            char *payload = malloc(3 * cluster_bytes);
+            char *actual = malloc(2 * cluster_bytes);
+            CHECK(payload != NULL && actual != NULL);
+            fs_file_t file = {0};
+            CHECK(fs->file_open(fs, &file, "/extend.bin", O_CREAT | O_RDWR) == 0);
+            memset(payload, 'S', cluster_bytes);
+            CHECK(fs->file_write(fs, &file, payload, cluster_bytes) == (ssize_t)cluster_bytes);
+            CHECK(fs->file_close(fs, &file) == 0);
+            CHECK(fs->file_open(fs, &file, "/extend.bin", O_RDWR) == 0);
+            CHECK(fs->file_seek(fs, &file, 0, SEEK_END) == (off_t)cluster_bytes);
+
+            // Reopening clears the previous modified flag. Fail the second
+            // extension transfer after the first complete cluster is accepted.
+            FATFS_DIR root = {0};
+            CHECK(f_opendir(&root, "0:/") == FR_OK);
+            fail_program_address = root.sect * volume->ssize;
+            CHECK(f_closedir(&root) == FR_OK);
+            saved_program = heap->program;
+            heap->program = failing_program;
+            program_calls = 0;
+            fail_program_at = 2;
+            fail_at_address = false;
+            program_failed = false;
+            fail_followup_metadata = sync_failure != 0;
+            metadata_failed = false;
+            memset(payload, 'A', 3 * cluster_bytes);
+            CHECK(fs->file_write(fs, &file, payload, 3 * cluster_bytes) ==
+                  (ssize_t)cluster_bytes);
+            CHECK(program_failed);
+            CHECK(metadata_failed == (sync_failure != 0));
+
+            // Partial success must preserve the abort latch. A metadata failure
+            // must also retain the modified flag so sync/close can really retry.
+            heap->program = saved_program;
+            fail_followup_metadata = false;
+            const FIL *physical = file.context;
+            CHECK(physical->err == FR_DISK_ERR);
+            CHECK(fs->file_write(fs, &file, "X", 1) == -EIO);
+            if (sync_failure) CHECK(fs->file_sync(fs, &file) == 0);
+            CHECK(physical->err == FR_DISK_ERR);
+            check_stat_size(fs, "/extend.bin", (off_t)(2 * cluster_bytes));
+            CHECK(fs->file_close(fs, &file) == 0);
+
+            // Discard every FatFs cache before checking that the acknowledged
+            // extension, and only its completed prefix, remains readable.
+            CHECK(fs->unmount(fs) == 0);
+            CHECK(fs->mount(fs, heap, false) == 0);
+            check_stat_size(fs, "/extend.bin", (off_t)(2 * cluster_bytes));
+            CHECK(fs->file_open(fs, &file, "/extend.bin", O_RDONLY) == 0);
+            CHECK(fs->file_read(fs, &file, actual, 2 * cluster_bytes) ==
+                  (ssize_t)(2 * cluster_bytes));
+            check_bytes(actual, 0, cluster_bytes, 'S');
+            check_bytes(actual, cluster_bytes, 2 * cluster_bytes, 'A');
+            CHECK(fs->file_read(fs, &file, actual, 1) == 0);
+            CHECK(fs->file_close(fs, &file) == 0);
+            free(actual);
+            free(payload);
+            destroy_heap_filesystem(fs, heap);
+        }
+    }
+}
+
+/** Verify signed-offset and format ceilings clip writes and reject further growth. */
+static void test_write_size_ceiling(void) {
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    const BYTE types[] = {FS_FAT32, FS_EXFAT};
+    const int modes[] = {O_RDWR, O_RDWR | O_APPEND};
+    for (size_t format = 0; format < sizeof(types) / sizeof(types[0]); ++format) {
+        for (size_t mode = 0; mode < sizeof(modes) / sizeof(modes[0]); ++mode) {
+            fs_file_t file = {0};
+            CHECK(fs->file_open(fs, &file, "/limit.bin", O_CREAT | O_TRUNC | modes[mode]) == 0);
+            FIL *physical = file.context;
+            FIL saved_file = *physical;
+            const BYTE saved_type = physical->obj.fs->fs_type;
+            const FSIZE_t format_limit = types[format] == FS_EXFAT ? (FSIZE_t)-1 : UINT32_MAX;
+            const FSIZE_t ceiling = format_limit < (FSIZE_t)TEST_OFF_MAX
+                ? format_limit : (FSIZE_t)TEST_OFF_MAX;
+
+            // Simulate valid enormous files without allocating their storage.
+            // Only FatFs transfer/stat/sync are stubbed; real adapter positioning,
+            // append policy, request clipping, and overflow checks remain active.
+            boundary_file = physical;
+            boundary_writes = 0;
+            physical->obj.fs->fs_type = types[format];
+            physical->obj.objsize = physical->fptr = ceiling - 1;
+            CHECK(fs->file_seek(fs, &file, mode ? 0 : (off_t)(ceiling - 1), SEEK_SET) ==
+                  (mode ? 0 : (off_t)(ceiling - 1)));
+            CHECK(fs->file_write(fs, &file, "XY", 2) == 1);
+            CHECK(boundary_writes == 1);
+            CHECK(fs->file_tell(fs, &file) == (off_t)ceiling);
+            CHECK(fs->file_size(fs, &file) == (off_t)ceiling);
+            check_stat_size(fs, "/limit.bin", (off_t)ceiling);
+
+            // At the ceiling, including append after seeking backward, refuse
+            // growth without transferring bytes or changing size/cursor.
+            if (mode) CHECK(fs->file_seek(fs, &file, 0, SEEK_SET) == 0);
+            CHECK(fs->file_write(fs, &file, "", 0) == 0);
+            CHECK(fs->file_write(fs, &file, "Z", 1) == -EFBIG);
+            CHECK(boundary_writes == 1);
+            CHECK(fs->file_tell(fs, &file) == (mode ? 0 : (off_t)ceiling));
+            CHECK(fs->file_size(fs, &file) == (off_t)ceiling);
+            check_stat_size(fs, "/limit.bin", (off_t)ceiling);
+
+            // Restore the real file and volume before native close/unmount.
+            physical->obj.fs->fs_type = saved_type;
+            *physical = saved_file;
+            boundary_file = NULL;
+            CHECK(fs->file_close(fs, &file) == 0);
+        }
+    }
+    destroy_heap_filesystem(fs, heap);
+}
+
 /** Verify a directory-sync failure does not let the next write overwrite prior data. */
 static void test_write_cursor_after_sync_error(void) {
     blockdevice_t *heap;
@@ -893,6 +1064,8 @@ void mutex_exit(mutex_t *mutex) {
 int main(void) {
     test_failed_open_cleanup();
     test_partial_write_errors();
+    test_partial_extension_errors();
+    test_write_size_ceiling();
     test_write_cursor_after_sync_error();
     test_truncate_metadata_and_cursor();
     test_cursor_and_access_modes();

@@ -8,7 +8,14 @@ logical cursor, append, metadata, and error-handling paths.
 
 Open regressions cover injected existence-probe failures, a full FAT12 root,
 and FAT32 mounted alongside a second volume. Linker wrappers inject probe errors
-without modifying vendored FatFs; a GNU-compatible linker with `--wrap` is required.
+without adding test hooks to FatFs; a GNU-compatible linker with `--wrap` is required.
+
+Partial-extension regressions use real FAT12 and exFAT volumes, inject transfer
+and subsequent metadata-write failures, and verify the accepted prefix after
+sync retries, close, and remount without clearing the file's error latch.
+Write-ceiling tests simulate enormous FAT32 and exFAT files through linker
+wrappers, exercising the production adapter's signed-offset limits and append
+policy without allocating gigabytes of backing storage.
 
 Scenario rationale and boundary calculations are documented beside the
 relevant expectations and assertions in [`test_fat_disk.c`](test_fat_disk.c).
