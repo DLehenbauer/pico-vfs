@@ -45,6 +45,8 @@ static ssize_t injected_write(filesystem_t *fs, fs_file_t *file, const void *buf
 int _open(const char *path, int flags, ...);
 int _close(int fd);
 int _unlink(const char *path);
+int _stat(const char *path, struct stat *st);
+int _fstat(int fd, struct stat *st);
 ssize_t _read(int fd, void *buffer, size_t size);
 ssize_t _write(int fd, const void *buffer, size_t size);
 off_t _lseek(int fd, off_t offset, int whence);
@@ -54,6 +56,8 @@ off_t _lseek(int fd, off_t offset, int whence);
 int __wrap_open(const char *path, int flags, ...) { return _open(path, flags); }
 int __wrap_close(int fd) { return _close(fd); }
 int __wrap_unlink(const char *path) { return _unlink(path); }
+int __wrap_stat(const char *path, struct stat *st) { return _stat(path, st); }
+int __wrap_fstat(int fd, struct stat *st) { return _fstat(fd, st); }
 ssize_t __wrap_read(int fd, void *buffer, size_t size) {
     return _read(fd, buffer, size);
 }
@@ -146,6 +150,70 @@ static void test_exclusive_create(const char *prefix) {
     CHECK(active_recursive_depth == 0);
 }
 
+/** Verify public ftruncate, stat, and open-handle fstat across shrink and growth. */
+static void test_truncate_and_fstat(const char *prefix, bool fat) {
+    static const char payload[] = "0123456789ABCDEF";
+    const size_t payload_len = sizeof(payload) - 1;
+    char path[64] = {0}, moved[64] = {0};
+    CHECK(snprintf(path, sizeof(path), "%s/trunc.bin", prefix) > 0);
+    CHECK(snprintf(moved, sizeof(moved), "%s/moved.bin", prefix) > 0);
+
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
+    CHECK(fd >= 3);
+    CHECK(write(fd, payload, payload_len) == (ssize_t)payload_len);
+
+    // Shrink while cursor remains overhanging at old EOF.
+    CHECK(ftruncate(fd, 9) == 0);
+    CHECK(lseek(fd, 0, SEEK_CUR) == (off_t)payload_len);
+    struct stat info = {0};
+    CHECK(fstat(fd, &info) == 0);
+    CHECK(info.st_size == 9);
+    if (fat) {
+        CHECK(stat(path, &info) == 0);
+        CHECK(info.st_size == 9);
+    }
+
+    char actual[32] = {0};
+    CHECK(read(fd, actual, sizeof(actual)) == 0);
+    CHECK(lseek(fd, 0, SEEK_CUR) == (off_t)payload_len);
+    CHECK(lseek(fd, 0, SEEK_SET) == 0);
+    CHECK(read(fd, actual, sizeof(actual)) == 9);
+    CHECK(memcmp(actual, "012345678", 9) == 0);
+
+    CHECK(ftruncate(fd, 24) == 0);
+    CHECK(lseek(fd, 0, SEEK_CUR) == 9);
+    CHECK(fstat(fd, &info) == 0);
+    CHECK(info.st_size == 24);
+    if (fat) {
+        CHECK(stat(path, &info) == 0);
+        CHECK(info.st_size == 24);
+    }
+    CHECK(close(fd) == 0);
+    CHECK(stat(path, &info) == 0);
+    CHECK(info.st_size == 24);
+
+    int ro = open(path, O_RDONLY);
+    CHECK(ro >= 3);
+    if (fat) {
+        errno = 0;
+        CHECK(ftruncate(ro, 4) == -1);
+        CHECK(errno == EINVAL);
+    }
+
+    // On filesystems that allow renaming open files (littlefs), _fstat still works
+    // because it queries fs->file_size on the open handle rather than a cached path.
+    const char *final_path = path;
+    if (!fat) {
+        CHECK(rename(path, moved) == 0);
+        final_path = moved;
+        CHECK(fstat(ro, &info) == 0);
+        CHECK(info.st_size == 24);
+    }
+    CHECK(close(ro) == 0);
+    CHECK(unlink(final_path) == 0);
+    CHECK(active_recursive_depth == 0);
+}
+
 /** Verify wide offsets and byte counts through public VFS entry points. */
 static void test_wide_results(filesystem_t *fs) {
     int fd = open("/wide.bin", O_CREAT | O_RDWR, 0644);
@@ -206,6 +274,7 @@ static void test_heap_backend(bool fat) {
     fs_file_t empty = {0};
     CHECK(fs->file_open(fs, &empty, "", O_CREAT | O_EXCL | O_RDWR) == -EINVAL);
     test_exclusive_create("");
+    test_truncate_and_fstat("", fat);
     CHECK(fs_unmount("/") == 0);
     errno = 0;
     CHECK(open("/unmounted", O_RDONLY) == -1);
@@ -229,6 +298,7 @@ static void test_loopback_backend(void) {
     CHECK(fs_mount("/disk", inner, loopback) == 0);
     max_recursive_depth = 0;
     test_exclusive_create("/disk");
+    test_truncate_and_fstat("/disk", true);
     CHECK(max_recursive_depth > 1);
     CHECK(fs_unmount("/disk") == 0);
     blockdevice_loopback_free(loopback);

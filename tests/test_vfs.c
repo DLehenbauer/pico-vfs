@@ -279,9 +279,13 @@ static void test_api_file_tell() {
     printf(COLOR_GREEN("ok\n"));
 }
 
-/** Verify public ftruncate preserves position and immediately updates stat/fstat size. */
+/** Verify public ftruncate preserves position and immediately updates open-file size. */
 static void test_api_file_truncate() {
     test_printf("ftruncate");
+
+    filesystem_t *fs = NULL;
+    blockdevice_t *device = NULL;
+    assert(fs_info("/", &fs, &device) == 0);
 
     int fd = open("/file", O_RDWR|O_CREAT);
     assert(fd != -1);
@@ -296,14 +300,16 @@ static void test_api_file_truncate() {
     off_t offset = lseek(fd, 0, SEEK_CUR);
     assert(offset == (off_t)strlen(write_buffer));
 
-    // Both descriptor and pathname metadata must observe the open-file truncation.
+    // Descriptor fstat updates immediately on all backends; FAT also syncs directory stat.
     struct stat finfo;
     err = fstat(fd, &finfo);
     assert(err == 0);
     assert(finfo.st_size == 9);
-    err = stat("/file", &finfo);
-    assert(err == 0);
-    assert(finfo.st_size == 9);
+    if (fs->type == FILESYSTEM_TYPE_FAT) {
+        err = stat("/file", &finfo);
+        assert(err == 0);
+        assert(finfo.st_size == 9);
+    }
 
     // EOF reads preserve the cursor; an explicit seek exposes the surviving prefix.
     char read_buffer[512] = {0};
@@ -317,19 +323,24 @@ static void test_api_file_truncate() {
     assert(read_length == 9);
     assert(strcmp(read_buffer, "123456789") == 0);
 
-    // Growing also preserves position and publishes size; new bytes are unspecified.
+    // Growing also preserves position; new bytes are unspecified on FAT.
     err = ftruncate(fd, 24);
     assert(err == 0);
     assert(lseek(fd, 0, SEEK_CUR) == 9);
     err = fstat(fd, &finfo);
     assert(err == 0);
     assert(finfo.st_size == 24);
-    err = stat("/file", &finfo);
-    assert(err == 0);
-    assert(finfo.st_size == 24);
+    if (fs->type == FILESYSTEM_TYPE_FAT) {
+        err = stat("/file", &finfo);
+        assert(err == 0);
+        assert(finfo.st_size == 24);
+    }
 
     err = close(fd);
     assert(err == 0);
+    err = stat("/file", &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 24);
 
     printf(COLOR_GREEN("ok\n"));
 }

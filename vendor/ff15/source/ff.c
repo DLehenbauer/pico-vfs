@@ -4011,7 +4011,29 @@ FRESULT f_read (
 /* Write File                                                            */
 /*-----------------------------------------------------------------------*/
 
-/** Write file data, retaining completed-transfer metadata even if a later transfer aborts. */
+/** Reclaim a cluster allocated for the current write step before data writeback failed. */
+static void rollback_new_cluster (
+	FIL* fp,
+	DWORD clst,
+	DWORD pclst
+)
+{
+	FATFS *fs = fp->obj.fs;
+	const FSIZE_t saved_size = fp->obj.objsize;
+
+#if FF_FS_EXFAT
+	if (fs->fs_type == FS_EXFAT) {
+		(void)fill_last_frag(&fp->obj, clst, 0xFFFFFFFF);
+	}
+#endif
+	fp->obj.objsize = fp->fptr + (FSIZE_t)fs->csize * SS(fs);
+	(void)remove_chain(&fp->obj, clst, pclst);
+	fp->obj.objsize = saved_size;
+	fp->clust = pclst;
+	if (pclst == 0) fp->obj.sclust = 0;
+}
+
+/** Write file data, committing only physically written bytes and rolling back failed growth. */
 FRESULT f_write (
 	FIL* fp,			/* Open file to be written */
 	const void* buff,	/* Data to be written */
@@ -4021,9 +4043,10 @@ FRESULT f_write (
 {
 	FRESULT res;
 	FATFS *fs;
-	DWORD clst;
+	DWORD clst, pclst;
 	LBA_t sect;
 	UINT wcnt, cc, csect;
+	BYTE new_clst;
 	const BYTE *wbuff = (const BYTE*)buff;
 
 
@@ -4037,18 +4060,29 @@ FRESULT f_write (
 		btw = (UINT)(0xFFFFFFFF - (DWORD)fp->fptr);
 	}
 
-	// Commit size, cursor, and modified state together before the next iteration can abort.
+	// Commit size, cursor, and modified state only after each sector reaches media.
 	for ( ; btw > 0;
 		btw -= wcnt, *bw += wcnt, wbuff += wcnt, fp->fptr += wcnt,
 		fp->obj.objsize = (fp->fptr > fp->obj.objsize) ? fp->fptr : fp->obj.objsize,
 		fp->flag |= FA_MODIFIED) {
+		new_clst = 0;
+		pclst = 0;
 		if (fp->fptr % SS(fs) == 0) {		/* On the sector boundary? */
+#if FF_FS_TINY
+			if (fs->winsect == fp->sect && sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);	/* Write-back sector cache */
+#else
+			if (fp->flag & FA_DIRTY) {		/* Write-back sector cache */
+				if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) ABORT(fs, FR_DISK_ERR);
+				fp->flag &= (BYTE)~FA_DIRTY;
+			}
+#endif
 			csect = (UINT)(fp->fptr / SS(fs)) & (fs->csize - 1);	/* Sector offset in the cluster */
 			if (csect == 0) {				/* On the cluster boundary? */
 				if (fp->fptr == 0) {		/* On the top of the file? */
 					clst = fp->obj.sclust;	/* Follow from the origin */
 					if (clst == 0) {		/* If no cluster is allocated, */
 						clst = create_chain(&fp->obj, 0);	/* create a new cluster chain */
+						new_clst = 1;
 					}
 				} else {					/* On the middle or end of the file */
 #if FF_USE_FASTSEEK
@@ -4057,6 +4091,8 @@ FRESULT f_write (
 					} else
 #endif
 					{
+						pclst = fp->clust;
+						if (fp->fptr >= fp->obj.objsize) new_clst = 1;
 						clst = create_chain(&fp->obj, fp->clust);	/* Follow or stretch cluster chain on the FAT */
 					}
 				}
@@ -4066,14 +4102,6 @@ FRESULT f_write (
 				fp->clust = clst;			/* Update current cluster */
 				if (fp->obj.sclust == 0) fp->obj.sclust = clst;	/* Set start cluster if the first write */
 			}
-#if FF_FS_TINY
-			if (fs->winsect == fp->sect && sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);	/* Write-back sector cache */
-#else
-			if (fp->flag & FA_DIRTY) {		/* Write-back sector cache */
-				if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) ABORT(fs, FR_DISK_ERR);
-				fp->flag &= (BYTE)~FA_DIRTY;
-			}
-#endif
 			sect = clst2sect(fs, fp->clust);	/* Get current sector */
 			if (sect == 0) ABORT(fs, FR_INT_ERR);
 			sect += csect;
@@ -4082,7 +4110,10 @@ FRESULT f_write (
 				if (csect + cc > fs->csize) {	/* Clip at cluster boundary */
 					cc = fs->csize - csect;
 				}
-				if (disk_write(fs->pdrv, wbuff, sect, cc) != RES_OK) ABORT(fs, FR_DISK_ERR);
+				if (disk_write(fs->pdrv, wbuff, sect, cc) != RES_OK) {
+					if (new_clst) rollback_new_cluster(fp, fp->clust, pclst);
+					ABORT(fs, FR_DISK_ERR);
+				}
 #if FF_FS_MINIMIZE <= 2
 #if FF_FS_TINY
 				if (fs->winsect - sect < cc) {	/* Refill sector cache if it gets invalidated by the direct write */
@@ -4101,7 +4132,10 @@ FRESULT f_write (
 			}
 #if FF_FS_TINY
 			if (fp->fptr >= fp->obj.objsize) {	/* Avoid silly cache filling on the growing edge */
-				if (sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);
+				if (sync_window(fs) != FR_OK) {
+					if (new_clst) rollback_new_cluster(fp, fp->clust, pclst);
+					ABORT(fs, FR_DISK_ERR);
+				}
 				fs->winsect = sect;
 			}
 #else
@@ -4116,12 +4150,23 @@ FRESULT f_write (
 		wcnt = SS(fs) - (UINT)fp->fptr % SS(fs);	/* Number of bytes remains in the sector */
 		if (wcnt > btw) wcnt = btw;					/* Clip it by btw if needed */
 #if FF_FS_TINY
-		if (move_window(fs, fp->sect) != FR_OK) ABORT(fs, FR_DISK_ERR);	/* Move sector window */
+		if (move_window(fs, fp->sect) != FR_OK) {	/* Move sector window */
+			if (new_clst) rollback_new_cluster(fp, fp->clust, pclst);
+			ABORT(fs, FR_DISK_ERR);
+		}
 		memcpy(fs->win + fp->fptr % SS(fs), wbuff, wcnt);	/* Fit data to the sector */
 		fs->wflag = 1;
+		if (sync_window(fs) != FR_OK) {
+			if (new_clst) rollback_new_cluster(fp, fp->clust, pclst);
+			ABORT(fs, FR_DISK_ERR);
+		}
 #else
 		memcpy(fp->buf + fp->fptr % SS(fs), wbuff, wcnt);	/* Fit data to the sector */
-		fp->flag |= FA_DIRTY;
+		if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) {
+			if (new_clst) rollback_new_cluster(fp, fp->clust, pclst);
+			ABORT(fs, FR_DISK_ERR);
+		}
+		fp->flag &= (BYTE)~FA_DIRTY;
 #endif
 	}
 

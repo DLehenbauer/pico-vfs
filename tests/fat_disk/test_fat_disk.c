@@ -38,29 +38,49 @@
 static FRESULT stat_failure, opendir_failure, closedir_failure;
 static unsigned stat_probes, opendir_probes, closedir_probes;
 static int (*saved_program)(blockdevice_t *, const void *, bd_size_t, bd_size_t);
+static int (*saved_read)(blockdevice_t *, const void *, bd_size_t, bd_size_t);
 static unsigned program_calls, fail_program_at;
 static bd_size_t fail_program_address;
-static bool fail_at_address, program_failed;
+static bool fail_at_address, fail_all_programs, program_failed;
 static bool fail_followup_metadata, metadata_failed;
+static unsigned read_calls, fail_read_at;
+static bool read_failed;
 static FIL *boundary_file;
 static unsigned boundary_writes;
 static unsigned boundary_reads;
 
-/** Fail one selected physical write, forwarding every other write to heap storage. */
+/** Fail selected physical writes, forwarding every other write to heap storage. */
 static int failing_program(blockdevice_t *device, const void *buffer,
                            bd_size_t address, bd_size_t size) {
     ++program_calls;
-    if (!program_failed && (fail_at_address ? address == fail_program_address
-                                            : program_calls == fail_program_at)) {
+    if (fail_all_programs) {
+        program_failed = true;
+        return BD_ERROR_DEVICE_ERROR;
+    }
+    if (!program_failed &&
+        (fail_at_address ? (address <= fail_program_address &&
+                            fail_program_address < address + size)
+                         : program_calls == fail_program_at)) {
         program_failed = true;
         return BD_ERROR_DEVICE_ERROR;
     }
     if (program_failed && fail_followup_metadata && !metadata_failed &&
-        address == fail_program_address) {
+        address <= fail_program_address && fail_program_address < address + size) {
         metadata_failed = true;
         return BD_ERROR_DEVICE_ERROR;
     }
     return saved_program(device, buffer, address, size);
+}
+
+/** Fail one selected physical read, forwarding every other read to heap storage. */
+static int failing_read(blockdevice_t *device, const void *buffer,
+                        bd_size_t address, bd_size_t size) {
+    ++read_calls;
+    if (!read_failed && read_calls == fail_read_at) {
+        read_failed = true;
+        return BD_ERROR_DEVICE_ERROR;
+    }
+    return saved_read(device, buffer, address, size);
 }
 
 FRESULT __real_f_stat(const TCHAR *path, FILINFO *info);
@@ -540,17 +560,24 @@ static void test_partial_write_errors(void) {
         program_calls = 0;
         fail_program_at = fail_at;
         fail_at_address = false;
+        fail_all_programs = false;
         program_failed = false;
         memset(payload, 'A', size);
         const ssize_t completed = fail_at == 1 ? 0 : (ssize_t)cluster_bytes;
         CHECK(fs->file_write(fs, &file, payload, size) == (completed ? completed : -EIO));
         CHECK(program_failed);
 
-        // A partial success must not clear FatFs's hard-error latch. Closing
-        // and reopening permits verification of the completed prefix and untouched
-        // suffix. The failed cluster was erased before program, so its bytes are unspecified.
+        // A partial success must keep the advanced logical cursor and size queryable,
+        // without clearing FatFs's hard-error latch for subsequent media I/O.
         heap->program = saved_program;
+        CHECK(fs->file_tell(fs, &file) == completed);
+        CHECK(fs->file_seek(fs, &file, 0, SEEK_CUR) == completed);
+        CHECK(fs->file_size(fs, &file) == (off_t)size);
+        CHECK(fs->file_seek(fs, &file, 0, SEEK_SET) == 0);
+        CHECK(fs->file_tell(fs, &file) == 0);
         CHECK(fs->file_write(fs, &file, "X", 1) == -EIO);
+        CHECK(fs->file_read(fs, &file, actual, 1) == -EIO);
+        CHECK(fs->file_truncate(fs, &file, 0) == -EIO);
         CHECK(fs->file_close(fs, &file) == 0);
         CHECK(fs->file_open(fs, &file, "/partial.bin", O_RDONLY) == 0);
         CHECK(fs->file_read(fs, &file, actual, size) == (ssize_t)size);
@@ -558,16 +585,181 @@ static void test_partial_write_errors(void) {
         check_bytes(actual, (size_t)completed + cluster_bytes, size, '.');
         CHECK(fs->file_close(fs, &file) == 0);
     }
+
+    // Unaligned multi-sector writes must never report buffered RAM bytes when
+    // zero physical writes succeed, and must commit only sectors that reached media.
+    const size_t unaligned_seed = (size_t)volume->ssize + 100;
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/unaligned.bin", O_CREAT | O_TRUNC | O_RDWR) == 0);
+        memset(payload, 'S', unaligned_seed);
+        CHECK(fs->file_write(fs, &file, payload, unaligned_seed) == (ssize_t)unaligned_seed);
+        CHECK(fs->file_close(fs, &file) == 0);
+        const DWORD baseline_free = free_clusters();
+
+        CHECK(fs->file_open(fs, &file, "/unaligned.bin", O_RDWR) == 0);
+        CHECK(fs->file_seek(fs, &file, 0, SEEK_END) == (off_t)unaligned_seed);
+        saved_program = heap->program;
+        heap->program = failing_program;
+        program_calls = 0;
+        fail_at_address = false;
+        fail_all_programs = mode == 0;
+        fail_program_at = 2;
+        program_failed = false;
+        memset(payload, 'P', 1000);
+        const ssize_t expected = mode == 0 ? -EIO : (ssize_t)(volume->ssize - 100);
+        const off_t expected_size =
+            mode == 0 ? (off_t)unaligned_seed : (off_t)(2 * volume->ssize);
+        CHECK(fs->file_write(fs, &file, payload, 1000) == expected);
+        CHECK(program_failed);
+        CHECK(fs->file_tell(fs, &file) == expected_size);
+        CHECK(fs->file_size(fs, &file) == expected_size);
+        heap->program = saved_program;
+        CHECK(fs->file_close(fs, &file) == 0);
+
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+        check_stat_size(fs, "/unaligned.bin", expected_size);
+        CHECK(free_clusters() == baseline_free);
+        CHECK(fs->file_open(fs, &file, "/unaligned.bin", O_RDONLY) == 0);
+        CHECK(fs->file_read(fs, &file, actual, (size_t)expected_size) == expected_size);
+        check_bytes(actual, 0, volume->ssize, 'S');
+        if (mode == 1) {
+            check_bytes(actual, volume->ssize, unaligned_seed, 'S');
+            check_bytes(actual, unaligned_seed, (size_t)expected_size, 'P');
+        }
+        CHECK(fs->file_close(fs, &file) == 0);
+        CHECK(fs->remove(fs, "/unaligned.bin") == 0);
+    }
+
     free(actual);
     free(payload);
     destroy_heap_filesystem(fs, heap);
 }
 
-/** Verify completed extensions survive immediate stat, sync retries, close, and remount. */
+/** Verify completed extensions survive immediate stat, sync retries, close, and remount without leaking clusters. */
 static void test_partial_extension_errors(void) {
     const BYTE types[] = {FS_FAT12, FS_EXFAT};
     for (size_t format = 0; format < sizeof(types) / sizeof(types[0]); ++format) {
-        for (unsigned sync_failure = 0; sync_failure < 2; ++sync_failure) {
+        const unsigned max_frag = types[format] == FS_EXFAT ? 2 : 1;
+        for (unsigned fragmented = 0; fragmented < max_frag; ++fragmented) {
+            for (unsigned sync_failure = 0; sync_failure < 2; ++sync_failure) {
+                blockdevice_t *heap = blockdevice_heap_create(
+                    types[format] == FS_EXFAT ? 8u * 1024u * 1024u : 128u * 1024u);
+                filesystem_t *fs = filesystem_fat_create();
+                CHECK(heap != NULL && fs != NULL);
+                CHECK(fs->mount(fs, heap, true) == 0);
+                const MKFS_PARM options = {
+                    .fmt = (types[format] == FS_EXFAT ? FM_EXFAT : FM_FAT) | FM_SFD,
+                    .au_size = types[format] == FS_EXFAT ? 4096 : 512,
+                };
+                uint8_t work[FF_MAX_SS] = {0};
+                CHECK(f_mkfs("0:", &options, work, sizeof(work)) == FR_OK);
+                CHECK(fs->unmount(fs) == 0);
+                CHECK(fs->mount(fs, heap, false) == 0);
+                FATFS *volume = NULL;
+                DWORD initial_free = 0;
+                CHECK(f_getfree("0:", &initial_free, &volume) == FR_OK);
+                CHECK(volume->fs_type == types[format]);
+                const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
+                char *payload = malloc(3 * cluster_bytes);
+                char *actual = malloc(2 * cluster_bytes);
+                CHECK(payload != NULL && actual != NULL);
+
+                fs_file_t file = {0};
+                if (fragmented) {
+                    // Reserve cluster #4 behind two free clusters (#2, #3), so
+                    // extending /extend.bin succeeds contiguously on #3 and then
+                    // fragments onto #5 on the failing cluster allocation.
+                    const char *const temps[] = {"/tmp0.bin", "/tmp1.bin", "/pin.bin"};
+                    memset(payload, 'P', cluster_bytes);
+                    for (size_t t = 0; t < 3; ++t) {
+                        CHECK(fs->file_open(fs, &file, temps[t], O_CREAT | O_RDWR) == 0);
+                        CHECK(fs->file_write(fs, &file, payload, cluster_bytes) ==
+                              (ssize_t)cluster_bytes);
+                        CHECK(fs->file_close(fs, &file) == 0);
+                    }
+                    CHECK(fs->remove(fs, "/tmp0.bin") == 0);
+                    CHECK(fs->remove(fs, "/tmp1.bin") == 0);
+                }
+
+                const DWORD baseline_free = free_clusters();
+                CHECK(fs->file_open(fs, &file, "/extend.bin", O_CREAT | O_RDWR) == 0);
+                memset(payload, 'S', cluster_bytes);
+                CHECK(fs->file_write(fs, &file, payload, cluster_bytes) ==
+                      (ssize_t)cluster_bytes);
+                CHECK(fs->file_close(fs, &file) == 0);
+                CHECK(fs->file_open(fs, &file, "/extend.bin", O_RDWR) == 0);
+                CHECK(fs->file_seek(fs, &file, 0, SEEK_END) == (off_t)cluster_bytes);
+
+                // Reopening clears the previous modified flag. Fail the second
+                // extension transfer after the first complete cluster is accepted.
+                FATFS_DIR root = {0};
+                CHECK(f_opendir(&root, "0:/") == FR_OK);
+                fail_program_address = root.sect * volume->ssize;
+                CHECK(f_closedir(&root) == FR_OK);
+                saved_program = heap->program;
+                heap->program = failing_program;
+                program_calls = 0;
+                fail_program_at = 2;
+                fail_at_address = false;
+                fail_all_programs = false;
+                program_failed = false;
+                fail_followup_metadata = sync_failure != 0;
+                metadata_failed = false;
+                memset(payload, 'A', 3 * cluster_bytes);
+                CHECK(fs->file_write(fs, &file, payload, 3 * cluster_bytes) ==
+                      (ssize_t)cluster_bytes);
+                CHECK(program_failed);
+                CHECK(metadata_failed == (sync_failure != 0));
+
+                // Partial success must preserve the abort latch while keeping
+                // cursor/size queryable. Failed metadata sync remains retryable.
+                heap->program = saved_program;
+                fail_followup_metadata = false;
+                const FIL *physical = file.context;
+                CHECK(physical->err == FR_DISK_ERR);
+                CHECK(fs->file_tell(fs, &file) == (off_t)(2 * cluster_bytes));
+                CHECK(fs->file_size(fs, &file) == (off_t)(2 * cluster_bytes));
+                CHECK(fs->file_write(fs, &file, "X", 1) == -EIO);
+                if (sync_failure) CHECK(fs->file_sync(fs, &file) == 0);
+                CHECK(physical->err == FR_DISK_ERR);
+                check_stat_size(fs, "/extend.bin", (off_t)(2 * cluster_bytes));
+                CHECK(fs->file_close(fs, &file) == 0);
+
+                // Remount to force fresh FAT/bitmap accounting and verify that
+                // the failed 3rd cluster was reclaimed rather than leaked.
+                CHECK(fs->unmount(fs) == 0);
+                CHECK(fs->mount(fs, heap, false) == 0);
+                check_stat_size(fs, "/extend.bin", (off_t)(2 * cluster_bytes));
+                CHECK(free_clusters() == baseline_free - 2);
+                CHECK(fs->file_open(fs, &file, "/extend.bin", O_RDONLY) == 0);
+                CHECK(fs->file_read(fs, &file, actual, 2 * cluster_bytes) ==
+                      (ssize_t)(2 * cluster_bytes));
+                check_bytes(actual, 0, cluster_bytes, 'S');
+                check_bytes(actual, cluster_bytes, 2 * cluster_bytes, 'A');
+                CHECK(fs->file_read(fs, &file, actual, 1) == 0);
+                CHECK(fs->file_close(fs, &file) == 0);
+
+                CHECK(fs->remove(fs, "/extend.bin") == 0);
+                if (fragmented) CHECK(fs->remove(fs, "/pin.bin") == 0);
+                CHECK(fs->unmount(fs) == 0);
+                CHECK(fs->mount(fs, heap, false) == 0);
+                CHECK(free_clusters() == initial_free);
+
+                free(actual);
+                free(payload);
+                destroy_heap_filesystem(fs, heap);
+            }
+        }
+    }
+}
+
+/** Verify failed overhanging writes, stale free-space rollbacks, partial reads, and truncate sync retries. */
+static void test_gap_rollback_and_io_recovery(void) {
+    const BYTE types[] = {FS_FAT12, FS_EXFAT};
+    for (size_t format = 0; format < sizeof(types) / sizeof(types[0]); ++format) {
+        for (size_t off_idx = 0; off_idx < 2; ++off_idx) {
             blockdevice_t *heap = blockdevice_heap_create(
                 types[format] == FS_EXFAT ? 8u * 1024u * 1024u : 128u * 1024u);
             filesystem_t *fs = filesystem_fat_create();
@@ -581,71 +773,154 @@ static void test_partial_extension_errors(void) {
             CHECK(f_mkfs("0:", &options, work, sizeof(work)) == FR_OK);
             CHECK(fs->unmount(fs) == 0);
             CHECK(fs->mount(fs, heap, false) == 0);
-            FATFS *volume = NULL;
-            DWORD count = 0;
-            CHECK(f_getfree("0:", &count, &volume) == FR_OK);
-            CHECK(volume->fs_type == types[format]);
-            const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
-            char *payload = malloc(3 * cluster_bytes);
-            char *actual = malloc(2 * cluster_bytes);
-            CHECK(payload != NULL && actual != NULL);
-            fs_file_t file = {0};
-            CHECK(fs->file_open(fs, &file, "/extend.bin", O_CREAT | O_RDWR) == 0);
-            memset(payload, 'S', cluster_bytes);
-            CHECK(fs->file_write(fs, &file, payload, cluster_bytes) == (ssize_t)cluster_bytes);
-            CHECK(fs->file_close(fs, &file) == 0);
-            CHECK(fs->file_open(fs, &file, "/extend.bin", O_RDWR) == 0);
-            CHECK(fs->file_seek(fs, &file, 0, SEEK_END) == (off_t)cluster_bytes);
 
-            // Reopening clears the previous modified flag. Fail the second
-            // extension transfer after the first complete cluster is accepted.
-            FATFS_DIR root = {0};
-            CHECK(f_opendir(&root, "0:/") == FR_OK);
-            fail_program_address = root.sect * volume->ssize;
-            CHECK(f_closedir(&root) == FR_OK);
+            FATFS *volume = NULL;
+            DWORD initial_free = 0;
+            CHECK(f_getfree("0:", &initial_free, &volume) == FR_OK);
+            const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
+            const off_t gap_pos = (off_t)(4 * cluster_bytes + (off_idx ? 2 : 0));
+
+            fs_file_t file = {0};
+            CHECK(fs->file_open(fs, &file, "/gap.bin", O_CREAT | O_RDWR) == 0);
+            char seed[100];
+            memset(seed, 'S', sizeof(seed));
+            CHECK(fs->file_write(fs, &file, seed, sizeof(seed)) == (ssize_t)sizeof(seed));
+            CHECK(fs->file_close(fs, &file) == 0);
+
+            // Fail the payload cluster write after f_lseek allocates the gap.
+            // Neither the gap size nor any gap/payload cluster may persist.
+            CHECK(fs->file_open(fs, &file, "/gap.bin", O_RDWR) == 0);
+            CHECK(fs->file_seek(fs, &file, gap_pos, SEEK_SET) == gap_pos);
+            const FIL *gap_physical = file.context;
+            fail_program_address =
+                (bd_size_t)(volume->database +
+                            (LBA_t)(gap_physical->obj.sclust - 2 + 4) * volume->csize) *
+                volume->ssize;
             saved_program = heap->program;
             heap->program = failing_program;
             program_calls = 0;
-            fail_program_at = 2;
-            fail_at_address = false;
+            fail_at_address = true;
+            fail_all_programs = false;
             program_failed = false;
-            fail_followup_metadata = sync_failure != 0;
-            metadata_failed = false;
-            memset(payload, 'A', 3 * cluster_bytes);
-            CHECK(fs->file_write(fs, &file, payload, 3 * cluster_bytes) ==
-                  (ssize_t)cluster_bytes);
-            CHECK(program_failed);
-            CHECK(metadata_failed == (sync_failure != 0));
-
-            // Partial success must preserve the abort latch. A metadata failure
-            // must also retain the modified flag so sync/close can really retry.
-            heap->program = saved_program;
             fail_followup_metadata = false;
-            const FIL *physical = file.context;
-            CHECK(physical->err == FR_DISK_ERR);
-            CHECK(fs->file_write(fs, &file, "X", 1) == -EIO);
-            if (sync_failure) CHECK(fs->file_sync(fs, &file) == 0);
-            CHECK(physical->err == FR_DISK_ERR);
-            check_stat_size(fs, "/extend.bin", (off_t)(2 * cluster_bytes));
-            CHECK(fs->file_close(fs, &file) == 0);
 
-            // Discard every FatFs cache before checking that the acknowledged
-            // extension, and only its completed prefix, remains readable.
+            char payload[512];
+            memset(payload, 'P', sizeof(payload));
+            CHECK(fs->file_write(fs, &file, payload, sizeof(payload)) == -EIO);
+            CHECK(program_failed);
+            CHECK(fs->file_tell(fs, &file) == gap_pos);
+            CHECK(fs->file_size(fs, &file) == (off_t)sizeof(seed));
+
+            heap->program = saved_program;
+            CHECK(fs->file_close(fs, &file) == 0);
             CHECK(fs->unmount(fs) == 0);
             CHECK(fs->mount(fs, heap, false) == 0);
-            check_stat_size(fs, "/extend.bin", (off_t)(2 * cluster_bytes));
-            CHECK(fs->file_open(fs, &file, "/extend.bin", O_RDONLY) == 0);
-            CHECK(fs->file_read(fs, &file, actual, 2 * cluster_bytes) ==
-                  (ssize_t)(2 * cluster_bytes));
-            check_bytes(actual, 0, cluster_bytes, 'S');
-            check_bytes(actual, cluster_bytes, 2 * cluster_bytes, 'A');
-            CHECK(fs->file_read(fs, &file, actual, 1) == 0);
-            CHECK(fs->file_close(fs, &file) == 0);
-            free(actual);
-            free(payload);
+            check_stat_size(fs, "/gap.bin", (off_t)sizeof(seed));
+            CHECK(free_clusters() == initial_free - 1);
+            CHECK(fs->remove(fs, "/gap.bin") == 0);
+            CHECK(fs->unmount(fs) == 0);
+            CHECK(fs->mount(fs, heap, false) == 0);
+            CHECK(free_clusters() == initial_free);
             destroy_heap_filesystem(fs, heap);
         }
     }
+
+    // Exercise stale free_clst rollback, partial file_read, and truncate sync retry.
+    blockdevice_t *heap;
+    filesystem_t *fs = create_heap_filesystem(&heap);
+    FATFS *volume = NULL;
+    DWORD free_before = 0;
+    CHECK(f_getfree("0:", &free_before, &volume) == FR_OK);
+    const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
+
+    // Fill all but one cluster, then inflate cached free_clst to simulate a
+    // stale FSInfo count so f_lseek partially grows and fat_rollback_size runs.
+    fs_file_t filler = {0}, file = {0};
+    CHECK(fs->file_open(fs, &file, "/stale.bin", O_CREAT | O_RDWR) == 0);
+    CHECK(fs->file_write(fs, &file, "seed", 4) == 4);
+    CHECK(fs->file_open(fs, &filler, "/filler.bin", O_CREAT | O_RDWR) == 0);
+    char *chunk = calloc(1, cluster_bytes);
+    CHECK(chunk != NULL);
+    while (free_clusters() > 1) {
+        CHECK(fs->file_write(fs, &filler, chunk, cluster_bytes) == (ssize_t)cluster_bytes);
+    }
+    CHECK(free_clusters() == 1);
+
+    volume->free_clst = 16;
+    CHECK(fs->file_truncate(fs, &file, (off_t)(4 * cluster_bytes)) == -ENOSPC);
+    CHECK(fs->file_size(fs, &file) == 4);
+    check_stat_size(fs, "/stale.bin", 4);
+    volume->free_clst = 0xFFFFFFFF;
+    CHECK(free_clusters() == 1);
+
+    volume->free_clst = 16;
+    CHECK(fs->file_seek(fs, &file, (off_t)(4 * cluster_bytes), SEEK_SET) ==
+          (off_t)(4 * cluster_bytes));
+    CHECK(fs->file_write(fs, &file, "X", 1) == -ENOSPC);
+    CHECK(fs->file_size(fs, &file) == 4);
+    check_stat_size(fs, "/stale.bin", 4);
+    volume->free_clst = 0xFFFFFFFF;
+    CHECK(free_clusters() == 1);
+
+    // Handle remains healthy and can still consume the one genuinely free cluster.
+    CHECK(fs->file_truncate(fs, &file, (off_t)(2 * cluster_bytes)) == 0);
+    CHECK(fs->file_size(fs, &file) == (off_t)(2 * cluster_bytes));
+    CHECK(fs->file_close(fs, &file) == 0);
+    CHECK(fs->file_close(fs, &filler) == 0);
+    CHECK(fs->remove(fs, "/filler.bin") == 0);
+    CHECK(fs->remove(fs, "/stale.bin") == 0);
+    free(chunk);
+
+    // Partial file_read must return the completed prefix, keep cursor queryable,
+    // and preserve FatFs's hard-error latch against subsequent reads.
+    const size_t read_total = 3 * cluster_bytes;
+    char *read_seed = malloc(read_total);
+    char *read_actual = calloc(1, read_total);
+    CHECK(read_seed != NULL && read_actual != NULL);
+    memset(read_seed, 'R', read_total);
+    CHECK(fs->file_open(fs, &file, "/pread.bin", O_CREAT | O_RDWR) == 0);
+    CHECK(fs->file_write(fs, &file, read_seed, read_total) == (ssize_t)read_total);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    CHECK(fs->file_open(fs, &file, "/pread.bin", O_RDONLY) == 0);
+    saved_read = heap->read;
+    heap->read = failing_read;
+    read_calls = 0;
+    fail_read_at = 2; // 1st FAT/data read succeeds for cluster 1; 2nd cluster read fails.
+    read_failed = false;
+    // Prime FAT window first by reading 0? No: cluster 1 read at fptr=0 uses sclust
+    // directly without reading FAT, so read_calls==1 is cluster 1 data, read_calls==2 is FAT/cluster 2!
+    CHECK(fs->file_read(fs, &file, read_actual, read_total) == (ssize_t)cluster_bytes);
+    CHECK(read_failed);
+    heap->read = saved_read;
+    check_bytes(read_actual, 0, cluster_bytes, 'R');
+    CHECK(fs->file_tell(fs, &file) == (off_t)cluster_bytes);
+    CHECK(fs->file_seek(fs, &file, 0, SEEK_CUR) == (off_t)cluster_bytes);
+    CHECK(fs->file_read(fs, &file, read_actual, 1) == -EIO);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    // Truncate metadata sync failure must remain retryable via file_sync.
+    CHECK(fs->file_open(fs, &file, "/pread.bin", O_RDWR) == 0);
+    const FIL *physical = file.context;
+    fail_program_address = physical->dir_sect * physical->obj.fs->ssize;
+    saved_program = heap->program;
+    heap->program = failing_program;
+    program_calls = 0;
+    fail_at_address = true;
+    fail_all_programs = false;
+    program_failed = false;
+    fail_followup_metadata = false;
+    CHECK(fs->file_truncate(fs, &file, 17) == -EIO);
+    CHECK(program_failed);
+    CHECK(fs->file_size(fs, &file) == 17);
+    heap->program = saved_program;
+    CHECK(fs->file_sync(fs, &file) == 0);
+    check_stat_size(fs, "/pread.bin", 17);
+    CHECK(fs->file_close(fs, &file) == 0);
+
+    free(read_actual);
+    free(read_seed);
+    destroy_heap_filesystem(fs, heap);
 }
 
 /** Verify signed-offset and format ceilings clip writes and reject further growth. */
@@ -1158,6 +1433,7 @@ int main(void) {
     test_failed_open_cleanup();
     test_partial_write_errors();
     test_partial_extension_errors();
+    test_gap_rollback_and_io_recovery();
     test_write_size_ceiling();
     test_read_offset_ceiling();
     test_write_cursor_after_sync_error();

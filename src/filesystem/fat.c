@@ -456,7 +456,7 @@ static int file_stat(filesystem_t *fs, const char *path, struct stat *st) {
     fat_path_prefix(fpath, context->id, path);
     FILINFO f = {0};
 
-    // VFS fstat also uses this directory lookup, not the open FIL's size.
+    // Path-based stat reads the directory entry on disk, not an open FIL's size.
     mutex_enter_blocking(&context->_mutex);
     FRESULT res = f_stat(fpath, &f);
     mutex_exit(&context->_mutex);
@@ -477,14 +477,22 @@ static int file_stat(filesystem_t *fs, const char *path, struct stat *st) {
     return 0;
 }
 
-/** Check mount identity and latched FatFs errors while the caller holds the mutex. */
-static FRESULT fat_validate_file(const FIL *fp) {
+/** Check mount identity for in-memory cursor and size queries while holding the mutex. */
+static FRESULT fat_validate_handle(const FIL *fp) {
     // A remount changes the volume ID, invalidating handles from the old mount.
     if (fp == NULL || fp->obj.fs == NULL || fp->obj.fs->fs_type == 0 ||
         fp->obj.fs->id != fp->obj.id) {
         return FR_INVALID_OBJECT;
     }
-    // Deferred cursor operations must not hide an earlier FatFs abort.
+    return FR_OK;
+}
+
+/** Check mount identity and latched FatFs I/O errors before media operations. */
+static FRESULT fat_validate_io(const FIL *fp) {
+    FRESULT res = fat_validate_handle(fp);
+    if (res != FR_OK) {
+        return res;
+    }
     return (FRESULT)fp->err;
 }
 
@@ -543,16 +551,25 @@ static int fat_ensure_capacity(const filesystem_fat_context_t *context,
 }
 
 /**
- * Best-effort cleanup after a capacity precheck still permits partial growth.
+ * Best-effort cleanup after an uncommitted gap or extension fails mid-way.
  * Write/truncate callers preserve their original error; hard-error latches remain.
  */
 static void fat_rollback_size(FIL *fp, FSIZE_t old_size) {
-    // Use only the visible size and normal FatFs APIs. Never invent an extra
-    // byte or clear fp->err to force cleanup of an unconfirmed allocation.
-    if (f_size(fp) > old_size &&
-        f_lseek(fp, old_size) == FR_OK &&
-        f_truncate(fp) == FR_OK) {
+    if (fp->fptr > fp->obj.objsize) {
+        fp->obj.objsize = fp->fptr;
+    }
+    if (f_size(fp) <= old_size) {
+        return;
+    }
+    // Temporarily clear a latched data-sector error so FatFs can release
+    // uncommitted clusters and sync the original size, then restore the latch.
+    const BYTE saved_err = fp->err;
+    fp->err = 0;
+    if (f_lseek(fp, old_size) == FR_OK && f_truncate(fp) == FR_OK) {
         (void)f_sync(fp);
+    }
+    if (saved_err != 0 && fp->err == 0) {
+        fp->err = saved_err;
     }
 }
 
@@ -640,7 +657,7 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
 
     // Hold one mutex across validation, allocation, transfer, and metadata sync.
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = fat_validate_file(&fat_file->file);
+    FRESULT res = fat_validate_io(&fat_file->file);
     if (res != FR_OK) {
         mutex_exit(&context->_mutex);
         return fat_error_remap(res);
@@ -681,6 +698,7 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
         // FatFs allocates the gap here; it does not initialize the gap's bytes.
         res = f_lseek(&fat_file->file, write_pos);
         if (res != FR_OK) {
+            fat_rollback_size(&fat_file->file, old_size);
             mutex_exit(&context->_mutex);
             debug_if(FFS_DBG, "f_write() failed: %d", res);
             return fat_error_remap(res);
@@ -718,6 +736,8 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
                 // f_sync permits an aborted handle without clearing its error latch;
                 // failed synchronization remains pending for file_sync or close.
                 (void)f_sync(&fat_file->file);
+            } else {
+                fat_rollback_size(&fat_file->file, old_size);
             }
             mutex_exit(&context->_mutex);
             debug_if(FFS_DBG, "f_write() failed: %d", res);
@@ -756,7 +776,7 @@ static ssize_t file_read(filesystem_t *fs, fs_file_t *file, void *buffer, size_t
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = fat_validate_file(&fat_file->file);
+    FRESULT res = fat_validate_io(&fat_file->file);
     if (res != FR_OK) {
         mutex_exit(&context->_mutex);
         return fat_error_remap(res);
@@ -844,7 +864,7 @@ static off_t file_seek(filesystem_t *fs, fs_file_t *file, off_t offset, int when
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = fat_validate_file(&fat_file->file);
+    FRESULT res = fat_validate_handle(&fat_file->file);
     if (res != FR_OK) {
         mutex_exit(&context->_mutex);
         return fat_error_remap(res);
@@ -899,7 +919,7 @@ static off_t file_tell(filesystem_t *fs, fs_file_t *file) {
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = fat_validate_file(&fat_file->file);
+    FRESULT res = fat_validate_handle(&fat_file->file);
     FSIZE_t value = fat_file->pos;
     mutex_exit(&context->_mutex);
 
@@ -916,7 +936,7 @@ static off_t file_size(filesystem_t *fs, fs_file_t *file) {
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = fat_validate_file(&fat_file->file);
+    FRESULT res = fat_validate_handle(&fat_file->file);
     FSIZE_t value = f_size(&fat_file->file);
     mutex_exit(&context->_mutex);
 
@@ -938,7 +958,7 @@ static int file_truncate(filesystem_t *fs, fs_file_t *file, off_t length) {
 
     // Reject invalid handles, access modes, and format limits before changing storage.
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = fat_validate_file(&fat_file->file);
+    FRESULT res = fat_validate_io(&fat_file->file);
     if (res != FR_OK) {
         mutex_exit(&context->_mutex);
         return fat_error_remap(res);
@@ -979,6 +999,7 @@ static int file_truncate(filesystem_t *fs, fs_file_t *file, off_t length) {
         }
         res = f_lseek(&fat_file->file, target_size);
         if (res != FR_OK) {
+            fat_rollback_size(&fat_file->file, old_size);
             mutex_exit(&context->_mutex);
             return fat_error_remap(res);
         }
@@ -990,8 +1011,8 @@ static int file_truncate(filesystem_t *fs, fs_file_t *file, off_t length) {
         }
     }
 
-    // Publish the size for path stat/VFS fstat. Do not restore FIL.fptr to the
-    // logical cursor: if it is beyond the new EOF, doing so would re-extend the file.
+    // Publish the size to the directory entry for path-based stat. Do not restore
+    // FIL.fptr to the logical cursor: beyond the new EOF, that would re-extend the file.
     res = f_sync(&fat_file->file);
     mutex_exit(&context->_mutex);
     return fat_error_remap(res);

@@ -25,6 +25,7 @@ target_link_libraries(vfs_tests PRIVATE vfs_test_filesystem)
 target_link_options(vfs_tests PRIVATE
   -Wl,--wrap=open -Wl,--wrap=read -Wl,--wrap=write
   -Wl,--wrap=close -Wl,--wrap=lseek -Wl,--wrap=unlink
+  -Wl,--wrap=stat -Wl,--wrap=fstat
 )
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(vfs_tests PRIVATE -Wall -Wextra -Werror)
