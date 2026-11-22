@@ -34,7 +34,10 @@ typedef struct {
     FIL file;
     /* Keep the public cursor independent of FatFs seeks, which can grow files. */
     FSIZE_t pos;
+    /* Last committed size when failed growth rollback awaits retry on sync/close. */
+    FSIZE_t rollback_size;
     bool append;
+    bool rollback_pending;
 } fat_file_t;
 
 typedef struct {
@@ -550,27 +553,60 @@ static int fat_ensure_capacity(const filesystem_fat_context_t *context,
     return 0;
 }
 
-/**
- * Best-effort cleanup after an uncommitted gap or extension fails mid-way.
- * Write/truncate callers preserve their original error; hard-error latches remain.
- */
-static void fat_rollback_size(FIL *fp, FSIZE_t old_size) {
+/** Return the committed logical size, hiding uncommitted growth awaiting rollback. */
+static FSIZE_t fat_visible_size(const fat_file_t *fat_file) {
+    return fat_file->rollback_pending
+        ? fat_file->rollback_size
+        : f_size(&fat_file->file);
+}
+
+/** Retry pending cluster/gap reclamation while preserving any latched I/O error. */
+static FRESULT fat_apply_rollback(fat_file_t *fat_file) {
+    FIL *fp = &fat_file->file;
+    const FSIZE_t target = fat_file->rollback_size;
     if (fp->fptr > fp->obj.objsize) {
         fp->obj.objsize = fp->fptr;
     }
-    if (f_size(fp) <= old_size) {
-        return;
-    }
-    // Temporarily clear a latched data-sector error so FatFs can release
+
+    // Temporarily clear a latched data-sector error so FatFs can reclaim
     // uncommitted clusters and sync the original size, then restore the latch.
     const BYTE saved_err = fp->err;
     fp->err = 0;
-    if (f_lseek(fp, old_size) == FR_OK && f_truncate(fp) == FR_OK) {
-        (void)f_sync(fp);
+    FRESULT res = FR_OK;
+    if (f_size(fp) > target) {
+        res = f_lseek(fp, target);
+        if (res == FR_OK) {
+            res = f_truncate(fp);
+        }
     }
-    if (saved_err != 0 && fp->err == 0) {
+    if (res == FR_OK) {
+        res = f_sync(fp);
+    }
+    if (saved_err != 0) {
         fp->err = saved_err;
     }
+    if (res == FR_OK) {
+        fat_file->rollback_pending = false;
+    }
+    return res;
+}
+
+/**
+ * Reclaim uncommitted gap or cluster growth, retaining retryable state if
+ * metadata writes also fail during cleanup.
+ */
+static void fat_rollback_size(fat_file_t *fat_file, FSIZE_t old_size) {
+    FIL *fp = &fat_file->file;
+    if (fp->fptr > fp->obj.objsize) {
+        fp->obj.objsize = fp->fptr;
+    }
+    if (f_size(fp) <= old_size && fp->reclaim_clst == 0 &&
+        !fp->reclaim_sync && !fat_file->rollback_pending) {
+        return;
+    }
+    fat_file->rollback_size = old_size;
+    fat_file->rollback_pending = true;
+    (void)fat_apply_rollback(fat_file);
 }
 
 /** Open a VFS file and initialize its independent cursor and append policy. */
@@ -641,7 +677,10 @@ static int file_close(filesystem_t *fs, fs_file_t *file) {
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = f_close(&fat_file->file);
+    FRESULT res = fat_file->rollback_pending ? fat_apply_rollback(fat_file) : FR_OK;
+    if (res == FR_OK) {
+        res = f_close(&fat_file->file);
+    }
     mutex_exit(&context->_mutex);
 
     free(file->context);
@@ -673,7 +712,7 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
 
     // Append ignores a prior seek. Bound payload by both file-size ceilings
     // and the signed byte-count return type.
-    const FSIZE_t old_size = f_size(&fat_file->file);
+    const FSIZE_t old_size = fat_visible_size(fat_file);
     const FSIZE_t write_pos = fat_file->append ? old_size : fat_file->pos;
     const FSIZE_t max_size = fat_max_file_size(&fat_file->file);
     if (write_pos >= max_size) {
@@ -698,14 +737,14 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
         // FatFs allocates the gap here; it does not initialize the gap's bytes.
         res = f_lseek(&fat_file->file, write_pos);
         if (res != FR_OK) {
-            fat_rollback_size(&fat_file->file, old_size);
+            fat_rollback_size(fat_file, old_size);
             mutex_exit(&context->_mutex);
             debug_if(FFS_DBG, "f_write() failed: %d", res);
             return fat_error_remap(res);
         }
         if (f_tell(&fat_file->file) != write_pos) {
             // FatFs can report success after clipping growth to available space.
-            fat_rollback_size(&fat_file->file, old_size);
+            fat_rollback_size(fat_file, old_size);
             mutex_exit(&context->_mutex);
             return -ENOSPC;
         }
@@ -737,7 +776,7 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
                 // failed synchronization remains pending for file_sync or close.
                 (void)f_sync(&fat_file->file);
             } else {
-                fat_rollback_size(&fat_file->file, old_size);
+                fat_rollback_size(fat_file, old_size);
             }
             mutex_exit(&context->_mutex);
             debug_if(FFS_DBG, "f_write() failed: %d", res);
@@ -746,7 +785,7 @@ static ssize_t file_write(filesystem_t *fs, fs_file_t *file, const void *buffer,
         if (n == 0) {
             if (total_written == 0) {
                 // Zero bytes with FR_OK means no space; undo any visible gap growth.
-                fat_rollback_size(&fat_file->file, old_size);
+                fat_rollback_size(fat_file, old_size);
                 mutex_exit(&context->_mutex);
                 return -ENOSPC;
             }
@@ -848,7 +887,9 @@ static int file_sync(filesystem_t *fs, fs_file_t *file) {
     fat_file_t *fat_file = file->context;
 
     mutex_enter_blocking(&context->_mutex);
-    FRESULT res = f_sync(&fat_file->file);
+    FRESULT res = fat_file->rollback_pending
+        ? fat_apply_rollback(fat_file)
+        : f_sync(&fat_file->file);
     mutex_exit(&context->_mutex);
 
     if (res != FR_OK) {
@@ -877,7 +918,7 @@ static off_t file_seek(filesystem_t *fs, fs_file_t *file, off_t offset, int when
     } else if (whence == SEEK_CUR) {
         base = fat_file->pos;
     } else if (whence == SEEK_END) {
-        base = f_size(&fat_file->file);
+        base = fat_visible_size(fat_file);
     } else {
         mutex_exit(&context->_mutex);
         return -EINVAL;
@@ -937,7 +978,7 @@ static off_t file_size(filesystem_t *fs, fs_file_t *file) {
 
     mutex_enter_blocking(&context->_mutex);
     FRESULT res = fat_validate_handle(&fat_file->file);
-    FSIZE_t value = f_size(&fat_file->file);
+    FSIZE_t value = fat_visible_size(fat_file);
     mutex_exit(&context->_mutex);
 
     if (res != FR_OK) {
@@ -974,7 +1015,7 @@ static int file_truncate(filesystem_t *fs, fs_file_t *file, off_t length) {
         return -EFBIG;
     }
 
-    const FSIZE_t old_size = f_size(&fat_file->file);
+    const FSIZE_t old_size = fat_visible_size(fat_file);
     if (target_size < old_size) {
         // FatFs truncates at its physical cursor, so position it at the new EOF.
         if (f_tell(&fat_file->file) != target_size) {
@@ -999,13 +1040,13 @@ static int file_truncate(filesystem_t *fs, fs_file_t *file, off_t length) {
         }
         res = f_lseek(&fat_file->file, target_size);
         if (res != FR_OK) {
-            fat_rollback_size(&fat_file->file, old_size);
+            fat_rollback_size(fat_file, old_size);
             mutex_exit(&context->_mutex);
             return fat_error_remap(res);
         }
         if (f_tell(&fat_file->file) != target_size) {
             // A stale free-space count can allow a short, nominally successful seek.
-            fat_rollback_size(&fat_file->file, old_size);
+            fat_rollback_size(fat_file, old_size);
             mutex_exit(&context->_mutex);
             return -ENOSPC;
         }

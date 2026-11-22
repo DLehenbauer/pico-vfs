@@ -11,10 +11,10 @@ and FAT32 mounted alongside a second volume. Linker wrappers inject probe errors
 without adding test hooks to FatFs; a GNU-compatible linker with `--wrap` is required.
 
 Partial-write, partial-extension, and gap-rollback regressions use real FAT12
-and exFAT volumes (contiguous and fragmented), inject data and metadata write
-failures, and verify committed prefixes, cluster reclamation, stale free-space
-rollbacks, and queryable cursors after sync retries, close, and remount without
-clearing the file's error latch.
+and exFAT volumes (contiguous and fragmented), inject simultaneous data and
+rollback/metadata write failures, and verify committed prefixes, retained
+cluster reclamation, stale free-space rollbacks, and queryable cursors after
+sync retries, close, and remount without clearing the file's error latch.
 Read/write boundary tests simulate enormous FAT32 and exFAT files through linker
 wrappers, exercising the production adapter's signed-offset limits, EOF behavior,
 and append policy without allocating gigabytes of backing storage. Imported

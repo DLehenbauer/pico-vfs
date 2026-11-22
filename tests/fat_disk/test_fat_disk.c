@@ -39,7 +39,7 @@ static FRESULT stat_failure, opendir_failure, closedir_failure;
 static unsigned stat_probes, opendir_probes, closedir_probes;
 static int (*saved_program)(blockdevice_t *, const void *, bd_size_t, bd_size_t);
 static int (*saved_read)(blockdevice_t *, const void *, bd_size_t, bd_size_t);
-static unsigned program_calls, fail_program_at;
+static unsigned program_calls, fail_program_at, fail_from_program_call;
 static bd_size_t fail_program_address;
 static bool fail_at_address, fail_all_programs, program_failed;
 static bool fail_followup_metadata, metadata_failed;
@@ -53,7 +53,8 @@ static unsigned boundary_reads;
 static int failing_program(blockdevice_t *device, const void *buffer,
                            bd_size_t address, bd_size_t size) {
     ++program_calls;
-    if (fail_all_programs) {
+    if (fail_all_programs ||
+        (fail_from_program_call != 0 && program_calls >= fail_from_program_call)) {
         program_failed = true;
         return BD_ERROR_DEVICE_ERROR;
     }
@@ -667,33 +668,33 @@ static void test_partial_extension_errors(void) {
                 CHECK(payload != NULL && actual != NULL);
 
                 fs_file_t file = {0};
+                CHECK(fs->file_open(fs, &file, "/extend.bin", O_CREAT | O_RDWR) == 0);
+                memset(payload, 'S', cluster_bytes);
+                CHECK(fs->file_write(fs, &file, payload, cluster_bytes) ==
+                      (ssize_t)cluster_bytes);
+                CHECK(fs->file_close(fs, &file) == 0);
+
                 if (fragmented) {
-                    // Reserve cluster #4 behind two free clusters (#2, #3), so
-                    // extending /extend.bin succeeds contiguously on #3 and then
-                    // fragments onto #5 on the failing cluster allocation.
-                    const char *const temps[] = {"/tmp0.bin", "/tmp1.bin", "/pin.bin"};
+                    // Leave one free cluster directly after /extend.bin, then pin
+                    // the next so cluster 2 stays contiguous and cluster 3 fragments.
+                    const char *const temps[] = {"/tmp0.bin", "/pin.bin"};
                     memset(payload, 'P', cluster_bytes);
-                    for (size_t t = 0; t < 3; ++t) {
+                    for (size_t t = 0; t < 2; ++t) {
                         CHECK(fs->file_open(fs, &file, temps[t], O_CREAT | O_RDWR) == 0);
                         CHECK(fs->file_write(fs, &file, payload, cluster_bytes) ==
                               (ssize_t)cluster_bytes);
                         CHECK(fs->file_close(fs, &file) == 0);
                     }
                     CHECK(fs->remove(fs, "/tmp0.bin") == 0);
-                    CHECK(fs->remove(fs, "/tmp1.bin") == 0);
                 }
 
-                const DWORD baseline_free = free_clusters();
-                CHECK(fs->file_open(fs, &file, "/extend.bin", O_CREAT | O_RDWR) == 0);
-                memset(payload, 'S', cluster_bytes);
-                CHECK(fs->file_write(fs, &file, payload, cluster_bytes) ==
-                      (ssize_t)cluster_bytes);
-                CHECK(fs->file_close(fs, &file) == 0);
+                const DWORD baseline_free = free_clusters() + 1;
                 CHECK(fs->file_open(fs, &file, "/extend.bin", O_RDWR) == 0);
                 CHECK(fs->file_seek(fs, &file, 0, SEEK_END) == (off_t)cluster_bytes);
 
                 // Reopening clears the previous modified flag. Fail the second
-                // extension transfer after the first complete cluster is accepted.
+                // extension transfer after the first complete cluster is accepted
+                // (fragmenting on exFAT flushes the bitmap sector before that write).
                 FATFS_DIR root = {0};
                 CHECK(f_opendir(&root, "0:/") == FR_OK);
                 fail_program_address = root.sect * volume->ssize;
@@ -701,7 +702,8 @@ static void test_partial_extension_errors(void) {
                 saved_program = heap->program;
                 heap->program = failing_program;
                 program_calls = 0;
-                fail_program_at = 2;
+                fail_program_at = fragmented ? 3 : 2;
+                fail_from_program_call = 0;
                 fail_at_address = false;
                 fail_all_programs = false;
                 program_failed = false;
@@ -921,6 +923,196 @@ static void test_gap_rollback_and_io_recovery(void) {
     free(read_actual);
     free(read_seed);
     destroy_heap_filesystem(fs, heap);
+}
+
+/** Verify simultaneous payload and rollback metadata write failures retain retryable cleanup state. */
+static void test_simultaneous_rollback_failures(void) {
+    // 1. Fragmented exFAT partial-extension double faults:
+    //    variant 0 transitions contiguous -> fragmented on the failing cluster (restores stat=2);
+    //    variant 1 is already fragmented before the failing cluster (restores FAT[pclst]=EOC).
+    for (unsigned variant = 0; variant < 2; ++variant) {
+        blockdevice_t *heap = blockdevice_heap_create(8u * 1024u * 1024u);
+        filesystem_t *fs = filesystem_fat_create();
+        CHECK(heap != NULL && fs != NULL);
+        CHECK(fs->mount(fs, heap, true) == 0);
+        const MKFS_PARM options = {.fmt = FM_EXFAT | FM_SFD, .au_size = 4096};
+        uint8_t work[FF_MAX_SS] = {0};
+        CHECK(f_mkfs("0:", &options, work, sizeof(work)) == FR_OK);
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+
+        FATFS *volume = NULL;
+        DWORD initial_free = 0;
+        CHECK(f_getfree("0:", &initial_free, &volume) == FR_OK);
+        CHECK(volume->fs_type == FS_EXFAT);
+        const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
+        char *payload = malloc(3 * cluster_bytes);
+        char *actual = malloc(2 * cluster_bytes);
+        CHECK(payload != NULL && actual != NULL);
+
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/double.bin", O_CREAT | O_RDWR) == 0);
+        memset(payload, 'S', cluster_bytes);
+        CHECK(fs->file_write(fs, &file, payload, cluster_bytes) == (ssize_t)cluster_bytes);
+        CHECK(fs->file_close(fs, &file) == 0);
+
+        memset(payload, 'P', cluster_bytes);
+        if (variant == 0) {
+            // Leave one free cluster directly after /double.bin, then pin the next,
+            // so cluster 2 allocates contiguously and cluster 3 fragments.
+            const char *const setup_files[] = {"/tmp0.bin", "/pin0.bin"};
+            for (size_t i = 0; i < 2; ++i) {
+                CHECK(fs->file_open(fs, &file, setup_files[i], O_CREAT | O_RDWR) == 0);
+                CHECK(fs->file_write(fs, &file, payload, cluster_bytes) ==
+                      (ssize_t)cluster_bytes);
+                CHECK(fs->file_close(fs, &file) == 0);
+            }
+            CHECK(fs->remove(fs, "/tmp0.bin") == 0);
+        } else {
+            // Pin immediately after /double.bin and again after one free slot,
+            // so both cluster 2 and the failing cluster 3 fragment.
+            const char *const setup_files[] = {"/pin0.bin", "/tmp0.bin", "/pin1.bin"};
+            for (size_t i = 0; i < 3; ++i) {
+                CHECK(fs->file_open(fs, &file, setup_files[i], O_CREAT | O_RDWR) == 0);
+                CHECK(fs->file_write(fs, &file, payload, cluster_bytes) ==
+                      (ssize_t)cluster_bytes);
+                CHECK(fs->file_close(fs, &file) == 0);
+            }
+            CHECK(fs->remove(fs, "/tmp0.bin") == 0);
+        }
+
+        const DWORD baseline_free = free_clusters() + 1;
+        CHECK(fs->file_open(fs, &file, "/double.bin", O_RDWR) == 0);
+        CHECK(fs->file_seek(fs, &file, 0, SEEK_END) == (off_t)cluster_bytes);
+
+        // Variant 0: call 1 writes cluster 2, call 2 flushes bitmap (cluster 3 set),
+        // call 3+ fails payload AND rollback metadata writes simultaneously.
+        // Variant 1: call 1 flushes bitmap, call 2 writes cluster 2, call 3 flushes
+        // FAT, call 4 flushes bitmap (cluster 3 set), call 5+ fails payload + rollback.
+        saved_program = heap->program;
+        heap->program = failing_program;
+        program_calls = 0;
+        fail_program_at = 0;
+        fail_from_program_call = variant == 0 ? 3 : 5;
+        fail_at_address = false;
+        fail_all_programs = false;
+        fail_followup_metadata = false;
+        program_failed = false;
+
+        memset(payload, 'A', 3 * cluster_bytes);
+        CHECK(fs->file_write(fs, &file, payload, 3 * cluster_bytes) ==
+              (ssize_t)cluster_bytes);
+        CHECK(program_failed);
+        const FIL *physical = file.context;
+        CHECK(physical->err == FR_DISK_ERR);
+        CHECK(physical->reclaim_clst != 0);
+        CHECK(fs->file_size(fs, &file) == (off_t)(2 * cluster_bytes));
+
+        // A retry while media writes are still failing must report -EIO and retain state.
+        CHECK(fs->file_sync(fs, &file) == -EIO);
+        CHECK(physical->reclaim_clst != 0 || physical->reclaim_sync != 0);
+
+        // Once media writes recover, test retry via file_sync (variant 0) and directly
+        // via file_close (variant 1).
+        heap->program = saved_program;
+        fail_from_program_call = 0;
+        if (variant == 0) {
+            CHECK(fs->file_sync(fs, &file) == 0);
+            CHECK(physical->reclaim_clst == 0 && physical->reclaim_sync == 0);
+            check_stat_size(fs, "/double.bin", (off_t)(2 * cluster_bytes));
+        }
+        CHECK(fs->file_close(fs, &file) == 0);
+
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+        check_stat_size(fs, "/double.bin", (off_t)(2 * cluster_bytes));
+        CHECK(free_clusters() == baseline_free - 2);
+        CHECK(fs->file_open(fs, &file, "/double.bin", O_RDONLY) == 0);
+        CHECK(fs->file_read(fs, &file, actual, 2 * cluster_bytes) ==
+              (ssize_t)(2 * cluster_bytes));
+        check_bytes(actual, 0, cluster_bytes, 'S');
+        check_bytes(actual, cluster_bytes, 2 * cluster_bytes, 'A');
+        CHECK(fs->file_close(fs, &file) == 0);
+
+        CHECK(fs->remove(fs, "/double.bin") == 0);
+        CHECK(fs->remove(fs, "/pin0.bin") == 0);
+        if (variant == 1) CHECK(fs->remove(fs, "/pin1.bin") == 0);
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+        CHECK(free_clusters() == initial_free);
+
+        free(actual);
+        free(payload);
+        destroy_heap_filesystem(fs, heap);
+    }
+
+    // 2. Zero-progress overhanging gap-write double fault across FAT12 and exFAT:
+    //    fail both the payload cluster write and fat_rollback_size's metadata writes.
+    const BYTE types[] = {FS_FAT12, FS_EXFAT};
+    for (size_t format = 0; format < sizeof(types) / sizeof(types[0]); ++format) {
+        blockdevice_t *heap = blockdevice_heap_create(
+            types[format] == FS_EXFAT ? 8u * 1024u * 1024u : 128u * 1024u);
+        filesystem_t *fs = filesystem_fat_create();
+        CHECK(heap != NULL && fs != NULL);
+        CHECK(fs->mount(fs, heap, true) == 0);
+        const MKFS_PARM options = {
+            .fmt = (types[format] == FS_EXFAT ? FM_EXFAT : FM_FAT) | FM_SFD,
+            .au_size = types[format] == FS_EXFAT ? 4096 : 512,
+        };
+        uint8_t work[FF_MAX_SS] = {0};
+        CHECK(f_mkfs("0:", &options, work, sizeof(work)) == FR_OK);
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+
+        FATFS *volume = NULL;
+        DWORD initial_free = 0;
+        CHECK(f_getfree("0:", &initial_free, &volume) == FR_OK);
+        const size_t cluster_bytes = (size_t)volume->csize * volume->ssize;
+
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/gapdbl.bin", O_CREAT | O_RDWR) == 0);
+        char seed[100];
+        memset(seed, 'S', sizeof(seed));
+        CHECK(fs->file_write(fs, &file, seed, sizeof(seed)) == (ssize_t)sizeof(seed));
+        CHECK(fs->file_close(fs, &file) == 0);
+
+        CHECK(fs->file_open(fs, &file, "/gapdbl.bin", O_RDWR) == 0);
+        const off_t gap_pos = (off_t)(4 * cluster_bytes);
+        CHECK(fs->file_seek(fs, &file, gap_pos, SEEK_SET) == gap_pos);
+
+        saved_program = heap->program;
+        heap->program = failing_program;
+        program_calls = 0;
+        fail_program_at = 0;
+        fail_from_program_call = 1; // Fail payload write AND all rollback metadata writes!
+        fail_at_address = false;
+        fail_all_programs = false;
+        fail_followup_metadata = false;
+        program_failed = false;
+
+        char payload[512];
+        memset(payload, 'P', sizeof(payload));
+        CHECK(fs->file_write(fs, &file, payload, sizeof(payload)) == -EIO);
+        CHECK(program_failed);
+        CHECK(fs->file_size(fs, &file) == (off_t)sizeof(seed));
+        CHECK(fs->file_sync(fs, &file) == -EIO);
+        CHECK(fs->file_size(fs, &file) == (off_t)sizeof(seed));
+
+        heap->program = saved_program;
+        fail_from_program_call = 0;
+        CHECK(fs->file_sync(fs, &file) == 0);
+        CHECK(fs->file_close(fs, &file) == 0);
+
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+        check_stat_size(fs, "/gapdbl.bin", (off_t)sizeof(seed));
+        CHECK(free_clusters() == initial_free - 1);
+        CHECK(fs->remove(fs, "/gapdbl.bin") == 0);
+        CHECK(fs->unmount(fs) == 0);
+        CHECK(fs->mount(fs, heap, false) == 0);
+        CHECK(free_clusters() == initial_free);
+        destroy_heap_filesystem(fs, heap);
+    }
 }
 
 /** Verify signed-offset and format ceilings clip writes and reject further growth. */
@@ -1434,6 +1626,7 @@ int main(void) {
     test_partial_write_errors();
     test_partial_extension_errors();
     test_gap_rollback_and_io_recovery();
+    test_simultaneous_rollback_failures();
     test_write_size_ceiling();
     test_read_offset_ceiling();
     test_write_cursor_after_sync_error();
