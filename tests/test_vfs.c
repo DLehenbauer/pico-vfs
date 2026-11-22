@@ -279,8 +279,13 @@ static void test_api_file_tell() {
     printf(COLOR_GREEN("ok\n"));
 }
 
+/** Verify public ftruncate preserves position and immediately updates open-file size. */
 static void test_api_file_truncate() {
     test_printf("ftruncate");
+
+    filesystem_t *fs = NULL;
+    blockdevice_t *device = NULL;
+    assert(fs_info("/", &fs, &device) == 0);
 
     int fd = open("/file", O_RDWR|O_CREAT);
     assert(fd != -1);
@@ -289,19 +294,53 @@ static void test_api_file_truncate() {
     ssize_t write_length = write(fd, write_buffer, strlen(write_buffer));
     assert((size_t)write_length == strlen(write_buffer));
 
-    off_t offset = lseek(fd, 0, SEEK_SET);
-    assert(offset == 0);
-
+    // Shrink at old EOF without moving the descriptor's now-overhanging cursor.
     int err = ftruncate(fd, 9);
     assert(err == 0);
+    off_t offset = lseek(fd, 0, SEEK_CUR);
+    assert(offset == (off_t)strlen(write_buffer));
 
+    // Descriptor fstat updates immediately on all backends; FAT also syncs directory stat.
+    struct stat finfo;
+    err = fstat(fd, &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 9);
+    if (fs->type == FILESYSTEM_TYPE_FAT) {
+        err = stat("/file", &finfo);
+        assert(err == 0);
+        assert(finfo.st_size == 9);
+    }
+
+    // EOF reads preserve the cursor; an explicit seek exposes the surviving prefix.
     char read_buffer[512] = {0};
     ssize_t read_length = read(fd, read_buffer, sizeof(read_buffer));
+    assert(read_length == 0);
+    assert(lseek(fd, 0, SEEK_CUR) == (off_t)strlen(write_buffer));
+
+    offset = lseek(fd, 0, SEEK_SET);
+    assert(offset == 0);
+    read_length = read(fd, read_buffer, sizeof(read_buffer));
     assert(read_length == 9);
     assert(strcmp(read_buffer, "123456789") == 0);
 
+    // Growing also preserves position; new bytes are unspecified on FAT.
+    err = ftruncate(fd, 24);
+    assert(err == 0);
+    assert(lseek(fd, 0, SEEK_CUR) == 9);
+    err = fstat(fd, &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 24);
+    if (fs->type == FILESYSTEM_TYPE_FAT) {
+        err = stat("/file", &finfo);
+        assert(err == 0);
+        assert(finfo.st_size == 24);
+    }
+
     err = close(fd);
     assert(err == 0);
+    err = stat("/file", &finfo);
+    assert(err == 0);
+    assert(finfo.st_size == 24);
 
     printf(COLOR_GREEN("ok\n"));
 }

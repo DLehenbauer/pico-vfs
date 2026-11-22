@@ -3865,6 +3865,9 @@ FRESULT f_open (
 			fp->sect = 0;		/* Invalidate current data sector */
 			fp->fptr = 0;		/* Set file pointer top of the file */
 #if !FF_FS_READONLY
+			fp->reclaim_clst = 0;
+			fp->reclaim_pclst = 0;
+			fp->reclaim_sync = 0;
 #if !FF_FS_TINY
 			memset(fp->buf, 0, sizeof fp->buf);	/* Clear sector buffer */
 #endif
@@ -4011,6 +4014,87 @@ FRESULT f_read (
 /* Write File                                                            */
 /*-----------------------------------------------------------------------*/
 
+/** Complete any deferred predecessor EOC and cluster deallocation on retry. */
+static FRESULT reclaim_pending_cluster (
+	FIL* fp
+)
+{
+	FATFS *fs = fp->obj.fs;
+	FRESULT res = FR_OK;
+
+	if (fp->reclaim_clst == 0) return FR_OK;
+
+	if (fp->reclaim_pclst != 0) {
+		res = put_fat(fs, fp->reclaim_pclst, 0xFFFFFFFF);
+		if (res != FR_OK) return res;
+		fp->reclaim_pclst = 0;
+		fp->reclaim_sync = 1;
+	}
+#if FF_FS_EXFAT
+	if (fs->fs_type == FS_EXFAT) {
+		res = change_bitmap(fs, fp->reclaim_clst, 1, 0);
+	} else
+#endif
+	{
+		res = put_fat(fs, fp->reclaim_clst, 0);
+	}
+	if (res != FR_OK) return res;
+
+	if (fs->free_clst < fs->n_fatent - 2) {
+		fs->free_clst++;
+		fs->fsi_flag |= 1;
+	}
+	fp->reclaim_clst = 0;
+	fp->reclaim_sync = 1;
+	return FR_OK;
+}
+
+/** Reclaim a cluster allocated for the current write step, retaining retry state on failure. */
+static void rollback_new_cluster (
+	FIL* fp,
+	DWORD clst,
+	DWORD pclst,
+	DWORD old_n_frag
+)
+{
+#if !FF_FS_EXFAT
+	(void)old_n_frag;
+#endif
+	FATFS *fs = fp->obj.fs;
+
+	fp->clust = pclst;
+	fp->reclaim_clst = clst;
+	fp->reclaim_pclst = pclst;
+	if (pclst == 0) {
+		fp->obj.sclust = 0;
+#if FF_FS_EXFAT
+		if (fs->fs_type == FS_EXFAT) {
+			fp->obj.stat = 0;
+			fp->obj.n_frag = 0;
+		}
+#endif
+	}
+#if FF_FS_EXFAT
+	else if (fs->fs_type == FS_EXFAT) {
+		if (fp->obj.stat == 2) {
+			fp->reclaim_pclst = 0;
+		} else if (clst == pclst + 1) {
+			fp->obj.n_frag = old_n_frag;
+			fp->reclaim_pclst = 0;
+		} else if (fp->obj.stat == 3 && pclst >= fp->obj.sclust &&
+				   pclst <= fp->obj.sclust + fp->obj.n_cont) {
+			fp->obj.stat = 2;
+			fp->obj.n_frag = 0;
+			fp->reclaim_pclst = 0;
+		} else {
+			fp->obj.n_frag = 0;
+		}
+	}
+#endif
+	(void)reclaim_pending_cluster(fp);
+}
+
+/** Write file data, committing only physically written bytes and rolling back failed growth. */
 FRESULT f_write (
 	FIL* fp,			/* Open file to be written */
 	const void* buff,	/* Data to be written */
@@ -4020,9 +4104,10 @@ FRESULT f_write (
 {
 	FRESULT res;
 	FATFS *fs;
-	DWORD clst;
+	DWORD clst, pclst, old_n_frag;
 	LBA_t sect;
 	UINT wcnt, cc, csect;
+	BYTE new_clst;
 	const BYTE *wbuff = (const BYTE*)buff;
 
 
@@ -4036,14 +4121,30 @@ FRESULT f_write (
 		btw = (UINT)(0xFFFFFFFF - (DWORD)fp->fptr);
 	}
 
-	for ( ; btw > 0; btw -= wcnt, *bw += wcnt, wbuff += wcnt, fp->fptr += wcnt, fp->obj.objsize = (fp->fptr > fp->obj.objsize) ? fp->fptr : fp->obj.objsize) {	/* Repeat until all data written */
+	// Commit size, cursor, and modified state only after each sector reaches media.
+	for ( ; btw > 0;
+		btw -= wcnt, *bw += wcnt, wbuff += wcnt, fp->fptr += wcnt,
+		fp->obj.objsize = (fp->fptr > fp->obj.objsize) ? fp->fptr : fp->obj.objsize,
+		fp->flag |= FA_MODIFIED) {
+		new_clst = 0;
+		pclst = 0;
+		old_n_frag = 0;
 		if (fp->fptr % SS(fs) == 0) {		/* On the sector boundary? */
+#if FF_FS_TINY
+			if (fs->winsect == fp->sect && sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);	/* Write-back sector cache */
+#else
+			if (fp->flag & FA_DIRTY) {		/* Write-back sector cache */
+				if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) ABORT(fs, FR_DISK_ERR);
+				fp->flag &= (BYTE)~FA_DIRTY;
+			}
+#endif
 			csect = (UINT)(fp->fptr / SS(fs)) & (fs->csize - 1);	/* Sector offset in the cluster */
 			if (csect == 0) {				/* On the cluster boundary? */
 				if (fp->fptr == 0) {		/* On the top of the file? */
 					clst = fp->obj.sclust;	/* Follow from the origin */
 					if (clst == 0) {		/* If no cluster is allocated, */
 						clst = create_chain(&fp->obj, 0);	/* create a new cluster chain */
+						new_clst = 1;
 					}
 				} else {					/* On the middle or end of the file */
 #if FF_USE_FASTSEEK
@@ -4052,6 +4153,11 @@ FRESULT f_write (
 					} else
 #endif
 					{
+						pclst = fp->clust;
+#if FF_FS_EXFAT
+						old_n_frag = fp->obj.n_frag;
+#endif
+						if (fp->fptr >= fp->obj.objsize) new_clst = 1;
 						clst = create_chain(&fp->obj, fp->clust);	/* Follow or stretch cluster chain on the FAT */
 					}
 				}
@@ -4061,14 +4167,6 @@ FRESULT f_write (
 				fp->clust = clst;			/* Update current cluster */
 				if (fp->obj.sclust == 0) fp->obj.sclust = clst;	/* Set start cluster if the first write */
 			}
-#if FF_FS_TINY
-			if (fs->winsect == fp->sect && sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);	/* Write-back sector cache */
-#else
-			if (fp->flag & FA_DIRTY) {		/* Write-back sector cache */
-				if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) ABORT(fs, FR_DISK_ERR);
-				fp->flag &= (BYTE)~FA_DIRTY;
-			}
-#endif
 			sect = clst2sect(fs, fp->clust);	/* Get current sector */
 			if (sect == 0) ABORT(fs, FR_INT_ERR);
 			sect += csect;
@@ -4077,7 +4175,10 @@ FRESULT f_write (
 				if (csect + cc > fs->csize) {	/* Clip at cluster boundary */
 					cc = fs->csize - csect;
 				}
-				if (disk_write(fs->pdrv, wbuff, sect, cc) != RES_OK) ABORT(fs, FR_DISK_ERR);
+				if (disk_write(fs->pdrv, wbuff, sect, cc) != RES_OK) {
+					if (new_clst) rollback_new_cluster(fp, fp->clust, pclst, old_n_frag);
+					ABORT(fs, FR_DISK_ERR);
+				}
 #if FF_FS_MINIMIZE <= 2
 #if FF_FS_TINY
 				if (fs->winsect - sect < cc) {	/* Refill sector cache if it gets invalidated by the direct write */
@@ -4096,7 +4197,10 @@ FRESULT f_write (
 			}
 #if FF_FS_TINY
 			if (fp->fptr >= fp->obj.objsize) {	/* Avoid silly cache filling on the growing edge */
-				if (sync_window(fs) != FR_OK) ABORT(fs, FR_DISK_ERR);
+				if (sync_window(fs) != FR_OK) {
+					if (new_clst) rollback_new_cluster(fp, fp->clust, pclst, old_n_frag);
+					ABORT(fs, FR_DISK_ERR);
+				}
 				fs->winsect = sect;
 			}
 #else
@@ -4111,12 +4215,23 @@ FRESULT f_write (
 		wcnt = SS(fs) - (UINT)fp->fptr % SS(fs);	/* Number of bytes remains in the sector */
 		if (wcnt > btw) wcnt = btw;					/* Clip it by btw if needed */
 #if FF_FS_TINY
-		if (move_window(fs, fp->sect) != FR_OK) ABORT(fs, FR_DISK_ERR);	/* Move sector window */
+		if (move_window(fs, fp->sect) != FR_OK) {	/* Move sector window */
+			if (new_clst) rollback_new_cluster(fp, fp->clust, pclst, old_n_frag);
+			ABORT(fs, FR_DISK_ERR);
+		}
 		memcpy(fs->win + fp->fptr % SS(fs), wbuff, wcnt);	/* Fit data to the sector */
 		fs->wflag = 1;
+		if (sync_window(fs) != FR_OK) {
+			if (new_clst) rollback_new_cluster(fp, fp->clust, pclst, old_n_frag);
+			ABORT(fs, FR_DISK_ERR);
+		}
 #else
 		memcpy(fp->buf + fp->fptr % SS(fs), wbuff, wcnt);	/* Fit data to the sector */
-		fp->flag |= FA_DIRTY;
+		if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) {
+			if (new_clst) rollback_new_cluster(fp, fp->clust, pclst, old_n_frag);
+			ABORT(fs, FR_DISK_ERR);
+		}
+		fp->flag &= (BYTE)~FA_DIRTY;
 #endif
 	}
 
@@ -4132,6 +4247,7 @@ FRESULT f_write (
 /* Synchronize the File                                                  */
 /*-----------------------------------------------------------------------*/
 
+/** Flush file data, pending cluster reclamation, and directory metadata, retaining state on failure. */
 FRESULT f_sync (
 	FIL* fp		/* Open file to be synced */
 )
@@ -4144,7 +4260,10 @@ FRESULT f_sync (
 
 	res = validate(&fp->obj, &fs);	/* Check validity of the file object */
 	if (res == FR_OK) {
-		if (fp->flag & FA_MODIFIED) {	/* Is there any change to the file? */
+		if (fp->reclaim_clst != 0) {
+			res = reclaim_pending_cluster(fp);
+		}
+		if (res == FR_OK && (fp->flag & FA_MODIFIED)) {	/* Is there any change to the file? */
 #if !FF_FS_TINY
 			if (fp->flag & FA_DIRTY) {	/* Write-back cached data if needed */
 				if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) LEAVE_FF(fs, FR_DISK_ERR);
@@ -4177,7 +4296,11 @@ FRESULT f_sync (
 						res = store_xdir(&dj);	/* Restore it to the directory */
 						if (res == FR_OK) {
 							res = sync_fs(fs);
-							fp->flag &= (BYTE)~FA_MODIFIED;
+							/* A failed metadata flush must remain retryable, including on aborted files. */
+							if (res == FR_OK) {
+								fp->flag &= (BYTE)~FA_MODIFIED;
+								fp->reclaim_sync = 0;
+							}
 						}
 					}
 					FREE_NAMBUF();
@@ -4195,9 +4318,16 @@ FRESULT f_sync (
 					st_word(dir + DIR_LstAccDate, 0);
 					fs->wflag = 1;
 					res = sync_fs(fs);					/* Restore it to the directory */
-					fp->flag &= (BYTE)~FA_MODIFIED;
+					/* Do not let a subsequent sync or close skip an unsuccessful metadata flush. */
+					if (res == FR_OK) {
+						fp->flag &= (BYTE)~FA_MODIFIED;
+						fp->reclaim_sync = 0;
+					}
 				}
 			}
+		} else if (res == FR_OK && fp->reclaim_sync) {
+			res = sync_fs(fs);
+			if (res == FR_OK) fp->reclaim_sync = 0;
 		}
 	}
 
@@ -4921,11 +5051,15 @@ FRESULT f_truncate (
 	res = validate(&fp->obj, &fs);	/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) LEAVE_FF(fs, res);
 	if (!(fp->flag & FA_WRITE)) LEAVE_FF(fs, FR_DENIED);	/* Check access mode */
+	if (fp->reclaim_clst != 0) {
+		res = reclaim_pending_cluster(fp);
+		if (res != FR_OK) ABORT(fs, res);
+	}
 
 	if (fp->fptr < fp->obj.objsize) {	/* Process when fptr is not on the eof */
 		if (fp->fptr == 0) {	/* When set file size to zero, remove entire cluster chain */
 			res = remove_chain(&fp->obj, fp->obj.sclust, 0);
-			fp->obj.sclust = 0;
+			if (res == FR_OK) fp->obj.sclust = 0;
 		} else {				/* When truncate a part of the file, remove remaining clusters */
 			ncl = get_fat(&fp->obj, fp->clust);
 			res = FR_OK;
@@ -4935,8 +5069,10 @@ FRESULT f_truncate (
 				res = remove_chain(&fp->obj, ncl, fp->clust);
 			}
 		}
-		fp->obj.objsize = fp->fptr;	/* Set file size to current read/write point */
-		fp->flag |= FA_MODIFIED;
+		if (res == FR_OK) {
+			fp->obj.objsize = fp->fptr;	/* Set file size to current read/write point */
+			fp->flag |= FA_MODIFIED;
+		}
 #if !FF_FS_TINY
 		if (res == FR_OK && (fp->flag & FA_DIRTY)) {
 			if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) {

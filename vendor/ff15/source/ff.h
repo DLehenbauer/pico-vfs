@@ -210,6 +210,9 @@ typedef struct {
 #if !FF_FS_READONLY
 	LBA_t	dir_sect;		/* Sector number containing the directory entry (not used at exFAT) */
 	BYTE*	dir_ptr;		/* Pointer to the directory entry in the win[] (not used at exFAT) */
+	DWORD	reclaim_clst;	/* Newly allocated cluster awaiting reclamation (0:none) */
+	DWORD	reclaim_pclst;	/* Predecessor cluster awaiting EOC restore (0:none) */
+	BYTE	reclaim_sync;	/* Reclaimed allocator metadata awaiting sync_fs */
 #endif
 #if FF_USE_FASTSEEK
 	DWORD*	cltbl;			/* Pointer to the cluster link map table (nulled on open, set by application) */

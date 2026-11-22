@@ -5,6 +5,7 @@
  */
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <sys/errno.h>
 #include <sys/dirent.h>
 #include <sys/unistd.h>
@@ -22,7 +23,6 @@ typedef struct {
 typedef struct {
     fs_file_t *file;
     filesystem_t *filesystem;
-    char path[PATH_MAX + 1];
 } file_descriptor_t;
 
 typedef struct {
@@ -45,13 +45,15 @@ static size_t max_dir_descriptor = 0;                      // Dir descriptor cur
 static dir_descriptor_t *dir_descriptor = NULL;            // Dir descriptor and file system map
 static recursive_mutex_t __attribute__((unused)) _mutex;   // Recursive mutexes are used because recursive calls occur, e.g. on loopback devices
 
-static int _error_remap(int err) {
+/** Map negative errno results without narrowing successful offsets or byte counts. */
+static intmax_t _error_remap(intmax_t err) {
     if (err >= 0) {
         errno = 0;
         return err;
     }
 
-    errno = -err;
+    // Only error codes use int. Successful off_t/ssize_t results retain their width.
+    errno = (int)-err;
     return -1;
 }
 
@@ -296,40 +298,11 @@ int _fstat(int fildes, struct stat *st) {
         return _error_remap(-EBADF);
     }
 
-    off_t size = 0;
-    if (fs->type != FILESYSTEM_TYPE_FAT) {
-        off_t current = fs->file_tell(fs, file);
-        size = fs->file_seek(fs, file, 0, SEEK_END);
-        off_t err = fs->file_seek(fs, file, current, SEEK_SET);
-        if (current != err) {
-            recursive_mutex_exit(&_mutex);
-            return _error_remap(err);
-        }
-    } else {
-        /* NOTE: Support for different behaviour of FatFs from POSIX
-         *
-         * FatFs has a problem where f_size() reports a larger than actual file size when
-         * moved to a position beyond the f_lseek() file size; POSIX reports the actual size
-         * written to the file, not the seek position.
-         */
-        const char *path = file_descriptor[FILENO_INDEX(fildes)].path;
-        mountpoint_t *mp = find_mountpoint(path);
-        if (mp == NULL) {
-            recursive_mutex_exit(&_mutex);
-            return _error_remap(-ENOENT);
-        }
-        const char *entity_path = remove_prefix(path, mp->dir);
-        filesystem_t *fs = mp->filesystem;
-
-        struct stat finfo = {0};
-        int err = fs->stat(fs, entity_path, &finfo);
-        if (err != 0) {
-            recursive_mutex_exit(&_mutex);
-            return _error_remap(err);
-        }
-        size = finfo.st_size;
-    }
+    off_t size = fs->file_size(fs, file);
     recursive_mutex_exit(&_mutex);
+    if (size < 0) {
+        return _error_remap(size);
+    }
 
     st->st_size = size;
     st->st_mode = S_IFREG;
@@ -437,7 +410,6 @@ int _open(const char *path, int oflags, ...) {
         return _error_remap(err);
     }
     file_descriptor[FILENO_INDEX(fd)].filesystem = fs;
-    strncpy(file_descriptor[FILENO_INDEX(fd)].path, path, PATH_MAX);
 
     recursive_mutex_exit(&_mutex);
 
@@ -463,7 +435,6 @@ int _close(int fildes) {
     free(file);
     file_descriptor[FILENO_INDEX(fildes)].filesystem = NULL;
     file_descriptor[FILENO_INDEX(fildes)].file = NULL;
-    file_descriptor[FILENO_INDEX(fildes)].path[0] = '\0';
 
     recursive_mutex_exit(&_mutex);
     return _error_remap(err);
