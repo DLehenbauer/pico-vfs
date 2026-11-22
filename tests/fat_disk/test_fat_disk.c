@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "blockdevice/heap.h"
 #include "filesystem/fat.h"
 #include "pico/mutex.h"
 #include "ff.h"
@@ -175,6 +176,26 @@ static void test_fat_disk(size_t sector_size) {
     filesystem_fat_free(fs);
 }
 
+/* A failed open must release its private handle without requiring file_close. */
+static void test_failed_open_cleanup(void) {
+    blockdevice_t *heap = blockdevice_heap_create(128u * 1024u);
+    filesystem_t *fs = filesystem_fat_create();
+    CHECK(heap != NULL && fs != NULL);
+    CHECK(fs->format(fs, heap) == 0);
+    CHECK(fs->mount(fs, heap, false) == 0);
+    for (unsigned i = 0; i < 3; ++i) {
+        fs_file_t file = {0};
+        CHECK(fs->file_open(fs, &file, "/missing.bin", O_RDONLY) == -ENOENT);
+        CHECK(file.context == NULL);
+    }
+    fs_file_t file = {0};
+    CHECK(fs->file_open(fs, &file, "/created.bin", O_CREAT | O_RDWR) == 0);
+    CHECK(fs->file_close(fs, &file) == 0);
+    CHECK(fs->unmount(fs) == 0);
+    filesystem_fat_free(fs);
+    blockdevice_heap_free(heap);
+}
+
 void mutex_init(mutex_t *mutex) {
     mutex->locked = false;
 }
@@ -190,6 +211,7 @@ void mutex_exit(mutex_t *mutex) {
 }
 
 int main(void) {
+    test_failed_open_cleanup();
     const size_t sector_sizes[] = {512, 4096};
     for (size_t i = 0; i < sizeof(sector_sizes) / sizeof(sector_sizes[0]); ++i) {
         test_fat_disk(sector_sizes[i]);
