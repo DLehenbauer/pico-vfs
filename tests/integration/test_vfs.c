@@ -272,6 +272,76 @@ static void test_api_file_tell() {
     printf(COLOR_GREEN("ok\n"));
 }
 
+/** Check newlib's logical positions with buffered reads, writes, and independent streams. */
+static void test_buffered_stream_positions(void) {
+    test_printf("buffered stream positions");
+
+    static const char contents[] = "format-version: 1\nconfigs:\n";
+    char write_buffer[128];
+    FILE *writer = fopen("/positions", "w");
+    assert(writer != NULL);
+    int err = setvbuf(writer, write_buffer, _IOFBF, sizeof(write_buffer));
+    assert(err == 0);
+    size_t written = fwrite(contents, 1, sizeof(contents) - 1, writer);
+    assert(written == sizeof(contents) - 1);
+    long pos = ftell(writer);
+    assert(pos == (long)(sizeof(contents) - 1));
+    err = fclose(writer);
+    assert(err == 0);
+
+    FILE *parent = fopen("/positions", "r");
+    FILE *alias = fopen("/positions", "r");
+    assert(parent != NULL && alias != NULL);
+    char alias_buffer[128];
+    err = setvbuf(alias, alias_buffer, _IOFBF, sizeof(alias_buffer));
+    assert(err == 0);
+
+    char line[64];
+    char *result = fgets(line, sizeof(line), parent);
+    assert(result != NULL && strcmp(line, "format-version: 1\n") == 0);
+    int character = fgetc(alias);
+    assert(character == contents[0]);
+    pos = ftell(alias);
+    assert(pos == 1);
+    pos = ftell(parent);
+    assert(pos == (long)strlen("format-version: 1\n"));
+
+    fpos_t saved;
+    err = fgetpos(alias, &saved);
+    assert(err == 0);
+    character = fgetc(alias);
+    assert(character == contents[1]);
+    err = fsetpos(alias, &saved);
+    assert(err == 0);
+    character = fgetc(alias);
+    assert(character == contents[1]);
+    character = ungetc(character, alias);
+    assert(character == contents[1]);
+    pos = ftell(alias);
+    assert(pos == 1);
+    character = fgetc(alias);
+    assert(character == contents[1]);
+
+    err = fseek(alias, 0, SEEK_SET);
+    assert(err == 0);
+    pos = ftell(alias);
+    assert(pos == 0);
+    character = fgetc(alias);
+    assert(character == contents[0]);
+    result = fgets(line, sizeof(line), parent);
+    assert(result != NULL && strcmp(line, "configs:\n") == 0);
+    pos = ftell(parent);
+    assert(pos == (long)(sizeof(contents) - 1));
+
+    err = fclose(alias);
+    assert(err == 0);
+    err = fclose(parent);
+    assert(err == 0);
+    err = unlink("/positions");
+    assert(err == 0);
+    printf(COLOR_GREEN("ok\n"));
+}
+
 /** Verify public ftruncate preserves position and immediately updates open-file size. */
 static void test_api_file_truncate() {
     test_printf("ftruncate");
@@ -603,6 +673,7 @@ void test_vfs(void) {
     test_api_file_write_read();
     test_api_file_seek();
     test_api_file_tell();
+    test_buffered_stream_positions();
     test_api_file_truncate();
     test_api_stat();
     test_api_remove();
@@ -634,6 +705,7 @@ void test_vfs(void) {
     test_api_file_write_read();
     test_api_file_seek();
     test_api_file_tell();
+    test_buffered_stream_positions();
     test_api_file_truncate();
     test_api_stat();
     test_api_remove();
@@ -665,6 +737,7 @@ void test_vfs(void) {
     test_api_file_write_read();
     test_api_file_seek();
     test_api_file_tell();
+    test_buffered_stream_positions();
     test_api_file_truncate();
     test_api_stat();
     test_api_remove();
@@ -706,6 +779,7 @@ void test_vfs(void) {
     test_api_file_write_read();
     test_api_file_seek();
     test_api_file_tell();
+    test_buffered_stream_positions();
     test_api_file_truncate();
     test_api_stat();
     test_api_remove();

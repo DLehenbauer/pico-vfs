@@ -12,8 +12,6 @@
 #include <pico/mutex.h>
 #include "filesystem/vfs.h"
 
-struct _reent;
-
 typedef struct {
     const char *dir;
     void *filesystem;
@@ -531,29 +529,6 @@ off_t _lseek(int fildes, off_t offset, int whence) {
     }
 
     off_t pos = fs->file_seek(fs, file, offset, whence);
-    recursive_mutex_exit(&_mutex);
-
-    return _error_remap(pos);
-}
-
-off_t _ftello_r(struct _reent *ptr, register FILE *fp) {
-    (void)ptr;
-    int fildes = fileno(fp);
-    auto_init_recursive_mutex(_mutex);
-    recursive_mutex_enter_blocking(&_mutex);
-
-    if (!is_valid_file_descriptor(fildes)) {
-        recursive_mutex_exit(&_mutex);
-        return _error_remap(-EBADF);
-    }
-    fs_file_t *file = file_descriptor[FILENO_INDEX(fildes)].file;
-    filesystem_t *fs = file_descriptor[FILENO_INDEX(fildes)].filesystem;
-    if (fs == NULL) {
-        recursive_mutex_exit(&_mutex);
-        return _error_remap(-EBADF);
-    }
-
-    off_t pos = fs->file_tell(fs, file);
     recursive_mutex_exit(&_mutex);
 
     return _error_remap(pos);
