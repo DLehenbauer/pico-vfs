@@ -577,7 +577,7 @@ static void test_api_stat() {
     test_printf("lstat");
 
     // regular file
-    int fd = open("/file", O_WRONLY|O_CREAT);
+    int fd = open("/file", O_WRONLY|O_CREAT|O_TRUNC);
     assert(fd != -1);
     char write_buffer[512] = "Hello World!";
     ssize_t write_length = write(fd, write_buffer, strlen(write_buffer));
